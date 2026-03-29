@@ -1,5 +1,5 @@
 """
-Monarch-based launcher for AReaL -- Phase 6b: Independent RolloutActor.
+Monarch-based launcher for AReaL -- Phase 6b+: Multi-GPU FSDP support.
 
 Uses Monarch actors for the full training lifecycle:
   - GeneratorActor: embeds vLLM AsyncLLM with AReaLMonarchExecutor
@@ -11,24 +11,32 @@ Uses Monarch actors for the full training lifecycle:
   - TrainerActor: runs FSDP training in-process with step-level control
   - All communication via Monarch RPC (no HTTP)
 
-Phase 6b adds:
-  - RolloutActor (CPU ProcMesh): independent actor with its own dataloader
-    and MonarchVLLMEngine, produces rollout batches WITHOUT loading a model.
-  - True pipeline parallelism: RolloutActor and TrainerActor run on
-    DIFFERENT ProcMeshes, so rollout and training execute concurrently.
-  - ReplayBufferActor decouples the two pipelines.
+Multi-GPU FSDP training:
+  When nprocs > 1 (e.g. allocation_mode=vllm:d4p1t1+d4p1t1), the launcher
+  spawns nprocs TrainerActors on a multi-process ProcMesh.  Each actor
+  auto-detects its rank via monarch.current_rank() and participates in
+  distributed training via torch.distributed (HCCL).  Endpoint calls use
+  .call() (broadcast) instead of .call_one().
 
 Usage:
+    # 4-card inference + 4-card training (8 NPUs):
     python -m areal.monarch_plugin.launcher \\
         examples/math/gsm8k_rl.py \\
         --config examples/math/gsm8k_grpo_npu.yaml
 
-Architecture:
+    # 1-card inference + 1-card training (2 NPUs):
+    python -m areal.monarch_plugin.launcher \\
+        examples/math/gsm8k_rl.py \\
+        --config examples/math/gsm8k_grpo_npu.yaml \\
+        "allocation_mode=vllm:d1p1t1+d1p1t1" \\
+        "cluster.n_gpus_per_node=2"
+
+Architecture (4+4 example):
     MonarchOrchestrator (main process, no NPU)
-      ├── GeneratorProcMesh (1 proc, NPU visible but not initialised)
+      ├── GeneratorProcMesh (1 proc, NPUs 0-3 visible)
       │     ├── WorkerRegistry (actor)
       │     └── GeneratorActor → AsyncLLM → EngineCore subprocess
-      │           └── AReaLMonarchExecutor → vLLM Worker ProcMesh (NPU 0)
+      │           └── AReaLMonarchExecutor → vLLM Worker ProcMesh (NPU 0-3)
       ├── RewardProcMesh (1 proc, CPU only)
       │     └── RewardActor → reward_fn() via Monarch RPC
       ├── SandboxProcMesh (1 proc, CPU only)
@@ -41,8 +49,11 @@ Architecture:
       │     └── RolloutActor → dataloader + WorkflowExecutor + MonarchVLLMEngine
       │           ├── do_rollout() → produces batches → ReplayBuffer
       │           └── (no model loaded, inference via GeneratorActor RPC)
-      └── TrainingProcMesh (1 proc per training NPU)
-            └── TrainerActor -- in-process FSDPEngine (NPU 1)
+      └── TrainingProcMesh (nprocs processes, NPUs 4-7)
+            ├── TrainerActor[rank=0] ─┐
+            ├── TrainerActor[rank=1]  ├── FSDP via HCCL all-reduce
+            ├── TrainerActor[rank=2]  │
+            └── TrainerActor[rank=3] ─┘
                   └── train_on_batch() ← consumes batches ← ReplayBuffer
 """
 
@@ -131,7 +142,7 @@ def generator_bootstrap(device_ids_str: str):
 
 
 def npu_training_bootstrap(device_id: int):
-    """Bootstrap for TrainerActor: bind to a specific NPU and initialise it.
+    """Bootstrap for TrainerActor (single-process): bind to a specific NPU.
     Also forces ``fork`` multiprocessing for AReaL DataLoader compatibility.
     Propagates LD_LIBRARY_PATH for CANN/ATB library availability.
     """
@@ -149,6 +160,29 @@ def npu_training_bootstrap(device_id: int):
         import torch
         import torch_npu  # noqa: F401
         torch.npu.set_device(0)
+    return _bootstrap
+
+
+def npu_training_bootstrap_multi(all_device_ids: str):
+    """Bootstrap for multi-process FSDP training: all training NPUs visible.
+
+    Each spawned process sees ALL training devices.  The actual device
+    selection (``torch.npu.set_device(local_rank)``) happens inside
+    ``TrainerActor.initialize()`` after the Monarch rank is known.
+    """
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+
+    def _bootstrap():
+        import multiprocessing as _mp
+        try:
+            _mp.set_start_method("fork", force=True)
+        except RuntimeError:
+            pass
+        if ld_path:
+            os.environ["LD_LIBRARY_PATH"] = ld_path
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = all_device_ids
+        import torch
+        import torch_npu  # noqa: F401
     return _bootstrap
 
 
@@ -257,12 +291,25 @@ class TrainerActor(Actor):
 
     @endpoint
     def initialize(self) -> dict:
+        if self._rank < 0:
+            from monarch._src.actor.actor_mesh import current_rank
+            rank_point = current_rank()
+            self._rank = rank_point.rank
+            logger.info(
+                f"TrainerActor auto-detected rank={self._rank} "
+                f"from ProcMesh coordinate"
+            )
+
         os.environ["RANK"] = str(self._rank)
         os.environ["LOCAL_RANK"] = str(self._rank)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["MASTER_ADDR"] = self._master_addr
         os.environ["MASTER_PORT"] = str(self._master_port)
         os.environ.update(self._env_vars)
+
+        if self._world_size > 1:
+            import torch
+            torch.npu.set_device(self._rank)
 
         logger.info(
             f"TrainerActor[rank={self._rank}] initialising: "
@@ -316,6 +363,32 @@ class TrainerActor(Actor):
         PPOTrainer.__exit__ = _intercept_exit
         PPOTrainer._init_rollout = _patched_init_rollout
 
+        from areal.engine.fsdp_engine import FSDPEngine
+        _orig_connect = FSDPEngine.connect_engine
+        ws = self._world_size
+
+        def _patched_connect(engine_self, engine, meta):
+            """Fix XCCL weight update group size for Monarch.
+
+            Monarch uses 1 inference worker (not gen.dp_size), so the
+            HCCL process group for weight updates must reflect that.
+            """
+            if meta.type == "xccl" and meta.alloc_mode is not None:
+                from areal.api import AllocationMode
+                orig_gen_ws = meta.alloc_mode.gen.world_size
+                fixed_alloc = AllocationMode.from_str(
+                    f"vllm:d1p1t1+d{ws}p1t1"
+                )
+                meta.alloc_mode = fixed_alloc
+                logger.info(
+                    f"TrainerActor: fixed XCCL alloc_mode "
+                    f"gen.world_size {orig_gen_ws} -> 1 "
+                    f"(Monarch has 1 inference worker)"
+                )
+            return _orig_connect(engine_self, engine, meta)
+
+        FSDPEngine.connect_engine = _patched_connect
+
         try:
             script_path = self._cli_args[0]
             spec = importlib.util.spec_from_file_location(
@@ -328,9 +401,19 @@ class TrainerActor(Actor):
             PPOTrainer.train = _orig_train
             PPOTrainer.__exit__ = _orig_exit
             PPOTrainer._init_rollout = _orig_init_rollout
+            FSDPEngine.connect_engine = _orig_connect
 
         self._trainer = _captured["trainer"]
         self._train_kwargs = _captured["kwargs"]
+
+        if (
+            hasattr(self._trainer, 'weight_update_meta')
+            and self._trainer.weight_update_meta.alloc_mode is not None
+        ):
+            from areal.api import AllocationMode
+            self._trainer.weight_update_meta.alloc_mode = (
+                AllocationMode.from_str(f"vllm:d1p1t1+d{ws}p1t1")
+            )
 
         config = self._trainer.config
         total_epochs = (
@@ -762,6 +845,7 @@ async def monarch_main_async(config, run_id: int = 0):
     agent_procs = None
     replay_buffer_procs = None
     rollout_procs = None
+    multi_rank = False
 
     try:
         # ================================================================
@@ -914,23 +998,38 @@ async def monarch_main_async(config, run_id: int = 0):
                 "HF_ENDPOINT": os.environ.get("HF_ENDPOINT", ""),
             }
 
-            train_device_id = int(train_device_ids[0])
-            logger.info(
-                f"Spawning TrainerActor on NPU {train_device_id} "
-                f"(rank 0/{nprocs})"
-            )
-            train_procs = host.spawn_procs(
-                per_host={"npu": 1},
-                bootstrap=npu_training_bootstrap(train_device_id),
-                name="training",
-            )
+            multi_rank = nprocs > 1
+
+            if multi_rank:
+                logger.info(
+                    f"Spawning {nprocs} TrainerActors on NPUs "
+                    f"{train_device_ids} (multi-process FSDP)"
+                )
+                train_procs = host.spawn_procs(
+                    per_host={"npu": nprocs},
+                    bootstrap=npu_training_bootstrap_multi(
+                        ",".join(train_device_ids)
+                    ),
+                    name="training",
+                )
+            else:
+                train_device_id = int(train_device_ids[0])
+                logger.info(
+                    f"Spawning TrainerActor on NPU {train_device_id} "
+                    f"(single-process)"
+                )
+                train_procs = host.spawn_procs(
+                    per_host={"npu": 1},
+                    bootstrap=npu_training_bootstrap(train_device_id),
+                    name="training",
+                )
 
             trainer_actor = train_procs.spawn(
                 "trainer",
                 TrainerActor,
                 cli_args=sys.argv[1:],
                 env_vars=trainer_env,
-                rank=0,
+                rank=-1 if multi_rank else 0,
                 world_size=nprocs,
                 master_addr="localhost",
                 master_port=master_port,
@@ -944,9 +1043,14 @@ async def monarch_main_async(config, run_id: int = 0):
             # ============================================================
             logger.info(
                 "Initialising TrainerActor "
-                "(model load + FSDP + MonarchVLLMEngine) ..."
+                f"({'multi-rank broadcast' if multi_rank else 'single'}: "
+                f"model load + FSDP + MonarchVLLMEngine) ..."
             )
-            info = await trainer_actor.initialize.call_one()
+            if multi_rank:
+                result_mesh = await trainer_actor.initialize.call()
+                info = result_mesh.item(npu=0)
+            else:
+                info = await trainer_actor.initialize.call_one()
             max_steps = info["max_steps"]
             start_step = info["start_step"]
             logger.info(
@@ -1022,9 +1126,15 @@ async def monarch_main_async(config, run_id: int = 0):
                         continue
 
                     step = train_step_counter
-                    result = await trainer_actor.train_on_batch.call_one(
-                        batch, step
-                    )
+                    if multi_rank:
+                        result_mesh = await trainer_actor.train_on_batch.call(
+                            batch, step
+                        )
+                        result = result_mesh.item(npu=0)
+                    else:
+                        result = await trainer_actor.train_on_batch.call_one(
+                            batch, step
+                        )
                     logger.info(
                         f"[Step {step + 1}/{max_steps}] "
                         f"epoch={result['epoch']}, "
@@ -1050,7 +1160,10 @@ async def monarch_main_async(config, run_id: int = 0):
         logger.info("Cleaning up Monarch actors ...")
         if trainer_actor is not None:
             try:
-                await trainer_actor.shutdown.call_one()
+                if multi_rank:
+                    await trainer_actor.shutdown.call()
+                else:
+                    await trainer_actor.shutdown.call_one()
             except Exception:
                 pass
         if agent_actor is not None:

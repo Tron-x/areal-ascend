@@ -37,6 +37,8 @@ MonarchOrchestrator (主进程, 无 NPU)
 | `agent_actor.py` | `AgentActor` + `MonarchAgentWorkflow` — 多轮 Agent 交互编排 |
 | `replay_buffer_actor.py` | `ReplayBufferActor` — 异步经验缓冲，支持版本感知的过期淘汰 |
 | `rollout_actor.py` | `RolloutActor` — 独立 rollout 生产，拥有自己的 dataloader 和 WorkflowExecutor |
+| `scripts/run_1x1.sh` | 执行脚本：1 卡推理 + 1 卡训练 |
+| `scripts/run_4x4.sh` | 执行脚本：4 卡推理 + 4 卡训练 |
 
 ## 环境要求
 
@@ -67,9 +69,44 @@ export VLLM_USE_MODELSCOPE=true
 export HF_ENDPOINT=https://hf-mirror.com
 ```
 
-### 2. 启动训练
+### 2. 使用执行脚本
+
+`scripts/` 目录下提供了两个开箱即用的执行脚本，自动配置环境并启动训练：
+
+**1+1 模式（1 卡推理 + 1 卡训练，共 2 NPU）：**
 
 ```bash
+# 默认 3 步训练
+bash areal/monarch_plugin/scripts/run_1x1.sh
+
+# 自定义参数
+bash areal/monarch_plugin/scripts/run_1x1.sh --steps 5 --model /path/to/model
+```
+
+**4+4 模式（4 卡推理 + 4 卡训练，共 8 NPU）：**
+
+```bash
+# 默认 2 步训练
+bash areal/monarch_plugin/scripts/run_4x4.sh
+
+# 自定义参数
+bash areal/monarch_plugin/scripts/run_4x4.sh --steps 5 --model /path/to/model
+```
+
+脚本支持的参数：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--steps N` | 训练步数 | 1+1: 3, 4+4: 2 |
+| `--model PATH` | 模型路径（本地或 HuggingFace） | `Qwen/Qwen2.5-1.5B-Instruct` |
+| `--cann PATH` | CANN 安装目录 | `/root/hzz/cann-9.0.0-beta.1` |
+
+### 3. 手动启动
+
+也可以直接调用 launcher，灵活传递 Hydra 参数：
+
+```bash
+# 1+1: 1 卡推理 + 1 卡训练
 python -m areal.monarch_plugin.launcher \
     examples/math/gsm8k_rl.py \
     --config examples/math/gsm8k_grpo_npu.yaml \
@@ -77,29 +114,36 @@ python -m areal.monarch_plugin.launcher \
     "cluster.n_gpus_per_node=2" \
     "actor.path=/path/to/Qwen2.5-1.5B-Instruct" \
     "+total_train_steps=3"
+
+# 4+4: 4 卡推理 + 4 卡训练 (yaml 默认配置)
+python -m areal.monarch_plugin.launcher \
+    examples/math/gsm8k_rl.py \
+    --config examples/math/gsm8k_grpo_npu.yaml \
+    "+total_train_steps=2"
 ```
 
-参数说明：
+Hydra 参数说明：
 
 | 参数 | 说明 |
 |------|------|
 | `allocation_mode=vllm:d1p1t1+d1p1t1` | NPU 分配：1 卡推理 + 1 卡训练 |
-| `cluster.n_gpus_per_node=2` | 节点可用 NPU 数量 |
+| `allocation_mode=vllm:d4p1t1+d4p1t1` | NPU 分配：4 卡推理 + 4 卡训练（yaml 默认） |
+| `cluster.n_gpus_per_node=N` | 节点可用 NPU 数量 |
 | `actor.path=...` | 模型路径（本地或 HuggingFace） |
-| `+total_train_steps=3` | 限制训练步数（测试用） |
+| `+total_train_steps=N` | 限制训练步数（测试用） |
 
-### 3. 预期输出
+### 4. 预期输出
 
 ```
-MonarchPlugin INFO: GeneratorActor spawned
+MonarchPlugin INFO: GeneratorActor ready (Monarch RPC mode)
 MonarchPlugin INFO: RewardActor spawned
 MonarchPlugin INFO: SandboxActor spawned
 MonarchPlugin INFO: AgentActor spawned
-MonarchPlugin INFO: ReplayBufferActor spawned
+MonarchPlugin INFO: ReplayBufferActor spawned (max_size=8)
 MonarchPlugin INFO: RolloutActor spawned
 MonarchPlugin INFO: TrainerActor ready: max_steps=3, start_step=0
 MonarchPlugin INFO: RolloutActor ready: steps_per_epoch=29
-MonarchPlugin INFO: Starting async pipeline (true parallelism) ...
+MonarchPlugin INFO: Starting async pipeline (true parallelism): steps 0 -> 3
 MonarchPlugin INFO: [Rollout] Step 0 batch added to buffer (buffer_size=1)
 MonarchPlugin INFO: [Step 1/3] epoch=0, epoch_step=0
 ...
