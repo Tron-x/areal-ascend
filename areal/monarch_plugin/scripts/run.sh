@@ -46,12 +46,10 @@ INF_DP=$((INF_CARDS / TP_SIZE / PP_SIZE))
 ALLOC_MODE="vllm:d${INF_DP}p${PP_SIZE}t${TP_SIZE}+d${TRAIN_CARDS}p1t1"
 
 # --------------- environment setup ---------------
-if [[ -f "$CANN_HOME/set_env.sh" ]]; then
-    source "$CANN_HOME/set_env.sh"
-fi
-if [[ -f "$CANN_HOME/nnal/atb/set_env.sh" ]]; then
-    source "$CANN_HOME/nnal/atb/set_env.sh"
-fi
+set +eu
+[[ -f "$CANN_HOME/set_env.sh" ]] && source "$CANN_HOME/set_env.sh"
+[[ -f "$CANN_HOME/nnal/atb/set_env.sh" ]] && source "$CANN_HOME/nnal/atb/set_env.sh"
+set -eu
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "monarch_ascend" ]]; then
     eval "$(conda shell.bash hook)"

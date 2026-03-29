@@ -40,17 +40,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --------------- environment setup ---------------
-if [[ -f "$CANN_HOME/set_env.sh" ]]; then
-    source "$CANN_HOME/set_env.sh"
-else
-    echo "[WARN] CANN set_env.sh not found at $CANN_HOME/set_env.sh"
-fi
-
-if [[ -f "$CANN_HOME/nnal/atb/set_env.sh" ]]; then
-    source "$CANN_HOME/nnal/atb/set_env.sh"
-else
-    echo "[WARN] ATB set_env.sh not found at $CANN_HOME/nnal/atb/set_env.sh"
-fi
+set +eu
+[[ -f "$CANN_HOME/set_env.sh" ]] && source "$CANN_HOME/set_env.sh"
+[[ -f "$CANN_HOME/nnal/atb/set_env.sh" ]] && source "$CANN_HOME/nnal/atb/set_env.sh"
+set -eu
 
 # conda (only activate if not already in the environment)
 if [[ "${CONDA_DEFAULT_ENV:-}" != "monarch_ascend" ]]; then
