@@ -1,5 +1,5 @@
 """
-Monarch-based launcher for AReaL -- Phase 6b+: Multi-GPU FSDP support.
+Monarch-based launcher for AReaL -- topology-aware distributed RL.
 
 Uses Monarch actors for the full training lifecycle:
   - GeneratorActor: embeds vLLM AsyncLLM with AReaLMonarchExecutor
@@ -11,27 +11,58 @@ Uses Monarch actors for the full training lifecycle:
   - TrainerActor: runs FSDP training in-process with step-level control
   - All communication via Monarch RPC (no HTTP)
 
-Multi-GPU FSDP training:
-  When nprocs > 1 (e.g. allocation_mode=vllm:d4p1t1+d4p1t1), the launcher
-  spawns nprocs TrainerActors on a multi-process ProcMesh.  Each actor
-  auto-detects its rank via monarch.current_rank() and participates in
-  distributed training via torch.distributed (HCCL).  Endpoint calls use
-  .call() (broadcast) instead of .call_one().
+Topology-aware placement (via topology.py):
+  The launcher supports arbitrary device configurations through
+  ClusterTopology.  Device placement is computed from allocation_mode
+  and cluster config, not hardcoded.
+
+  Single-node: devices linearly partitioned (inference first, then training)
+  Multi-node:  MONARCH_WORKERS env var or cluster.monarch_workers config
+               provides worker addresses; symmetric or role-split placement.
+
+Supported configurations:
+  allocation_mode         n_gpus_per_node    Layout
+  ──────────────────────  ─────────────────  ──────────────────────────
+  vllm:d1p1t1+d1p1t1     2                  1 inf + 1 train
+  vllm:d2p1t1+d2p1t1     4                  2 inf + 2 train
+  vllm:d1p1t1+d3p1t1     4                  1 inf + 3 train
+  vllm:d4p1t1+d4p1t1     8                  4 inf + 4 train
+  vllm:d2p1t1+d6p1t1     8                  2 inf + 6 train
+  vllm:d1p1t4+d4p1t1     8                  1 inf (TP=4) + 4 train
+
+Multi-node (requires MONARCH_WORKERS):
+  allocation_mode         n_nodes  Layout
+  ──────────────────────  ───────  ──────────────────────────
+  vllm:d4p1t1+d4p1t1     2        each node: 4 inf + 4 train
+  vllm:d8p1t1+d8p1t1     2        each node: 8 inf + 8 train
 
 Usage:
-    # 4-card inference + 4-card training (8 NPUs):
+    # 4+4 (8 NPU, single node):
     python -m areal.monarch_plugin.launcher \\
         examples/math/gsm8k_rl.py \\
         --config examples/math/gsm8k_grpo_npu.yaml
 
-    # 1-card inference + 1-card training (2 NPUs):
+    # 1+1 (2 NPU):
     python -m areal.monarch_plugin.launcher \\
         examples/math/gsm8k_rl.py \\
         --config examples/math/gsm8k_grpo_npu.yaml \\
         "allocation_mode=vllm:d1p1t1+d1p1t1" \\
         "cluster.n_gpus_per_node=2"
 
-Architecture (4+4 example):
+    # 2+6 (8 NPU):
+    python -m areal.monarch_plugin.launcher \\
+        examples/math/gsm8k_rl.py \\
+        --config examples/math/gsm8k_grpo_npu.yaml \\
+        "allocation_mode=vllm:d2p1t1+d6p1t1"
+
+    # Multi-node (2 nodes × 8 NPU):
+    MONARCH_WORKERS=tcp://node0:29600,tcp://node1:29600 \\
+    python -m areal.monarch_plugin.launcher \\
+        examples/math/gsm8k_rl.py \\
+        --config examples/math/gsm8k_grpo_npu.yaml \\
+        "cluster.n_nodes=2"
+
+Architecture (4+4 single-node example):
     MonarchOrchestrator (main process, no NPU)
       ├── GeneratorProcMesh (1 proc, NPUs 0-3 visible)
       │     ├── WorkerRegistry (actor)
@@ -204,13 +235,6 @@ def _kill_proc_tree(pid: int, sig=signal.SIGTERM, timeout: int = 15):
         pass
 
 
-def _resolve_device_ids(n_total: int, env_var: str) -> list:
-    raw = os.environ.get(env_var, "")
-    if raw:
-        return [d.strip() for d in raw.split(",") if d.strip()]
-    return [str(i) for i in range(n_total)]
-
-
 def _build_vllm_cli_args(config, alloc_mode) -> list[str]:
     """Build the CLI arg list that would normally be passed to
     ``areal.engine.vllm_ext.areal_vllm_server``.
@@ -243,7 +267,7 @@ def _build_vllm_cli_args(config, alloc_mode) -> list[str]:
 # Monarch Actors
 # ---------------------------------------------------------------------------
 
-from monarch.actor import Actor, endpoint, this_host  # noqa: E402
+from monarch.actor import Actor, endpoint  # noqa: E402
 
 from areal.monarch_plugin.agent_actor import AgentActor  # noqa: E402
 from areal.monarch_plugin.executor import WorkerRegistry  # noqa: E402
@@ -804,25 +828,15 @@ async def monarch_main_async(config, run_id: int = 0):
         logger.info(f"Saved experiment metadata to {metadata_file}")
 
     env_var = current_platform.device_control_env_var
-    all_device_ids = _resolve_device_ids(config.cluster.n_gpus_per_node, env_var)
 
-    gen_gpu_count = (
-        alloc_mode.gen.pp_size * alloc_mode.gen.tp_size * alloc_mode.gen.dp_size
-    )
-    train_gpu_count = (
-        alloc_mode.train.world_size
-        if alloc_mode.type_ != AllocationType.LLM_SERVER_ONLY
-        else 0
-    )
+    from areal.monarch_plugin.topology import ClusterTopology
+    topology = ClusterTopology.from_config(config, alloc_mode, env_var=env_var)
+    placement = topology.placement
 
-    inf_device_ids = all_device_ids[:gen_gpu_count]
-    train_device_ids = all_device_ids[
-        gen_gpu_count : gen_gpu_count + train_gpu_count
-    ]
+    inf_device_ids = placement.inference.all_device_ids
+    train_device_ids = placement.training.all_device_ids
 
-    logger.info(
-        f"Device allocation: inference={inf_device_ids}, training={train_device_ids}"
-    )
+    logger.info(f"Topology:\n{topology.summary()}")
 
     fileroot = config.cluster.fileroot
     user = os.environ.get("USER", "root")
@@ -831,7 +845,7 @@ async def monarch_main_async(config, run_id: int = 0):
     )
     os.makedirs(log_dir, exist_ok=True)
 
-    host = this_host()
+    host = topology.create_host_mesh()
     generator_actor = None
     reward_actor = None
     sandbox_actor = None
@@ -1031,7 +1045,7 @@ async def monarch_main_async(config, run_id: int = 0):
                 env_vars=trainer_env,
                 rank=-1 if multi_rank else 0,
                 world_size=nprocs,
-                master_addr="localhost",
+                master_addr=placement.master_addr,
                 master_port=master_port,
                 generator_actor=generator_actor,
                 reward_actor=reward_actor,
