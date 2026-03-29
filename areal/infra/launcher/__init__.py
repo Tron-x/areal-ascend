@@ -1,6 +1,7 @@
 """Launcher modules for different cluster backends."""
 
 from .local import LocalLauncher, local_main
+from .monarch import monarch_main
 from .ray import RayLauncher, ray_main
 from .sglang_server import SGLangServerWrapper, launch_sglang_server
 from .slurm import SlurmLauncher, slurm_main
@@ -9,6 +10,7 @@ from .vllm_server import launch_vllm_server, vLLMServerWrapper
 __all__ = [
     "LocalLauncher",
     "local_main",
+    "monarch_main",
     "RayLauncher",
     "ray_main",
     "SlurmLauncher",
