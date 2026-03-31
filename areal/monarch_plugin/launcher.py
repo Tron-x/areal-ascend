@@ -16,6 +16,14 @@ Topology-aware placement (via topology.py):
   ClusterTopology.  Device placement is computed from allocation_mode
   and cluster config, not hardcoded.
 
+XCCL weight-update alloc_mode (via weight_sync.py):
+  For ``type="xccl"``, ``WeightUpdateMeta.alloc_mode.gen`` must match how many
+  vLLM workers join the weight-update group (``GeneratorActor`` collective RPC).
+  By default we rebuild alloc_mode from the cluster ``allocation_mode`` inference
+  parallel strategy plus training world size; optional env
+  ``MONARCH_INFERENCE_XCCL_PARTICIPANTS`` forces a flat ``d{N}p1t1`` inference
+  half. See ``weight_sync.resolve_xccl_alloc_mode``.
+
   Single-node: devices linearly partitioned (inference first, then training)
   Multi-node:  MONARCH_WORKERS env var or cluster.monarch_workers config
                provides worker addresses; symmetric or role-split placement.
@@ -276,6 +284,9 @@ from areal.monarch_plugin.replay_buffer_actor import ReplayBufferActor  # noqa: 
 from areal.monarch_plugin.reward_actor import RewardActor  # noqa: E402
 from areal.monarch_plugin.rollout_actor import RolloutActor  # noqa: E402
 from areal.monarch_plugin.sandbox_actor import SandboxActor  # noqa: E402
+from areal.monarch_plugin.weight_sync import (  # noqa: E402
+    resolve_xccl_alloc_mode,
+)
 
 
 class TrainerActor(Actor):
@@ -285,6 +296,9 @@ class TrainerActor(Actor):
       - Accepts ``generator_actor``, ``reward_actor``, and ``agent_actor``
       - Monkey-patches ``PPOTrainer._init_rollout`` to create
         ``MonarchVLLMEngine`` with all actor references
+      - ``xccl_weight_update_alloc_mode``: ``AllocationMode`` used when patching
+        FSDP XCCL connect (see
+        ``weight_sync.resolve_xccl_alloc_mode``)
     """
 
     def __init__(
@@ -298,6 +312,7 @@ class TrainerActor(Actor):
         generator_actor,
         reward_actor=None,
         agent_actor=None,
+        xccl_weight_update_alloc_mode: AllocationMode | None = None,
     ):
         self._cli_args = cli_args
         self._env_vars = env_vars
@@ -308,6 +323,7 @@ class TrainerActor(Actor):
         self._generator = generator_actor
         self._reward = reward_actor
         self._agent = agent_actor
+        self._xccl_weight_update_alloc_mode = xccl_weight_update_alloc_mode
         self._trainer = None
         self._train_kwargs: dict = {}
         self._max_steps = 0
@@ -392,22 +408,19 @@ class TrainerActor(Actor):
         ws = self._world_size
 
         def _patched_connect(engine_self, engine, meta):
-            """Fix XCCL weight update group size for Monarch.
-
-            Monarch uses 1 inference worker (not gen.dp_size), so the
-            HCCL process group for weight updates must reflect that.
-            """
-            if meta.type == "xccl" and meta.alloc_mode is not None:
-                from areal.api import AllocationMode
+            """Fix XCCL weight update alloc_mode for Monarch (see weight_sync)."""
+            if (
+                meta.type == "xccl"
+                and meta.alloc_mode is not None
+                and self._xccl_weight_update_alloc_mode is not None
+            ):
                 orig_gen_ws = meta.alloc_mode.gen.world_size
-                fixed_alloc = AllocationMode.from_str(
-                    f"vllm:d1p1t1+d{ws}p1t1"
-                )
-                meta.alloc_mode = fixed_alloc
+                fixed = self._xccl_weight_update_alloc_mode
+                meta.alloc_mode = fixed
                 logger.info(
-                    f"TrainerActor: fixed XCCL alloc_mode "
-                    f"gen.world_size {orig_gen_ws} -> 1 "
-                    f"(Monarch has 1 inference worker)"
+                    "TrainerActor: XCCL weight-update alloc_mode set for Monarch: "
+                    f"gen.world_size {orig_gen_ws} -> {fixed.gen.world_size} "
+                    f"(train_world_size={ws})"
                 )
             return _orig_connect(engine_self, engine, meta)
 
@@ -431,12 +444,12 @@ class TrainerActor(Actor):
         self._train_kwargs = _captured["kwargs"]
 
         if (
-            hasattr(self._trainer, 'weight_update_meta')
+            hasattr(self._trainer, "weight_update_meta")
             and self._trainer.weight_update_meta.alloc_mode is not None
+            and self._xccl_weight_update_alloc_mode is not None
         ):
-            from areal.api import AllocationMode
             self._trainer.weight_update_meta.alloc_mode = (
-                AllocationMode.from_str(f"vllm:d1p1t1+d{ws}p1t1")
+                self._xccl_weight_update_alloc_mode
             )
 
         config = self._trainer.config
@@ -1013,6 +1026,9 @@ async def monarch_main_async(config, run_id: int = 0):
             }
 
             multi_rank = nprocs > 1
+            xccl_alloc_mode = resolve_xccl_alloc_mode(
+                config, alloc_mode, train_world_size=nprocs
+            )
 
             if multi_rank:
                 logger.info(
@@ -1050,6 +1066,7 @@ async def monarch_main_async(config, run_id: int = 0):
                 generator_actor=generator_actor,
                 reward_actor=reward_actor,
                 agent_actor=agent_actor,
+                xccl_weight_update_alloc_mode=xccl_alloc_mode,
             )
 
             # ============================================================
