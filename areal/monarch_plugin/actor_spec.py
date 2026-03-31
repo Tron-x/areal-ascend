@@ -31,6 +31,32 @@ class ResourceKind(Enum):
     NPU_MULTI = "npu_multi"  # per_host={"npu": N}, all training devices visible
 
 
+# ---------------------------------------------------------------------------
+# Declarative reference types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ActorRef:
+    """Reference to another actor by name.
+
+    Resolved by :class:`ActorRegistry` at spawn / init time to the actual
+    actor reference from the already-spawned actors dict.
+    """
+
+    name: str
+
+
+@dataclass(frozen=True)
+class CtxRef:
+    """Reference to a value in :attr:`ActorContext.extra`.
+
+    Resolved by :class:`ActorRegistry` at spawn / init time.
+    """
+
+    key: str
+
+
 @dataclass
 class ActorContext:
     """Bundles everything a spec callback might need to construct args.
@@ -65,9 +91,10 @@ class ActorSpec:
         ``() -> callable``  Returns the bootstrap function passed to
         ``host.spawn_procs(bootstrap=...)``.
     constructor_args:
-        ``(ctx: ActorContext) -> dict``  Returns keyword arguments for the
-        actor constructor.  ``ctx.actors`` contains previously spawned actors
-        so dependencies can be wired.
+        Either a ``dict`` with :class:`ActorRef` / :class:`CtxRef` instances
+        mixed with plain values, *or* a ``(ctx: ActorContext) -> dict``
+        callable.  When a dict is provided the registry resolves references
+        automatically; when a callable is provided it is invoked at spawn time.
     dependencies:
         Names of actors that must be spawned (and optionally initialised)
         before this one.
@@ -75,7 +102,10 @@ class ActorSpec:
         If set, this method is called on the actor after spawning (e.g.
         ``"setup"`` or ``"initialize"``).
     init_args:
-        ``(ctx: ActorContext) -> dict``  Arguments for the ``init_method`` call.
+        Either a ``dict`` with :class:`ActorRef` / :class:`CtxRef` instances
+        mixed with plain values, *or* a ``(ctx: ActorContext) -> dict``
+        callable.  When a dict is provided the registry resolves references
+        automatically; when a callable is provided it is invoked at init time.
     post_spawn:
         ``(procs, ctx: ActorContext) -> dict[str, ActorRef]``  Called after the
         ProcMesh is created but before the main actor is initialised.  Use this
@@ -93,10 +123,10 @@ class ActorSpec:
     actor_class: type
     resource: ResourceKind
     bootstrap_factory: Callable[[], Callable]
-    constructor_args: Callable[[ActorContext], dict]
+    constructor_args: dict[str, Any] | Callable[[ActorContext], dict]
     dependencies: list[str] = field(default_factory=list)
     init_method: str | None = None
-    init_args: Callable[[ActorContext], dict] | None = None
+    init_args: dict[str, Any] | Callable[[ActorContext], dict] | None = None
     post_spawn: Callable[[Any, ActorContext], dict[str, Any]] | None = None
     nprocs: int = 1
     """Number of processes in the ProcMesh.  Only used when ``resource=NPU_MULTI``."""

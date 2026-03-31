@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from areal.monarch_plugin.actor_spec import ActorContext, ResourceKind
+from areal.monarch_plugin.actor_spec import ActorContext, ActorRef, CtxRef, ResourceKind
 from areal.utils import logging
 
 logger = logging.getLogger("ActorRegistry")
@@ -88,6 +88,37 @@ class ActorRegistry:
         raise ValueError(f"Unknown ResourceKind: {spec.resource}")
 
     # ------------------------------------------------------------------
+    # Reference resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_refs(self, args: dict, ctx: ActorContext) -> dict:
+        """Walk *args* and resolve :class:`ActorRef` / :class:`CtxRef`.
+
+        Plain values are passed through unchanged.
+        """
+        resolved: dict[str, Any] = {}
+        for k, v in args.items():
+            if isinstance(v, ActorRef):
+                resolved[k] = self.actor(v.name)
+            elif isinstance(v, CtxRef):
+                resolved[k] = ctx.extra[v.key]
+            else:
+                resolved[k] = v
+        return resolved
+
+    def _resolve_args(
+        self,
+        args: dict[str, Any] | Callable[[ActorContext], dict] | None,
+        ctx: ActorContext,
+    ) -> dict[str, Any]:
+        """Resolve constructor/init args — supports dict or callable."""
+        if args is None:
+            return {}
+        if isinstance(args, dict):
+            return self._resolve_refs(args, ctx)
+        return args(ctx)
+
+    # ------------------------------------------------------------------
     # Spawn
     # ------------------------------------------------------------------
 
@@ -99,37 +130,59 @@ class ActorRegistry:
         order = self._topo_sort()
         logger.info(f"Actor spawn order: {order}")
 
-        for name in order:
-            spec = self._specs[name]
-            ctx.actors = {**self._actors, **self._extra_actors}
+        spawned: list[str] = []
+        try:
+            for name in order:
+                spec = self._specs[name]
+                ctx.actors = {**self._actors, **self._extra_actors}
 
-            bootstrap = spec.bootstrap_factory()
-            per_host = self._per_host(spec)
+                bootstrap = spec.bootstrap_factory()
+                per_host = self._per_host(spec)
 
-            logger.info(
-                f"Spawning ProcMesh for '{name}' (resource={spec.resource.value})"
+                logger.info(
+                    f"Spawning ProcMesh for '{name}' "
+                    f"(resource={spec.resource.value})"
+                )
+                procs = host.spawn_procs(
+                    per_host=per_host,
+                    bootstrap=bootstrap,
+                    name=name,
+                )
+                self._procs[name] = procs
+                spawned.append(name)
+
+                # post_spawn hook (e.g. WorkerRegistry on generator ProcMesh)
+                if spec.post_spawn is not None:
+                    extras = spec.post_spawn(procs, ctx)
+                    if extras:
+                        self._extra_actors.update(extras)
+                        ctx.actors = {**self._actors, **self._extra_actors}
+                        logger.info(
+                            f"  post_spawn added actors: {list(extras.keys())}"
+                        )
+
+                # Build constructor args (dict or callable)
+                ctor_kwargs = self._resolve_args(spec.constructor_args, ctx)
+
+                logger.info(
+                    f"Spawning actor '{name}' ({spec.actor_class.__name__})"
+                )
+                actor_ref = procs.spawn(name, spec.actor_class, **ctor_kwargs)
+                self._actors[name] = actor_ref
+
+        except Exception:
+            logger.error(
+                f"Spawn failed at '{name}', "
+                f"rolling back {len(spawned)} ProcMeshes"
             )
-            procs = host.spawn_procs(
-                per_host=per_host,
-                bootstrap=bootstrap,
-                name=name,
-            )
-            self._procs[name] = procs
-
-            # post_spawn hook (e.g. WorkerRegistry on generator ProcMesh)
-            if spec.post_spawn is not None:
-                extras = spec.post_spawn(procs, ctx)
-                if extras:
-                    self._extra_actors.update(extras)
-                    ctx.actors = {**self._actors, **self._extra_actors}
-                    logger.info(f"  post_spawn added actors: {list(extras.keys())}")
-
-            # Build constructor args
-            ctor_kwargs = spec.constructor_args(ctx)
-
-            logger.info(f"Spawning actor '{name}' ({spec.actor_class.__name__})")
-            actor_ref = procs.spawn(name, spec.actor_class, **ctor_kwargs)
-            self._actors[name] = actor_ref
+            for rollback_name in reversed(spawned):
+                procs = self._procs.pop(rollback_name, None)
+                if procs is not None:
+                    try:
+                        procs.stop().get()
+                    except Exception:
+                        pass
+            raise
 
         return {**self._actors, **self._extra_actors}
 
@@ -163,7 +216,7 @@ class ActorRegistry:
                     else result_mesh
                 )
             else:
-                init_kwargs = spec.init_args(ctx) if spec.init_args else {}
+                init_kwargs = self._resolve_args(spec.init_args, ctx)
                 if init_kwargs:
                     result = await method.call_one(**init_kwargs)
                 else:

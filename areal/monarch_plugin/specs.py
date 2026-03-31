@@ -25,7 +25,7 @@ from areal.infra.utils.launcher import (
     get_scheduling_spec,
     get_thread_env_vars,
 )
-from areal.monarch_plugin.actor_spec import ActorSpec, ResourceKind
+from areal.monarch_plugin.actor_spec import ActorRef, ActorSpec, CtxRef, ResourceKind
 from areal.monarch_plugin.agent_actor import AgentActor
 from areal.monarch_plugin.bootstraps import (
     make_cpu_bootstrap,
@@ -106,12 +106,12 @@ def make_actor_specs(
             bootstrap_factory=lambda: make_generator_bootstrap(
                 ",".join(inf_device_ids)
             ),
-            constructor_args=lambda ctx: {"vllm_cli_args": vllm_cli_args},
+            constructor_args={"vllm_cli_args": vllm_cli_args},
             dependencies=[],
             init_method="setup",
-            init_args=lambda ctx: {
-                "host_mesh": ctx.extra["host"],
-                "worker_registry": ctx.actors.get("worker_registry"),
+            init_args={
+                "host_mesh": CtxRef("host"),
+                "worker_registry": ActorRef("worker_registry"),
                 "device_ids": inf_device_ids,
             },
             post_spawn=_gen_post_spawn,
@@ -125,7 +125,7 @@ def make_actor_specs(
             actor_class=RewardActor,
             resource=ResourceKind.CPU,
             bootstrap_factory=make_cpu_bootstrap,
-            constructor_args=lambda ctx: {},
+            constructor_args={},
             dependencies=[],
         )
     )
@@ -137,7 +137,7 @@ def make_actor_specs(
             actor_class=SandboxActor,
             resource=ResourceKind.CPU,
             bootstrap_factory=make_cpu_bootstrap,
-            constructor_args=lambda ctx: {},
+            constructor_args={},
             dependencies=[],
         )
     )
@@ -149,10 +149,10 @@ def make_actor_specs(
             actor_class=AgentActor,
             resource=ResourceKind.CPU,
             bootstrap_factory=make_cpu_bootstrap,
-            constructor_args=lambda ctx: {
-                "generator_actor": ctx.actors["generator"],
-                "sandbox_actor": ctx.actors["sandbox"],
-                "reward_actor": ctx.actors["reward"],
+            constructor_args={
+                "generator_actor": ActorRef("generator"),
+                "sandbox_actor": ActorRef("sandbox"),
+                "reward_actor": ActorRef("reward"),
             },
             dependencies=["generator", "sandbox", "reward"],
         )
@@ -165,7 +165,7 @@ def make_actor_specs(
             actor_class=ReplayBufferActor,
             resource=ResourceKind.CPU,
             bootstrap_factory=make_cpu_bootstrap,
-            constructor_args=lambda ctx: {"max_size": 8},
+            constructor_args={"max_size": 8},
             dependencies=[],
         )
     )
@@ -177,14 +177,14 @@ def make_actor_specs(
             actor_class=RolloutActor,
             resource=ResourceKind.CPU,
             bootstrap_factory=make_cpu_bootstrap,
-            constructor_args=lambda ctx: {
-                "generator_actor": ctx.actors["generator"],
-                "reward_actor": ctx.actors["reward"],
-                "agent_actor": ctx.actors["agent"],
+            constructor_args={
+                "generator_actor": ActorRef("generator"),
+                "reward_actor": ActorRef("reward"),
+                "agent_actor": ActorRef("agent"),
             },
             dependencies=["generator", "reward", "agent"],
             init_method="setup",
-            init_args=lambda ctx: {
+            init_args={
                 "cli_args": sys.argv[1:],
                 "train_dp_size": 1,
             },
@@ -244,16 +244,16 @@ def make_actor_specs(
                 else ResourceKind.NPU_SINGLE,
                 nprocs=nprocs,
                 bootstrap_factory=bootstrap_fn,
-                constructor_args=lambda ctx: {
+                constructor_args={
                     "cli_args": sys.argv[1:],
                     "env_vars": trainer_env,
                     "rank": -1 if multi_rank else 0,
                     "world_size": nprocs,
                     "master_addr": placement.master_addr,
                     "master_port": master_port,
-                    "generator_actor": ctx.actors["generator"],
-                    "reward_actor": ctx.actors["reward"],
-                    "agent_actor": ctx.actors["agent"],
+                    "generator_actor": ActorRef("generator"),
+                    "reward_actor": ActorRef("reward"),
+                    "agent_actor": ActorRef("agent"),
                     "xccl_weight_update_alloc_mode": xccl_alloc_mode,
                 },
                 dependencies=["generator", "reward", "agent"],
