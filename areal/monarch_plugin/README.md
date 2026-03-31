@@ -48,18 +48,37 @@ MonarchOrchestrator (主进程, 无 NPU)
 
 ## 文件说明
 
+### 编排层（声明式 Actor 生命周期管理）
+
 | 文件 | 说明 |
 |------|------|
-| `launcher.py` | 主入口，负责创建 ProcMesh、spawn Actor、编排训练流程 |
-| `topology.py` | 集群拓扑与设备放置抽象（单机/多机统一接口） |
-| `generator_actor.py` | 封装 vLLM `AsyncLLM`，提供 `/v1/completions` 等推理端点 |
+| `launcher.py` | 主入口（~260 行），解析配置 → 构建 specs → 调用 registry spawn/init → 启动 pipeline |
+| `actor_spec.py` | `ActorSpec` / `ActorContext` 数据类 — 每个 actor 的声明式描述（资源、依赖、构造参数） |
+| `actor_registry.py` | `ActorRegistry` — 拓扑排序、有序 spawn/init、反序 shutdown 的生命周期管理器 |
+| `specs.py` | `make_actor_specs()` — 根据配置构建所有 ActorSpec 的唯一入口 |
+| `pipeline.py` | `run_training_pipeline()` — 异步 rollout→replay_buffer→training 流水线 |
+| `bootstraps.py` | 平台无关的 bootstrap 工厂（Ascend NPU / CUDA） |
+
+### Actor 实现
+
+| 文件 | 说明 |
+|------|------|
+| `generator_actor.py` | 封装 vLLM `AsyncLLM`，提供推理端点 |
 | `executor.py` | `AReaLMonarchExecutor` — 自定义 vLLM Executor，在 Monarch Worker ProcMesh 中运行 |
 | `monarch_inf_engine.py` | `MonarchVLLMEngine` — 替换 AReaL 的 `RemotevLLMEngine`，通过 Monarch RPC 路由请求 |
+| `trainer_actor.py` | `TrainerActor` — in-process FSDP 训练，拆分 rollout/train_on_batch 端点 |
 | `reward_actor.py` | `RewardActor` + `MonarchRewardWrapper`，CPU 上运行 reward 计算 |
 | `sandbox_actor.py` | `SandboxActor` — 隔离子进程执行 Python 代码（带超时） |
 | `agent_actor.py` | `AgentActor` + `MonarchAgentWorkflow` — 多轮 Agent 交互编排 |
 | `replay_buffer_actor.py` | `ReplayBufferActor` — 异步经验缓冲，支持版本感知的过期淘汰 |
 | `rollout_actor.py` | `RolloutActor` — 独立 rollout 生产，拥有自己的 dataloader 和 WorkflowExecutor |
+
+### 基础设施
+
+| 文件 | 说明 |
+|------|------|
+| `topology.py` | 集群拓扑与设备放置抽象（单机/多机统一接口） |
+| `weight_sync.py` | XCCL weight sync alloc_mode 解析与修正 |
 | `scripts/run.sh` | 通用执行脚本（支持任意 N+M 配置） |
 | `scripts/run_1x1.sh` | 快捷脚本：1 卡推理 + 1 卡训练 |
 | `scripts/run_4x4.sh` | 快捷脚本：4 卡推理 + 4 卡训练 |
@@ -241,6 +260,7 @@ MonarchPlugin INFO: Training completed successfully.
 | Phase 5 | AgentActor + SandboxActor，多轮 Agent 场景 | 5 |
 | Phase 6 | ReplayBufferActor，异步 rollout + 训练流水线 | 6 |
 | Phase 6b | RolloutActor 独立化，真正的流水线并行 | 8 |
+| Phase 7 | 声明式 launcher 重构：ActorSpec + ActorRegistry + 拓扑排序 | 8 |
 
 ## 踩坑记录
 
@@ -293,3 +313,9 @@ allocation_mode + cluster config
 - 解耦 rollout 生产和 training 消费的速率差异
 - 支持版本感知的过期淘汰（staleness control）
 - 实现流水线并行：rollout step N+1 与 training step N 重叠执行
+
+**为什么要做声明式 launcher 重构？**
+- 旧 launcher 是 1100+ 行的单一函数，spawn/init/shutdown 逻辑交织
+- 新架构：每个 actor 用 `ActorSpec` 声明式描述（资源、依赖、构造参数），`ActorRegistry` 自动拓扑排序管理生命周期
+- launcher 降到 ~260 行，只做配置解析 → specs 构建 → registry 调用 → pipeline 启动
+- 新增 actor 只需在 `specs.py` 加一个 `ActorSpec`，无需改 launcher 逻辑
