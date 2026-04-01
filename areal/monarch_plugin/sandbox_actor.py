@@ -20,7 +20,10 @@ import textwrap
 import time
 from typing import Any
 
-from monarch.actor import Actor, endpoint
+from monarch.actor import endpoint
+
+from areal.monarch_plugin.actor_base import MonarchActor
+from areal.monarch_plugin.actor_spec import ResourceKind
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +58,15 @@ print(json.dumps({{
 """)
 
 
-class SandboxActor(Actor):
+class SandboxActor(MonarchActor):
     """Monarch Actor providing subprocess-isolated Python execution.
 
     Each ``execute_code`` call spawns a fresh Python subprocess with
     a hard timeout, preventing resource leaks and infinite loops.
     """
+
+    resource = ResourceKind.CPU
+    dependencies: list[str] = []
 
     def __init__(self):
         self._call_count = 0

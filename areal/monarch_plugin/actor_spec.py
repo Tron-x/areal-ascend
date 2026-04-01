@@ -1,23 +1,20 @@
-"""Declarative actor specification for Monarch orchestration.
+"""Declarative actor specification types for Monarch orchestration.
 
-Instead of imperatively spawning each actor in a monolithic function,
-each actor type is described by an :class:`ActorSpec` dataclass.  The
-:class:`ActorRegistry` consumes these specs, resolves dependencies via
-topological sort, and handles the full lifecycle automatically.
+Each actor class inherits from :class:`MonarchActor` (in ``actor_base.py``)
+and declares its resource requirements, dependencies, and lifecycle hooks as
+class-level attributes.  The :class:`ActorRegistry` discovers these via
+``cls.actor_name()`` and ``cls.dependencies``, resolves the dependency graph,
+and calls ``cls.spawn()`` / ``cls.initialize_actor()`` / ``cls.shutdown_actor()``
+in the correct order.
 
-Example::
-
-    specs = [
-        ActorSpec(name="generator", actor_class=GeneratorActor, ...),
-        ActorSpec(name="reward", actor_class=RewardActor, ...),
-    ]
-    registry = ActorRegistry(specs)
-    actors = await registry.spawn_all(ctx)
+This module provides the shared data types:
+  - :class:`ResourceKind` — CPU, NPU_SINGLE, NPU_MULTI
+  - :class:`ActorRef` / :class:`CtxRef` — declarative reference markers
+  - :class:`ActorContext` — shared mutable state passed to all classmethods
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -40,8 +37,8 @@ class ResourceKind(Enum):
 class ActorRef:
     """Reference to another actor by name.
 
-    Resolved by :class:`ActorRegistry` at spawn / init time to the actual
-    actor reference from the already-spawned actors dict.
+    Resolved at spawn / init time to the actual actor reference from
+    the already-spawned actors dict.
     """
 
     name: str
@@ -51,7 +48,7 @@ class ActorRef:
 class CtxRef:
     """Reference to a value in :attr:`ActorContext.extra`.
 
-    Resolved by :class:`ActorRegistry` at spawn / init time.
+    Resolved at spawn / init time.
     """
 
     key: str
@@ -59,10 +56,10 @@ class CtxRef:
 
 @dataclass
 class ActorContext:
-    """Bundles everything a spec callback might need to construct args.
+    """Mutable shared state passed to all actor classmethods.
 
-    Passed to ``constructor_args`` and ``init_args`` callables so they can
-    reference config, topology, and already-spawned actors.
+    The registry and ``MonarchActor.spawn()`` / ``initialize_actor()`` /
+    ``shutdown_actor()`` read and write into this object.
     """
 
     config: Any
@@ -70,65 +67,7 @@ class ActorContext:
     placement: Any
     host: Any
     actors: dict[str, Any] = field(default_factory=dict)
+    procs: dict[str, Any] = field(default_factory=dict)
+    extra_actors: dict[str, Any] = field(default_factory=dict)
     master_port: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ActorSpec:
-    """Declarative description of one Monarch actor.
-
-    Parameters
-    ----------
-    name:
-        Unique identifier used as key in the actors dict and for dependency
-        resolution.
-    actor_class:
-        The Monarch ``Actor`` subclass to spawn.
-    resource:
-        Determines the ``per_host`` ProcMesh configuration.
-    bootstrap_factory:
-        ``() -> callable``  Returns the bootstrap function passed to
-        ``host.spawn_procs(bootstrap=...)``.
-    constructor_args:
-        Either a ``dict`` with :class:`ActorRef` / :class:`CtxRef` instances
-        mixed with plain values, *or* a ``(ctx: ActorContext) -> dict``
-        callable.  When a dict is provided the registry resolves references
-        automatically; when a callable is provided it is invoked at spawn time.
-    dependencies:
-        Names of actors that must be spawned (and optionally initialised)
-        before this one.
-    init_method:
-        If set, this method is called on the actor after spawning (e.g.
-        ``"setup"`` or ``"initialize"``).
-    init_args:
-        Either a ``dict`` with :class:`ActorRef` / :class:`CtxRef` instances
-        mixed with plain values, *or* a ``(ctx: ActorContext) -> dict``
-        callable.  When a dict is provided the registry resolves references
-        automatically; when a callable is provided it is invoked at init time.
-    post_spawn:
-        ``(procs, ctx: ActorContext) -> dict[str, ActorRef]``  Called after the
-        ProcMesh is created but before the main actor is initialised.  Use this
-        to spawn additional actors on the same ProcMesh (e.g. WorkerRegistry).
-        Returns a dict of extra actor references to merge into the registry.
-    is_multi_rank:
-        If ``True``, the ProcMesh has >1 process and ``call()`` (broadcast)
-        should be used instead of ``call_one()``.
-    shutdown_broadcast:
-        If ``True``, use ``call()`` for shutdown instead of ``call_one()``.
-        Needed when the actor has multiple ranks (e.g. TrainerActor).
-    """
-
-    name: str
-    actor_class: type
-    resource: ResourceKind
-    bootstrap_factory: Callable[[], Callable]
-    constructor_args: dict[str, Any] | Callable[[ActorContext], dict]
-    dependencies: list[str] = field(default_factory=list)
-    init_method: str | None = None
-    init_args: dict[str, Any] | Callable[[ActorContext], dict] | None = None
-    post_spawn: Callable[[Any, ActorContext], dict[str, Any]] | None = None
-    nprocs: int = 1
-    """Number of processes in the ProcMesh.  Only used when ``resource=NPU_MULTI``."""
-    is_multi_rank: bool = False
-    shutdown_broadcast: bool = False

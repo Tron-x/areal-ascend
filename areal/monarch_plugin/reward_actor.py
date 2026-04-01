@@ -20,12 +20,19 @@ import time
 import traceback
 from typing import Any
 
-from monarch.actor import Actor, endpoint
+from monarch.actor import endpoint
+
+from areal.monarch_plugin.actor_base import MonarchActor
+from areal.monarch_plugin.actor_spec import ResourceKind
 
 logger = logging.getLogger(__name__)
 
 
-class RewardActor(Actor):
+class RewardActor(MonarchActor):
+    """CPU-only Monarch Actor for reward computation."""
+
+    resource = ResourceKind.CPU
+    dependencies: list[str] = []
     """Monarch Actor that loads and executes a reward function.
 
     Lifecycle:

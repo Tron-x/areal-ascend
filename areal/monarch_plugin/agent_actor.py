@@ -17,7 +17,10 @@ import re
 import time
 from typing import Any
 
-from monarch.actor import Actor, endpoint
+from monarch.actor import endpoint
+
+from areal.monarch_plugin.actor_base import MonarchActor
+from areal.monarch_plugin.actor_spec import ActorRef, ResourceKind
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +45,7 @@ def _parse_token_ids(tokens: list[str]) -> list[int]:
     return ids
 
 
-class AgentActor(Actor):
+class AgentActor(MonarchActor):
     """Multi-turn agent that orchestrates generation, tool use, and reward.
 
     Lifecycle:
@@ -56,6 +59,17 @@ class AgentActor(Actor):
       AgentActor ──RPC──→ SandboxActor (code execution)
       AgentActor ──RPC──→ RewardActor (reward computation)
     """
+
+    resource = ResourceKind.CPU
+    dependencies = ["generator", "sandbox", "reward"]
+
+    @classmethod
+    def constructor_args(cls, ctx) -> dict:
+        return {
+            "generator_actor": ActorRef("generator"),
+            "sandbox_actor": ActorRef("sandbox"),
+            "reward_actor": ActorRef("reward"),
+        }
 
     def __init__(self, generator_actor, sandbox_actor, reward_actor):
         self._generator = generator_actor

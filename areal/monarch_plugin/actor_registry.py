@@ -1,45 +1,50 @@
 """Actor lifecycle manager for Monarch orchestration.
 
-Takes a list of :class:`ActorSpec` instances and handles:
+Takes a list of :class:`MonarchActor` **classes** (not instances) and handles:
 
-1. **Topological sort** on dependency graph
-2. **Ordered spawning** -- ProcMesh creation, post_spawn hooks, actor init
-3. **Reverse-ordered shutdown** -- graceful cleanup
+1. **Topological sort** on dependency graph (from ``cls.dependencies``)
+2. **Ordered spawning** -- calls ``cls.spawn(ctx, host)`` in dependency order
+3. **Ordered initialization** -- calls ``cls.initialize_actor(ctx)``
+4. **Reverse-ordered shutdown** -- calls ``cls.shutdown_actor(ctx)``
 
 Usage::
 
-    specs = [ActorSpec(...), ActorSpec(...)]
-    registry = ActorRegistry(specs)
-    actors = await registry.spawn_all(ctx)
-    info = await registry.initialize_all(ctx)
+    from areal.monarch_plugin.generator_actor import GeneratorActor
+    from areal.monarch_plugin.reward_actor import RewardActor
+    ...
+
+    actor_classes = [GeneratorActor, RewardActor, ...]
+    registry = ActorRegistry(actor_classes)
+    await registry.spawn_all(ctx, host)
+    await registry.initialize_all(ctx)
     # ... run pipeline ...
-    await registry.shutdown_all()
+    await registry.shutdown_all(ctx)
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from areal.monarch_plugin.actor_spec import ActorContext, ActorRef, CtxRef, ResourceKind
+from areal.monarch_plugin.actor_spec import ActorContext
 from areal.utils import logging
 
 logger = logging.getLogger("ActorRegistry")
 
 
 class ActorRegistry:
-    """Manages the full lifecycle of Monarch actors declared via specs."""
+    """Manages the full lifecycle of MonarchActor classes."""
 
-    def __init__(self, specs: list):
-        self._specs: dict[str, Any] = {s.name: s for s in specs}
-        self._actors: dict[str, Any] = {}
-        self._procs: dict[str, Any] = {}
-        self._extra_actors: dict[str, Any] = {}
+    def __init__(self, actor_classes: list[type]):
+        self._classes: dict[str, type] = {
+            cls.actor_name(): cls for cls in actor_classes
+        }
+        self._spawn_order: list[str] = []
 
         # Validate no duplicate names
-        if len(self._specs) != len(specs):
-            names = [s.name for s in specs]
+        if len(self._classes) != len(actor_classes):
+            names = [cls.actor_name() for cls in actor_classes]
             dupes = {n for n in names if names.count(n) > 1}
-            raise ValueError(f"Duplicate actor spec names: {dupes}")
+            raise ValueError(f"Duplicate actor names: {dupes}")
 
     # ------------------------------------------------------------------
     # Dependency resolution
@@ -47,14 +52,14 @@ class ActorRegistry:
 
     def _topo_sort(self) -> list[str]:
         """Kahn's algorithm: return names in spawn order."""
-        in_degree: dict[str, int] = {n: 0 for n in self._specs}
-        graph: dict[str, list[str]] = {n: [] for n in self._specs}
+        in_degree: dict[str, int] = {n: 0 for n in self._classes}
+        graph: dict[str, list[str]] = {n: [] for n in self._classes}
 
-        for name, spec in self._specs.items():
-            for dep in spec.dependencies:
-                if dep not in self._specs:
+        for name, cls in self._classes.items():
+            for dep in cls.dependencies:
+                if dep not in self._classes:
                     raise ValueError(
-                        f"Actor '{name}' depends on '{dep}' which is not in specs"
+                        f"Actor '{name}' depends on '{dep}' which is not in registry"
                     )
                 graph[dep].append(name)
                 in_degree[name] += 1
@@ -69,122 +74,31 @@ class ActorRegistry:
                 if in_degree[neighbour] == 0:
                     queue.append(neighbour)
 
-        if len(order) != len(self._specs):
-            remaining = set(self._specs) - set(order)
+        if len(order) != len(self._classes):
+            remaining = set(self._classes) - set(order)
             raise ValueError(f"Circular dependency detected among actors: {remaining}")
         return order
-
-    # ------------------------------------------------------------------
-    # ProcMesh helper
-    # ------------------------------------------------------------------
-
-    def _per_host(self, spec) -> dict:
-        if spec.resource == ResourceKind.CPU:
-            return {"cpu": 1}
-        elif spec.resource == ResourceKind.NPU_SINGLE:
-            return {"npu": 1}
-        elif spec.resource == ResourceKind.NPU_MULTI:
-            return {"npu": spec.nprocs}
-        raise ValueError(f"Unknown ResourceKind: {spec.resource}")
-
-    # ------------------------------------------------------------------
-    # Reference resolution
-    # ------------------------------------------------------------------
-
-    def _resolve_refs(self, args: dict, ctx: ActorContext) -> dict:
-        """Walk *args* and resolve :class:`ActorRef` / :class:`CtxRef`.
-
-        Plain values are passed through unchanged.
-        """
-        resolved: dict[str, Any] = {}
-        for k, v in args.items():
-            if isinstance(v, ActorRef):
-                resolved[k] = self.actor(v.name)
-            elif isinstance(v, CtxRef):
-                resolved[k] = ctx.extra[v.key]
-            else:
-                resolved[k] = v
-        return resolved
-
-    def _resolve_args(
-        self,
-        args: dict[str, Any] | Callable[[ActorContext], dict] | None,
-        ctx: ActorContext,
-    ) -> dict[str, Any]:
-        """Resolve constructor/init args — supports dict or callable."""
-        if args is None:
-            return {}
-        if isinstance(args, dict):
-            return self._resolve_refs(args, ctx)
-        return args(ctx)
 
     # ------------------------------------------------------------------
     # Spawn
     # ------------------------------------------------------------------
 
     async def spawn_all(self, ctx: ActorContext, host) -> dict[str, Any]:
-        """Create ProcMeshes and spawn actors in dependency order.
+        """Spawn all actors in dependency order.
 
         Returns a dict mapping actor name -> ActorRef.
         """
         order = self._topo_sort()
+        self._spawn_order = order
         logger.info(f"Actor spawn order: {order}")
 
         spawned: list[str] = []
-        try:
-            for name in order:
-                spec = self._specs[name]
-                ctx.actors = {**self._actors, **self._extra_actors}
+        for name in order:
+            cls = self._classes[name]
+            await cls.spawn(ctx, host)
+            spawned.append(name)
 
-                bootstrap = spec.bootstrap_factory()
-                per_host = self._per_host(spec)
-
-                logger.info(
-                    f"Spawning ProcMesh for '{name}' "
-                    f"(resource={spec.resource.value})"
-                )
-                procs = host.spawn_procs(
-                    per_host=per_host,
-                    bootstrap=bootstrap,
-                    name=name,
-                )
-                self._procs[name] = procs
-                spawned.append(name)
-
-                # post_spawn hook (e.g. WorkerRegistry on generator ProcMesh)
-                if spec.post_spawn is not None:
-                    extras = spec.post_spawn(procs, ctx)
-                    if extras:
-                        self._extra_actors.update(extras)
-                        ctx.actors = {**self._actors, **self._extra_actors}
-                        logger.info(
-                            f"  post_spawn added actors: {list(extras.keys())}"
-                        )
-
-                # Build constructor args (dict or callable)
-                ctor_kwargs = self._resolve_args(spec.constructor_args, ctx)
-
-                logger.info(
-                    f"Spawning actor '{name}' ({spec.actor_class.__name__})"
-                )
-                actor_ref = procs.spawn(name, spec.actor_class, **ctor_kwargs)
-                self._actors[name] = actor_ref
-
-        except Exception:
-            logger.error(
-                f"Spawn failed at '{name}', "
-                f"rolling back {len(spawned)} ProcMeshes"
-            )
-            for rollback_name in reversed(spawned):
-                procs = self._procs.pop(rollback_name, None)
-                if procs is not None:
-                    try:
-                        procs.stop().get()
-                    except Exception:
-                        pass
-            raise
-
-        return {**self._actors, **self._extra_actors}
+        return {**ctx.actors, **ctx.extra_actors}
 
     # ------------------------------------------------------------------
     # Initialize
@@ -195,35 +109,14 @@ class ActorRegistry:
 
         Returns a dict mapping actor name -> init result.
         """
-        order = self._topo_sort()
+        if not self._spawn_order:
+            self._spawn_order = self._topo_sort()
+
         results: dict[str, Any] = {}
-
-        for name in order:
-            spec = self._specs[name]
-            if spec.init_method is None:
-                continue
-
-            ctx.actors = {**self._actors, **self._extra_actors}
-            actor_ref = self._actors[name]
-            method = getattr(actor_ref, spec.init_method)
-
-            logger.info(f"Initialising '{name}' via {spec.init_method}()")
-            if spec.is_multi_rank:
-                result_mesh = await method.call()
-                result = (
-                    result_mesh.item(npu=0)
-                    if hasattr(result_mesh, "item")
-                    else result_mesh
-                )
-            else:
-                init_kwargs = self._resolve_args(spec.init_args, ctx)
-                if init_kwargs:
-                    result = await method.call_one(**init_kwargs)
-                else:
-                    result = await method.call_one()
-
+        for name in self._spawn_order:
+            cls = self._classes[name]
+            result = await cls.initialize_actor(ctx)
             results[name] = result
-            logger.info(f"  '{name}' initialised: {result}")
 
         return results
 
@@ -231,41 +124,25 @@ class ActorRegistry:
     # Shutdown
     # ------------------------------------------------------------------
 
-    async def shutdown_all(self) -> None:
+    async def shutdown_all(self, ctx: ActorContext) -> None:
         """Shut down all actors and stop ProcMeshes in reverse spawn order."""
-        order = list(reversed(list(self._procs.keys())))
+        order = list(reversed(self._spawn_order))
         logger.info(f"Shutdown order: {order}")
 
-        # Shutdown actors
-        for name in order:
-            spec = self._specs.get(name)
-            actor_ref = self._actors.get(name)
-            if actor_ref is None:
-                continue
-            try:
-                if spec and spec.shutdown_broadcast:
-                    await actor_ref.shutdown.call()
-                else:
-                    await actor_ref.shutdown.call_one()
-            except Exception as e:
-                logger.warning(f"Error shutting down actor '{name}': {e}")
-
-        # Shutdown extra actors (e.g. worker_registry)
-        for name, actor_ref in self._extra_actors.items():
+        # Shutdown extra actors first (e.g. worker_registry)
+        for name, actor_ref in ctx.extra_actors.items():
             try:
                 await actor_ref.shutdown.call_one()
             except Exception as e:
                 logger.warning(f"Error shutting down extra actor '{name}': {e}")
 
-        # Stop ProcMeshes
+        # Shutdown main actors in reverse order
         for name in order:
-            procs = self._procs.get(name)
-            if procs is None:
-                continue
+            cls = self._classes[name]
             try:
-                procs.stop().get()
+                await cls.shutdown_actor(ctx)
             except Exception as e:
-                logger.warning(f"Error stopping ProcMesh '{name}': {e}")
+                logger.warning(f"Error during shutdown of '{name}': {e}")
 
         logger.info("All actors shut down.")
 
@@ -273,14 +150,13 @@ class ActorRegistry:
     # Accessors
     # ------------------------------------------------------------------
 
-    @property
-    def actors(self) -> dict[str, Any]:
-        return {**self._actors, **self._extra_actors}
-
-    def actor(self, name: str) -> Any:
-        """Get actor reference by name."""
-        if name in self._actors:
-            return self._actors[name]
-        if name in self._extra_actors:
-            return self._extra_actors[name]
+    def actor(self, name: str, ctx: ActorContext) -> Any:
+        """Get actor reference by name from context."""
+        all_actors = {**ctx.actors, **ctx.extra_actors}
+        if name in all_actors:
+            return all_actors[name]
         raise KeyError(f"No actor named '{name}'")
+
+    @property
+    def actor_classes(self) -> dict[str, type]:
+        return dict(self._classes)

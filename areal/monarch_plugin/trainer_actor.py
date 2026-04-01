@@ -12,9 +12,16 @@ import importlib.util
 import os
 from typing import NamedTuple
 
-from monarch.actor import Actor, endpoint
+from monarch.actor import endpoint
 
 from areal.api import AllocationMode
+from areal.infra.utils.launcher import (
+    BASE_ENVIRONS,
+    get_scheduling_spec,
+    get_thread_env_vars,
+)
+from areal.monarch_plugin.actor_base import MonarchActor
+from areal.monarch_plugin.actor_spec import ActorRef, ResourceKind
 from areal.utils import logging, perf_tracer, stats_tracker
 from areal.utils.perf_tracer import Category
 
@@ -42,7 +49,7 @@ class _StepContext(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
-class TrainerActor(Actor):
+class TrainerActor(MonarchActor):
     """In-process FSDP training actor with Monarch RPC rollout and reward.
 
     Accepts ``generator_actor``, ``reward_actor``, and ``agent_actor``
@@ -52,6 +59,106 @@ class TrainerActor(Actor):
     ``xccl_weight_update_alloc_mode``: ``AllocationMode`` used when patching
     FSDPEngine XCCL connect (see ``weight_sync.resolve_xccl_alloc_mode``).
     """
+
+    dependencies = ["generator", "reward", "agent"]
+
+    @classmethod
+    def resolve_resource(cls, ctx) -> ResourceKind:
+        nprocs = ctx.alloc_mode.train.world_size
+        return ResourceKind.NPU_MULTI if nprocs > 1 else ResourceKind.NPU_SINGLE
+
+    @classmethod
+    def resolve_nprocs(cls, ctx) -> int:
+        return ctx.alloc_mode.train.world_size
+
+    @classmethod
+    def resolve_is_multi_rank(cls, ctx) -> bool:
+        return ctx.alloc_mode.train.world_size > 1
+
+    @classmethod
+    def resolve_shutdown_broadcast(cls, ctx) -> bool:
+        return ctx.alloc_mode.train.world_size > 1
+
+    @classmethod
+    def init_method(cls) -> str | None:
+        return "initialize"
+
+    @classmethod
+    def resolve_shutdown_broadcast(cls, ctx) -> bool:
+        return cls.resolve_is_multi_rank(ctx)
+
+    @classmethod
+    def bootstrap_factory(cls, ctx):
+        from areal.monarch_plugin.bootstraps import (
+            make_trainer_bootstrap_multi,
+            make_trainer_bootstrap_single,
+        )
+
+        train_device_ids = ctx.placement.training.all_device_ids
+        nprocs = ctx.alloc_mode.train.world_size
+        if nprocs > 1:
+            return make_trainer_bootstrap_multi(",".join(train_device_ids))
+        else:
+            return make_trainer_bootstrap_single(int(train_device_ids[0]))
+
+    @classmethod
+    def constructor_args(cls, ctx) -> dict:
+        import os
+        import sys
+
+        from areal.infra.utils.launcher import (
+            BASE_ENVIRONS,
+            get_scheduling_spec,
+            get_thread_env_vars,
+        )
+        from areal.monarch_plugin.weight_sync import resolve_xccl_alloc_mode
+
+        env_var = ctx.extra.get("env_var", "ASCEND_RT_VISIBLE_DEVICES")
+        train_device_ids = ctx.placement.training.all_device_ids
+        nprocs = ctx.alloc_mode.train.world_size
+        multi_rank = nprocs > 1
+
+        actor_sched = get_scheduling_spec(ctx.config.actor)
+        actor_env_vars = actor_sched.env_vars
+        thread_env = get_thread_env_vars(
+            cpus_per_task=actor_sched.cpu,
+            existing_env_vars=actor_env_vars,
+        )
+        tms_env_vars = {}
+        if ctx.config.get("enable_offload", False):
+            from areal.utils.offload import get_tms_env_vars
+
+            tms_env_vars = get_tms_env_vars()
+
+        trainer_env = {
+            **BASE_ENVIRONS,
+            **thread_env,
+            **actor_env_vars,
+            **tms_env_vars,
+            "AREAL_SPMD_MODE": "1",
+            env_var: ",".join(train_device_ids),
+            "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", ""),
+            "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE", ""),
+            "VLLM_USE_MODELSCOPE": os.environ.get("VLLM_USE_MODELSCOPE", ""),
+            "HF_ENDPOINT": os.environ.get("HF_ENDPOINT", ""),
+        }
+
+        xccl_alloc_mode = resolve_xccl_alloc_mode(
+            ctx.config, ctx.alloc_mode, train_world_size=nprocs
+        )
+
+        return {
+            "cli_args": sys.argv[1:],
+            "env_vars": trainer_env,
+            "rank": -1 if multi_rank else 0,
+            "world_size": nprocs,
+            "master_addr": ctx.placement.master_addr,
+            "master_port": ctx.master_port,
+            "generator_actor": ActorRef("generator"),
+            "reward_actor": ActorRef("reward"),
+            "agent_actor": ActorRef("agent"),
+            "xccl_weight_update_alloc_mode": xccl_alloc_mode,
+        }
 
     def __init__(
         self,

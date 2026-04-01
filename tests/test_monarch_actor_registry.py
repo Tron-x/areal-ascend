@@ -1,47 +1,75 @@
 """Unit tests for ActorRegistry: topological sort, reference resolution, rollback.
 
-All tests are pure Python — no GPU or Monarch runtime required.
+All tests are pure Python -- no GPU or Monarch runtime required.
+Monarch is mocked via in-file sys.modules injection.
 """
 
+import sys
+import types
 import unittest
 from unittest.mock import MagicMock
 
+# ---------------------------------------------------------------------------
+# Mock monarch.actor before any areal imports
+# ---------------------------------------------------------------------------
+
+_mock_monarch_actor = types.ModuleType("monarch.actor")
+
+
+class _MockActor:
+    pass
+
+
+def _mock_endpoint(fn):
+    return fn
+
+
+_mock_monarch_actor.Actor = _MockActor
+_mock_monarch_actor.endpoint = _mock_endpoint
+_mock_monarch_actor.this_host = lambda: MagicMock()
+_mock_monarch_actor.this_proc = lambda: MagicMock()
+sys.modules["monarch.actor"] = _mock_monarch_actor
+sys.modules["monarch"] = types.ModuleType("monarch")
+sys.modules["monarch._src"] = types.ModuleType("monarch._src")
+sys.modules["monarch._src.actor"] = types.ModuleType("monarch._src.actor")
+sys.modules["monarch._src.actor.actor_mesh"] = types.ModuleType("monarch._src.actor.actor_mesh")
+sys.modules["monarch._src.actor.bootstrap"] = types.ModuleType("monarch._src.actor.bootstrap")
+
+# Now import from areal.monarch_plugin
 from areal.monarch_plugin.actor_registry import ActorRegistry
 from areal.monarch_plugin.actor_spec import (
     ActorContext,
     ActorRef,
-    ActorSpec,
     CtxRef,
     ResourceKind,
 )
+from areal.monarch_plugin.actor_base import MonarchActor
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Dummy actor classes for testing
 # ---------------------------------------------------------------------------
 
 
-def _dummy_spec(
-    name: str,
-    *,
-    deps: list[str] | None = None,
-    resource: ResourceKind = ResourceKind.CPU,
-    constructor_args=None,
-    nprocs: int = 1,
-) -> ActorSpec:
-    """Build a minimal ActorSpec for testing."""
-    return ActorSpec(
-        name=name,
-        actor_class=type(f"Dummy{name.title()}", (), {}),
-        resource=resource,
-        bootstrap_factory=lambda: lambda: None,
-        constructor_args=constructor_args or {},
-        dependencies=deps or [],
-        nprocs=nprocs,
-    )
+class DummyActor(MonarchActor):
+    resource = ResourceKind.CPU
+    dependencies: list[str] = []
+
+
+class DummyA(DummyActor):
+    pass
+
+
+class DummyB(DummyActor):
+    dependencies = ["dummy_a"]
+
+
+class DummyC(DummyActor):
+    dependencies = ["dummy_a", "dummy_b"]
 
 
 def _ctx(**extra) -> ActorContext:
+    """Build a context with extra dict populated from kwargs."""
     return ActorContext(
         config=MagicMock(),
         alloc_mode=MagicMock(),
@@ -59,45 +87,50 @@ def _ctx(**extra) -> ActorContext:
 class TestTopoSort(unittest.TestCase):
     def test_correct_order(self):
         """Dependencies come before dependents."""
-        specs = [
-            _dummy_spec("c", deps=["a", "b"]),
-            _dummy_spec("a"),
-            _dummy_spec("b", deps=["a"]),
-        ]
-        reg = ActorRegistry(specs)
+        reg = ActorRegistry([DummyC, DummyA, DummyB])
         order = reg._topo_sort()
-        self.assertLess(order.index("a"), order.index("b"))
-        self.assertLess(order.index("a"), order.index("c"))
-        self.assertLess(order.index("b"), order.index("c"))
+        self.assertLess(order.index("dummy_a"), order.index("dummy_b"))
+        self.assertLess(order.index("dummy_a"), order.index("dummy_c"))
+        self.assertLess(order.index("dummy_b"), order.index("dummy_c"))
 
     def test_no_deps_any_order(self):
         """No dependencies: all valid permutations accepted."""
-        names = ["x", "y", "z"]
-        specs = [_dummy_spec(n) for n in names]
-        reg = ActorRegistry(specs)
+        reg = ActorRegistry([DummyA, DummyB, DummyActor])
         order = reg._topo_sort()
-        self.assertEqual(set(order), set(names))
+        self.assertEqual(set(order), {"dummy_a", "dummy_b", "dummy"})
 
     def test_circular_dependency_raises(self):
-        specs = [
-            _dummy_spec("a", deps=["b"]),
-            _dummy_spec("b", deps=["c"]),
-            _dummy_spec("c", deps=["a"]),
-        ]
-        reg = ActorRegistry(specs)
+        class CircA(DummyActor):
+            dependencies = ["circ_c"]
+
+        class CircC(DummyActor):
+            dependencies = ["circ_a"]
+
+        reg = ActorRegistry([CircA, CircC])
         with self.assertRaises(ValueError):
             reg._topo_sort()
 
     def test_missing_dependency_raises(self):
-        specs = [_dummy_spec("a", deps=["nonexistent"])]
-        reg = ActorRegistry(specs)
+        class DepA(DummyActor):
+            dependencies = ["nonexistent"]
+
+        reg = ActorRegistry([DepA])
         with self.assertRaises(ValueError):
             reg._topo_sort()
 
     def test_duplicate_names_rejected(self):
-        specs = [_dummy_spec("a"), _dummy_spec("a")]
+        class Actor1(DummyActor):
+            @classmethod
+            def actor_name(cls):
+                return "same_name"
+
+        class Actor2(DummyActor):
+            @classmethod
+            def actor_name(cls):
+                return "same_name"
+
         with self.assertRaises(ValueError):
-            ActorRegistry(specs)
+            ActorRegistry([Actor1, Actor2])
 
 
 # ===========================================================================
@@ -107,28 +140,26 @@ class TestTopoSort(unittest.TestCase):
 
 class TestRefResolution(unittest.TestCase):
     def setUp(self):
-        self.specs = [
-            _dummy_spec("generator"),
-            _dummy_spec("reward"),
-            _dummy_spec("trainer", deps=["generator", "reward"]),
-        ]
-        self.reg = ActorRegistry(self.specs)
-        # Simulate already-spawned actors
-        gen_mock = MagicMock(name="generator_ref")
-        reward_mock = MagicMock(name="reward_ref")
-        self.reg._actors = {"generator": gen_mock, "reward": reward_mock}
         self.ctx = _ctx(host="host_mesh_obj", port=12345)
+        self.ctx.actors["generator"] = MagicMock(name="generator_ref")
 
-    def test_actor_ref(self):
-        result = self.reg._resolve_refs({"gen": ActorRef("generator")}, self.ctx)
-        self.assertEqual(result["gen"], self.reg._actors["generator"])
+    def test_actor_ref_resolved(self):
+        result = MonarchActor._resolve_refs(
+            {"gen": ActorRef("generator")}, self.ctx
+        )
+        self.assertEqual(result["gen"], self.ctx.actors["generator"])
 
+    def test_actor_ref_not_found(self):
+        with self.assertRaises(KeyError):
+            MonarchActor._resolve_refs({"gen": ActorRef("missing")}, self.ctx)
     def test_ctx_ref(self):
-        result = self.reg._resolve_refs({"mesh": CtxRef("host")}, self.ctx)
+        result = MonarchActor._resolve_refs(
+            {"mesh": CtxRef("host")}, self.ctx
+        )
         self.assertEqual(result["mesh"], "host_mesh_obj")
 
     def test_mixed_args(self):
-        result = self.reg._resolve_refs(
+        result = MonarchActor._resolve_refs(
             {
                 "gen": ActorRef("generator"),
                 "mesh": CtxRef("host"),
@@ -137,33 +168,35 @@ class TestRefResolution(unittest.TestCase):
             },
             self.ctx,
         )
-        self.assertEqual(result["gen"], self.reg._actors["generator"])
+        self.assertEqual(result["gen"], self.ctx.actors["generator"])
         self.assertEqual(result["mesh"], "host_mesh_obj")
         self.assertEqual(result["plain"], 42)
         self.assertEqual(result["text"], "hello")
 
     def test_plain_dict_passthrough(self):
         args = {"a": 1, "b": "two", "c": [3]}
-        result = self.reg._resolve_refs(args, self.ctx)
+        result = MonarchActor._resolve_refs(args, self.ctx)
         self.assertEqual(result, args)
 
-    def test_resolve_args_dict(self):
-        result = self.reg._resolve_args(
-            {"gen": ActorRef("generator")}, self.ctx
+    def test_extra_actors_resolved(self):
+        self.ctx.extra_actors["worker_registry"] = MagicMock(name="wr_ref")
+        result = MonarchActor._resolve_refs(
+            {"wr": ActorRef("worker_registry")}, self.ctx
         )
-        self.assertEqual(result["gen"], self.reg._actors["generator"])
+        self.assertEqual(result["wr"], self.ctx.extra_actors["worker_registry"])
 
-    def test_resolve_args_callable(self):
-        """Callable path still works (backward compat)."""
-        self.ctx.actors = dict(self.reg._actors)
-        result = self.reg._resolve_args(
-            lambda ctx: {"gen": ctx.actors["generator"]}, self.ctx
-        )
-        self.assertEqual(result["gen"], self.reg._actors["generator"])
 
-    def test_resolve_args_none(self):
-        result = self.reg._resolve_args(None, self.ctx)
-        self.assertEqual(result, {})
+# ===========================================================================
+# Actor naming
+# ===========================================================================
+
+
+class TestActorNaming(unittest.TestCase):
+    def test_snake_case_conversion(self):
+        self.assertEqual(DummyA.actor_name(), "dummy_a")
+        self.assertEqual(DummyB.actor_name(), "dummy_b")
+        # _to_snake strips _Actor suffix: DummyActor -> "dummy"
+        self.assertEqual(DummyActor.actor_name(), "dummy")
 
 
 if __name__ == "__main__":

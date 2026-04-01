@@ -20,12 +20,15 @@ import time
 from collections import deque
 from typing import Any
 
-from monarch.actor import Actor, endpoint
+from monarch.actor import endpoint
+
+from areal.monarch_plugin.actor_base import MonarchActor
+from areal.monarch_plugin.actor_spec import ActorRef, CtxRef, ResourceKind
 
 logger = logging.getLogger(__name__)
 
 
-class ReplayBufferActor(Actor):
+class ReplayBufferActor(MonarchActor):
     """Monarch Actor that buffers rollout batches for async training.
 
     Each entry is a dict with:
@@ -37,6 +40,13 @@ class ReplayBufferActor(Actor):
       ``sample_batch(current_version, max_staleness)`` discards entries
       whose ``policy_version < current_version - max_staleness``.
     """
+
+    resource = ResourceKind.CPU
+    dependencies: list[str] = []
+
+    @classmethod
+    def constructor_args(cls, ctx) -> dict:
+        return {"max_size": 8}
 
     def __init__(self, max_size: int = 16):
         self._buffer: deque[dict[str, Any]] = deque(maxlen=max_size)

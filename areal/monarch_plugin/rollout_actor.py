@@ -27,12 +27,15 @@ import time
 import numpy as np
 import torch
 
-from monarch.actor import Actor, endpoint
+from monarch.actor import endpoint
+
+from areal.monarch_plugin.actor_base import MonarchActor
+from areal.monarch_plugin.actor_spec import ActorRef, ResourceKind
 
 logger = logging.getLogger(__name__)
 
 
-class RolloutActor(Actor):
+class RolloutActor(MonarchActor):
     """CPU-only Monarch Actor that produces rollout batches independently.
 
     Lifecycle:
@@ -41,6 +44,30 @@ class RolloutActor(Actor):
       do_rollout() -> produce one batch via prepare_batch, serialise
       get_stats() / shutdown()
     """
+
+    resource = ResourceKind.CPU
+    dependencies = ["generator", "reward", "agent"]
+
+    @classmethod
+    def constructor_args(cls, ctx) -> dict:
+        return {
+            "generator_actor": ActorRef("generator"),
+            "reward_actor": ActorRef("reward"),
+            "agent_actor": ActorRef("agent"),
+        }
+
+    @classmethod
+    def init_method(cls) -> str | None:
+        return "setup"
+
+    @classmethod
+    def init_args(cls, ctx) -> dict:
+        import sys
+
+        return {
+            "cli_args": sys.argv[1:],
+            "train_dp_size": 1,
+        }
 
     def __init__(self, generator_actor, reward_actor=None, agent_actor=None):
         self._generator = generator_actor

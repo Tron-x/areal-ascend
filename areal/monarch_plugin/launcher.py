@@ -28,22 +28,6 @@ XCCL weight-update alloc_mode (via weight_sync.py):
   Multi-node:  MONARCH_WORKERS env var or cluster.monarch_workers config
                provides worker addresses; symmetric or role-split placement.
 
-Supported configurations:
-  allocation_mode         n_gpus_per_node    Layout
-  ──────────────────────  ─────────────────  ──────────────────────────
-  vllm:d1p1t1+d1p1t1     2                  1 inf + 1 train
-  vllm:d2p1t1+d2p1t1     4                  2 inf + 2 train
-  vllm:d1p1t1+d3p1t1     4                  1 inf + 3 train
-  vllm:d4p1t1+d4p1t1     8                  4 inf + 4 train
-  vllm:d2p1t1+d6p1t1     8                  2 inf + 6 train
-  vllm:d1p1t4+d4p1t1     8                  1 inf (TP=4) + 4 train
-
-Multi-node (requires MONARCH_WORKERS):
-  allocation_mode         n_nodes  Layout
-  ──────────────────────  ───────  ──────────────────────────
-  vllm:d4p1t1+d4p1t1     2        each node: 4 inf + 4 train
-  vllm:d8p1t1+d8p1t1     2        each node: 8 inf + 8 train
-
 Usage:
     # 4+4 (8 NPU, single node):
     python -m areal.monarch_plugin.launcher \\
@@ -56,19 +40,6 @@ Usage:
         --config examples/math/gsm8k_grpo_npu.yaml \\
         "allocation_mode=vllm:d1p1t1+d1p1t1" \\
         "cluster.n_gpus_per_node=2"
-
-    # 2+6 (8 NPU):
-    python -m areal.monarch_plugin.launcher \\
-        examples/math/gsm8k_rl.py \\
-        --config examples/math/gsm8k_grpo_npu.yaml \\
-        "allocation_mode=vllm:d2p1t1+d6p1t1"
-
-    # Multi-node (2 nodes × 8 NPU):
-    MONARCH_WORKERS=tcp://node0:29600,tcp://node1:29600 \\
-    python -m areal.monarch_plugin.launcher \\
-        examples/math/gsm8k_rl.py \\
-        --config examples/math/gsm8k_grpo_npu.yaml \\
-        "cluster.n_nodes=2"
 
 Architecture (4+4 single-node example):
     MonarchOrchestrator (main process, no NPU)
@@ -105,9 +76,11 @@ import sys
 from areal.api import AllocationMode, AllocationType
 from areal.api.cli_args import (
     ClusterSpecConfig,
+    InferenceEngineConfig,
     RecoverConfig,
     parse_cli_args,
     to_structured_cfg,
+    vLLMConfig,
 )
 from areal.infra.platforms import current_platform
 from areal.infra.utils.exp_metadata import save_experiment_metadata
@@ -125,22 +98,59 @@ logger = logging.getLogger("MonarchPlugin")
 
 from areal.monarch_plugin.actor_registry import ActorRegistry  # noqa: E402
 from areal.monarch_plugin.actor_spec import ActorContext  # noqa: E402
+from areal.monarch_plugin.agent_actor import AgentActor  # noqa: E402
 from areal.monarch_plugin.bootstraps import ensure_ascend_custom_opp_path  # noqa: E402
+from areal.monarch_plugin.generator_actor import GeneratorActor  # noqa: E402
 from areal.monarch_plugin.pipeline import run_training_pipeline  # noqa: E402
-from areal.monarch_plugin.specs import make_actor_specs  # noqa: E402
+from areal.monarch_plugin.replay_buffer_actor import ReplayBufferActor  # noqa: E402
+from areal.monarch_plugin.reward_actor import RewardActor  # noqa: E402
+from areal.monarch_plugin.rollout_actor import RolloutActor  # noqa: E402
+from areal.monarch_plugin.sandbox_actor import SandboxActor  # noqa: E402
 from areal.monarch_plugin.topology import ClusterTopology  # noqa: E402
+from areal.monarch_plugin.trainer_actor import TrainerActor  # noqa: E402
 
 # Initialise CANN custom OPP path early so child processes inherit it.
 ensure_ascend_custom_opp_path()
 
 
+# ---------------------------------------------------------------------------
+# Actor class list builder
+# ---------------------------------------------------------------------------
+
+
+def build_actor_list(alloc_mode) -> list[type]:
+    """Return the list of MonarchActor classes for the given allocation mode.
+
+    Omits TrainerActor when in LLM_SERVER_ONLY mode.
+    """
+    actors = [
+        GeneratorActor,
+        RewardActor,
+        SandboxActor,
+        AgentActor,
+        ReplayBufferActor,
+        RolloutActor,
+    ]
+    if alloc_mode.type_ != AllocationType.LLM_SERVER_ONLY:
+        actors.append(TrainerActor)
+    return actors
+
+
+# ---------------------------------------------------------------------------
+# Monarch orchestration
+# ---------------------------------------------------------------------------
+
+
 async def monarch_main_async(config, run_id: int = 0):
-    """Declarative Monarch orchestration: specs → registry → pipeline."""
+    """Declarative Monarch orchestration: actor classes → registry → pipeline."""
     # --- Config & topology ---
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     is_recover_run = check_if_recover(config.recover, run_id)
     validate_config_for_launcher(config)
+
+    config.vllm = to_structured_cfg(config.vllm, vLLMConfig)
+    config.rollout = to_structured_cfg(config.rollout, InferenceEngineConfig)
 
     name_resolve.reconfigure(config.cluster.name_resolve)
     name_resolve.clear_subtree(
@@ -179,35 +189,26 @@ async def monarch_main_async(config, run_id: int = 0):
     host = topology.create_host_mesh()
     master_port = find_free_ports(1, (10000, 50000))[0]
 
-    # --- Build declarative actor specs ---
-    specs = make_actor_specs(
-        config=config,
-        alloc_mode=alloc_mode,
-        placement=placement,
-        master_port=master_port,
-        env_var=env_var,
-        inf_device_ids=inf_device_ids,
-        train_device_ids=train_device_ids,
-    )
+    # --- Build actor classes and context ---
+    actor_classes = build_actor_list(alloc_mode)
 
-    # --- Build context and spawn ---
     ctx = ActorContext(
         config=config,
         alloc_mode=alloc_mode,
         placement=placement,
         host=host,
         master_port=master_port,
-        extra={"host": host},
+        extra={"host": host, "env_var": env_var},
     )
 
-    registry = ActorRegistry(specs)
+    registry = ActorRegistry(actor_classes)
 
     try:
         await registry.spawn_all(ctx, host)
 
         if alloc_mode.type_ == AllocationType.LLM_SERVER_ONLY:
             logger.info("LLM_SERVER_ONLY mode -- skipping training pipeline")
-            await registry.shutdown_all()
+            await registry.shutdown_all(ctx)
             return
 
         # --- Initialize actors ---
@@ -217,10 +218,13 @@ async def monarch_main_async(config, run_id: int = 0):
         start_step = trainer_info["start_step"]
 
         # --- Run async training pipeline ---
-        trainer_actor = registry.actor("trainer")
-        rollout_actor = registry.actor("rollout")
-        replay_buffer_actor = registry.actor("replay_buffer")
-        multi_rank = any(s.name == "trainer" and s.is_multi_rank for s in specs)
+        trainer_actor = registry.actor("trainer", ctx)
+        rollout_actor = registry.actor("rollout", ctx)
+        replay_buffer_actor = registry.actor("replay_buffer", ctx)
+        multi_rank = any(
+            cls.actor_name() == "trainer" and cls.resolve_is_multi_rank(ctx)
+            for cls in actor_classes
+        )
 
         await run_training_pipeline(
             rollout_actor=rollout_actor,
@@ -237,7 +241,7 @@ async def monarch_main_async(config, run_id: int = 0):
         logger.error(f"MonarchPlugin error: {e}", exc_info=True)
         raise
     finally:
-        await registry.shutdown_all()
+        await registry.shutdown_all(ctx)
 
 
 # ---------------------------------------------------------------------------

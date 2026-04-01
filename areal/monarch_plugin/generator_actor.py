@@ -16,12 +16,16 @@ import uuid
 from typing import Any, Optional
 
 import cloudpickle
-from monarch.actor import Actor, endpoint
+from monarch.actor import endpoint
+
+from areal.api.cli_args import vLLMConfig
+from areal.monarch_plugin.actor_base import MonarchActor
+from areal.monarch_plugin.actor_spec import ActorRef, CtxRef, ResourceKind
 
 logger = logging.getLogger(__name__)
 
 
-class GeneratorActor(Actor):
+class GeneratorActor(MonarchActor):
     """Monarch actor embedding vLLM's AsyncLLM for in-process inference.
 
     Lifecycle
@@ -31,6 +35,63 @@ class GeneratorActor(Actor):
     handle_request(endpoint, payload) -> dispatch (generation / weight-sync)
     shutdown() -> cleanup
     """
+
+    resource = ResourceKind.NPU_SINGLE
+    dependencies: list[str] = []
+
+    @classmethod
+    def constructor_args(cls, ctx) -> dict:
+        return {"vllm_cli_args": cls.build_vllm_cli_args(ctx.config, ctx.alloc_mode)}
+
+    @classmethod
+    def init_method(cls) -> str | None:
+        return "setup"
+
+    @classmethod
+    def init_args(cls, ctx) -> dict:
+        return {
+            "host_mesh": CtxRef("host"),
+            "worker_registry": ActorRef("worker_registry"),
+            "device_ids": ctx.placement.inference.all_device_ids,
+        }
+
+    @classmethod
+    def bootstrap_factory(cls, ctx):
+        from areal.monarch_plugin.bootstraps import make_generator_bootstrap
+
+        return make_generator_bootstrap(
+            ",".join(ctx.placement.inference.all_device_ids)
+        )
+
+    @classmethod
+    def post_spawn(cls, procs, ctx) -> dict:
+        from areal.monarch_plugin.executor import WorkerRegistry
+
+        registry = procs.spawn("worker_registry", WorkerRegistry)
+        return {"worker_registry": registry}
+
+    @staticmethod
+    def build_vllm_cli_args(config, alloc_mode) -> list[str]:
+        """Build the CLI arg list for vLLM."""
+        args_dict = vLLMConfig.build_args(
+            vllm_config=config.vllm,
+            tp_size=alloc_mode.gen.tp_size,
+            pp_size=alloc_mode.gen.pp_size,
+        )
+        cli: list[str] = []
+        for k, v in args_dict.items():
+            if v is None or v is False or v == "" or (isinstance(v, list) and not v):
+                continue
+            flag = f"--{k.replace('_', '-')}"
+            if v is True:
+                cli.append(flag)
+            elif isinstance(v, list):
+                cli.append(flag)
+                cli.extend(str(x) for x in v)
+            else:
+                cli.append(flag)
+                cli.append(str(v))
+        return cli
 
     def __init__(self, vllm_cli_args: list):
         self._cli_args = vllm_cli_args

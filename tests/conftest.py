@@ -1,0 +1,32 @@
+"""Shared conftest for AReaL monarch_plugin tests.
+
+Mocks heavy dependencies so monarch_plugin test modules can import
+without triggering the full dependency chain.
+"""
+import importlib
+import sys
+import types
+from unittest.mock import MagicMock
+
+
+def _make_module(name, attrs=None):
+    mod = types.ModuleType(name)
+    for k, v in (attrs or {}).items():
+        setattr(mod, k, v)
+    return mod
+
+
+def _install_package_mock(name, sub_names=None):
+    pkg = _make_module(name)
+    sys.modules[name] = pkg
+    for sub in (sub_names or []):
+        submod = types.ModuleType(f"{name}.{sub}")
+        sys.modules[f"{name}.{sub}"] = submod
+
+
+def _install_mock_package(name, submods=None):
+    pkg = types.ModuleType(name)
+    sys.modules[name] = pkg
+    for sub in (submods or []):
+        sys.modules[f"{name}.{sub}"] = types.ModuleType(f"{name}.{sub}")
+    return pkg
