@@ -52,10 +52,10 @@ MonarchOrchestrator (主进程, 无 NPU)
 
 | 文件 | 说明 |
 |------|------|
-| `launcher.py` | 主入口（~260 行），解析配置 → 构建 specs → 调用 registry spawn/init → 启动 pipeline |
-| `actor_spec.py` | `ActorSpec` / `ActorContext` 数据类 — 每个 actor 的声明式描述（资源、依赖、构造参数） |
-| `actor_registry.py` | `ActorRegistry` — 拓扑排序、有序 spawn/init、反序 shutdown 的生命周期管理器 |
-| `specs.py` | `make_actor_specs()` — 根据配置构建所有 ActorSpec 的唯一入口 |
+| `launcher.py` | 主入口，解析配置 → 注册 actors → 调用 registry spawn/init → 启动 pipeline |
+| `actor_base.py` | `MonarchActor` 基类 — 声明式资源/依赖/lifecycle hook 定义，`ActorRef` / `CtxRef` 引用解析 |
+| `actor_spec.py` | `ActorSpec` / `ActorContext` 数据类 — 从 `MonarchActor` 类自动构建 spec |
+| `actor_registry.py` | `ActorRegistry` — Kahn 拓扑排序、有序 spawn/init、反序 shutdown 的生命周期管理器 |
 | `pipeline.py` | `run_training_pipeline()` — 异步 rollout→replay_buffer→training 流水线 |
 | `bootstraps.py` | 平台无关的 bootstrap 工厂（Ascend NPU / CUDA） |
 
@@ -261,6 +261,7 @@ MonarchPlugin INFO: Training completed successfully.
 | Phase 6 | ReplayBufferActor，异步 rollout + 训练流水线 | 6 |
 | Phase 6b | RolloutActor 独立化，真正的流水线并行 | 8 |
 | Phase 7 | 声明式 launcher 重构：ActorSpec + ActorRegistry + 拓扑排序 | 8 |
+| Phase 8 | MonarchActor 基类抽取：统一 lifecycle hook、ActorRef/CtxRef 引用解析、删除 specs.py | 8 |
 
 ## 踩坑记录
 
@@ -316,6 +317,7 @@ allocation_mode + cluster config
 
 **为什么要做声明式 launcher 重构？**
 - 旧 launcher 是 1100+ 行的单一函数，spawn/init/shutdown 逻辑交织
-- 新架构：每个 actor 用 `ActorSpec` 声明式描述（资源、依赖、构造参数），`ActorRegistry` 自动拓扑排序管理生命周期
-- launcher 降到 ~260 行，只做配置解析 → specs 构建 → registry 调用 → pipeline 启动
-- 新增 actor 只需在 `specs.py` 加一个 `ActorSpec`，无需改 launcher 逻辑
+- Phase 7：引入 `ActorSpec` + `ActorRegistry`，拓扑排序管理生命周期
+- Phase 8：抽取 `MonarchActor` 基类，每个 actor 继承基类并声明式定义资源、依赖、构造参数
+- `ActorRef("name")` 和 `CtxRef("key")` 在 spawn 时自动解析为实际引用，消除了 lambda 闭包
+- 新增 actor 只需继承 `MonarchActor` 并实现几个类方法，`ActorRegistry` 自动发现依赖关系
