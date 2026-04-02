@@ -18,7 +18,6 @@ import subprocess
 import sys
 import textwrap
 import time
-from typing import Any
 
 from monarch.actor import endpoint
 
@@ -103,6 +102,7 @@ class SandboxActor(MonarchActor):
                 env=None,
             )
             import json
+
             try:
                 result = json.loads(proc.stdout.strip())
             except (json.JSONDecodeError, ValueError):

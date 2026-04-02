@@ -32,8 +32,12 @@ sys.modules["monarch.actor"] = _mock_monarch_actor
 sys.modules["monarch"] = types.ModuleType("monarch")
 sys.modules["monarch._src"] = types.ModuleType("monarch._src")
 sys.modules["monarch._src.actor"] = types.ModuleType("monarch._src.actor")
-sys.modules["monarch._src.actor.actor_mesh"] = types.ModuleType("monarch._src.actor.actor_mesh")
-sys.modules["monarch._src.actor.bootstrap"] = types.ModuleType("monarch._src.actor.bootstrap")
+sys.modules["monarch._src.actor.actor_mesh"] = types.ModuleType(
+    "monarch._src.actor.actor_mesh"
+)
+sys.modules["monarch._src.actor.bootstrap"] = types.ModuleType(
+    "monarch._src.actor.bootstrap"
+)
 sys.modules["monarch._src.actor.bootstrap"].attach_to_workers = lambda **kw: None
 sys.modules["monarch._src.actor.bootstrap"].run_worker_loop_forever = lambda **kw: None
 
@@ -53,7 +57,6 @@ from areal.monarch_plugin.reward_actor import RewardActor
 from areal.monarch_plugin.rollout_actor import RolloutActor
 from areal.monarch_plugin.sandbox_actor import SandboxActor
 from areal.monarch_plugin.trainer_actor import TrainerActor
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -123,7 +126,13 @@ class TestResourceDeclarations(unittest.TestCase):
         self.assertEqual(GeneratorActor.resource, ResourceKind.NPU_SINGLE)
 
     def test_cpu_actors(self):
-        for cls in [RewardActor, SandboxActor, AgentActor, ReplayBufferActor, RolloutActor]:
+        for cls in [
+            RewardActor,
+            SandboxActor,
+            AgentActor,
+            ReplayBufferActor,
+            RolloutActor,
+        ]:
             self.assertEqual(cls.resource, ResourceKind.CPU)
 
     def test_trainer_dynamic_multi(self):
@@ -214,8 +223,13 @@ class TestConstructorArgs(unittest.TestCase):
 class TestTopoSortFromActors(unittest.TestCase):
     def test_no_circular_deps(self):
         actors = [
-            GeneratorActor, RewardActor, SandboxActor,
-            AgentActor, ReplayBufferActor, RolloutActor, TrainerActor,
+            GeneratorActor,
+            RewardActor,
+            SandboxActor,
+            AgentActor,
+            ReplayBufferActor,
+            RolloutActor,
+            TrainerActor,
         ]
         reg = ActorRegistry(actors)
         order = reg._topo_sort()
@@ -223,8 +237,13 @@ class TestTopoSortFromActors(unittest.TestCase):
 
     def test_spawn_order_respects_deps(self):
         actors = [
-            GeneratorActor, RewardActor, SandboxActor,
-            AgentActor, ReplayBufferActor, RolloutActor, TrainerActor,
+            GeneratorActor,
+            RewardActor,
+            SandboxActor,
+            AgentActor,
+            ReplayBufferActor,
+            RolloutActor,
+            TrainerActor,
         ]
         reg = ActorRegistry(actors)
         order = reg._topo_sort()

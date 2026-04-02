@@ -205,9 +205,7 @@ class MonarchActor(Actor):
         if multi_rank:
             result_mesh = await method.call()
             result = (
-                result_mesh.item(npu=0)
-                if hasattr(result_mesh, "item")
-                else result_mesh
+                result_mesh.item(npu=0) if hasattr(result_mesh, "item") else result_mesh
             )
         else:
             init_kwargs = cls._resolve_refs(cls.init_args(ctx), ctx)

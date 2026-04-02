@@ -2138,6 +2138,13 @@ class ClusterSpecConfig:
         default=8,
         metadata={"help": "Number of GPUs per node (physical)."},
     )
+    num_generator_replicas: int = field(
+        default=1,
+        metadata={
+            "help": "Number of generator actor replicas. "
+            "Splits inference devices equally across replicas."
+        },
+    )
 
 
 @dataclass

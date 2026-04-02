@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 from typing import Any
 
 from monarch.actor import endpoint
@@ -24,9 +23,7 @@ from areal.monarch_plugin.actor_spec import ActorRef, ResourceKind
 
 logger = logging.getLogger(__name__)
 
-_CODE_BLOCK_RE = re.compile(
-    r"```(?:python|py)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE
-)
+_CODE_BLOCK_RE = re.compile(r"```(?:python|py)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
 def _extract_code_blocks(text: str) -> list[str]:
@@ -204,9 +201,7 @@ class AgentActor(MonarchActor):
             if code_blocks and self._sandbox is not None:
                 self._code_exec_count += 1
                 for code in code_blocks:
-                    exec_result = await self._sandbox.execute_code.call_one(
-                        code, 10.0
-                    )
+                    exec_result = await self._sandbox.execute_code.call_one(code, 10.0)
                     if exec_result["success"]:
                         exec_output += exec_result.get("result", "")
                     else:
@@ -262,9 +257,7 @@ class AgentActor(MonarchActor):
     @endpoint
     async def get_stats(self) -> dict:
         avg_turns = (
-            self._total_turns / self._episode_count
-            if self._episode_count > 0
-            else 0
+            self._total_turns / self._episode_count if self._episode_count > 0 else 0
         )
         return {
             "episode_count": self._episode_count,
@@ -275,11 +268,7 @@ class AgentActor(MonarchActor):
 
     @endpoint
     async def shutdown(self) -> None:
-        avg = (
-            self._total_turns / self._episode_count
-            if self._episode_count > 0
-            else 0
-        )
+        avg = self._total_turns / self._episode_count if self._episode_count > 0 else 0
         logger.info(
             f"[AgentActor] Shutting down. "
             f"{self._episode_count} episodes, "

@@ -17,7 +17,8 @@ import base64
 import logging
 import os
 import socket
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from collections.abc import Callable
+from typing import Any
 
 import cloudpickle
 import torch
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_host_ip() -> str:
     if host_ip := os.environ.get("VLLM_HOST_IP"):
@@ -51,7 +53,7 @@ def _build_worker_configs(
     gpus_per_host: int,
     master_addr: str,
     master_port: int,
-    gpu_ids: List[str] | None = None,
+    gpu_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, str]], list[dict]]:
     if gpu_ids:
         device_list = ",".join(gpu_ids)
@@ -87,14 +89,16 @@ def _build_worker_configs(
             env_vars["CUDA_VISIBLE_DEVICES"] = device_list
 
         all_envs.append(env_vars)
-        all_kwargs.append({
-            "vllm_config": vllm_config,
-            "local_rank": local_rank,
-            "rank": rank,
-            "distributed_init_method": "env://",
-            "is_driver_worker": is_driver,
-            "shared_worker_lock": None,
-        })
+        all_kwargs.append(
+            {
+                "vllm_config": vllm_config,
+                "local_rank": local_rank,
+                "rank": rank,
+                "distributed_init_method": "env://",
+                "is_driver_worker": is_driver,
+                "shared_worker_lock": None,
+            }
+        )
 
     return all_envs, all_kwargs
 
@@ -102,6 +106,7 @@ def _build_worker_configs(
 # ---------------------------------------------------------------------------
 # WorkerRegistry -- bridge between EngineCore subprocess and GeneratorActor
 # ---------------------------------------------------------------------------
+
 
 class WorkerRegistry(Actor):
     """Rendezvous point so MonarchExecutor (inside EngineCore subprocess)
@@ -123,6 +128,7 @@ class WorkerRegistry(Actor):
 # ---------------------------------------------------------------------------
 # _FutureWrapper -- adapts Monarch Future to vLLM's expected interface
 # ---------------------------------------------------------------------------
+
 
 class _FutureWrapper:
     def __init__(self, monarch_future, timeout):
@@ -146,6 +152,7 @@ class _FutureWrapper:
 # ---------------------------------------------------------------------------
 # AReaLWorkerWrapper -- Monarch actor wrapping vLLM worker
 # ---------------------------------------------------------------------------
+
 
 class AReaLWorkerWrapper(WorkerWrapperBase, Actor):
     """vLLM worker that is also a Monarch actor.
@@ -182,6 +189,7 @@ class AReaLWorkerWrapper(WorkerWrapperBase, Actor):
     @endpoint
     def destroy_process_group(self) -> None:
         import torch.distributed as dist
+
         if dist.is_initialized():
             logger.info("[AReaLWorkerWrapper] Destroying process group")
             dist.destroy_process_group()
@@ -219,9 +227,11 @@ def _make_worker_bootstrap(cann_env: dict):
     ASCEND_OPP_PATH / ASCEND_HOME_PATH are used by torch_npu and
     vllm_ascend to locate libopapi.so at runtime.
     """
+
     def _bootstrap():
         for k, v in cann_env.items():
             os.environ[k] = v
+
     return _bootstrap
 
 
@@ -305,12 +315,12 @@ class AReaLMonarchExecutor(Executor):
 
     def collective_rpc(
         self,
-        method: Union[str, Callable],
-        timeout: Optional[float] = None,
-        args: Tuple = (),
-        kwargs: Optional[Dict[str, Any]] = None,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict[str, Any] | None = None,
         non_block: bool = False,
-    ) -> List[Any]:
+    ) -> list[Any]:
         future = self.workers.execute_method.call(method, *args, **(kwargs or {}))
         if non_block:
             return _FutureWrapper(future, timeout)

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import queue
-import threading
 import tempfile
+import threading
 import time
-import json
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -41,7 +41,9 @@ MOE_LOCAL_PATH = "/home/model/Qwen3-30B-A3B-Instruct-2507-reduced-l2-e8"
 
 # Avoid MindSpeed transformer_config_init_wrapper get sys args which might translate to ''
 import sys
+
 sys.argv = [sys.argv[0]]
+
 
 def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
@@ -89,9 +91,7 @@ VLLM_EPLB_STEP_INTERVAL = _env_int("AREAL_AWEX_VLLM_EPLB_STEP_INTERVAL", 4)
 VLLM_EPLB_NUM_REDUNDANT_EXPERTS = _env_int(
     "AREAL_AWEX_VLLM_EPLB_NUM_REDUNDANT_EXPERTS", 0
 )
-VLLM_EPLB_LOG_BALANCEDNESS = _env_bool(
-    "AREAL_AWEX_VLLM_EPLB_LOG_BALANCEDNESS", True
-)
+VLLM_EPLB_LOG_BALANCEDNESS = _env_bool("AREAL_AWEX_VLLM_EPLB_LOG_BALANCEDNESS", True)
 # NPU(vllm-ascend) EPLB knobs. Keep GPU-style knobs above for CUDA vLLM.
 VLLM_EPLB_DYNAMIC = _env_bool("AREAL_AWEX_VLLM_EPLB_DYNAMIC", True)
 VLLM_EPLB_EXPERT_HEAT_COLLECTION_INTERVAL = _env_int(
@@ -119,9 +119,7 @@ REQUEST_RETRIES = _env_int("AREAL_AWEX_REQUEST_RETRIES", 3)
 STRICT_REQUEST_TRAFFIC = _env_bool("AREAL_AWEX_STRICT_REQUEST_TRAFFIC", False)
 ENGINE_REQUEST_TIMEOUT_S = _env_int("AREAL_AWEX_ENGINE_REQUEST_TIMEOUT_S", 60)
 ENGINE_SETUP_TIMEOUT_S = _env_int("AREAL_AWEX_ENGINE_SETUP_TIMEOUT_S", 360)
-VLLM_GPU_MEMORY_UTILIZATION = _env_float(
-    "AREAL_AWEX_VLLM_GPU_MEMORY_UTILIZATION", 0.6
-)
+VLLM_GPU_MEMORY_UTILIZATION = _env_float("AREAL_AWEX_VLLM_GPU_MEMORY_UTILIZATION", 0.6)
 VLLM_MAX_NUM_SEQS = _env_int("AREAL_AWEX_VLLM_MAX_NUM_SEQS", 1)
 VLLM_MAX_MODEL_LEN = _env_int("AREAL_AWEX_VLLM_MAX_MODEL_LEN", 128)
 TRAIN_CLUSTER_ID = os.environ.get("AREAL_AWEX_TRAIN_CLUSTER_ID", "").strip() or None
@@ -222,7 +220,11 @@ def _select_devices(
         ]
 
     need = train_world_size + vllm_world_size
-    if len(visible_devices) < need or len(train_devices) < train_world_size or len(vllm_devices) < vllm_world_size:
+    if (
+        len(visible_devices) < need
+        or len(train_devices) < train_world_size
+        or len(vllm_devices) < vllm_world_size
+    ):
         pytest.skip(
             f"Need at least {need} devices (train={train_world_size}, vLLM={vllm_world_size}). "
             f"Found {len(visible_devices)}."
@@ -255,19 +257,11 @@ def _build_ascend_eplb_config(base_config: dict | None) -> dict:
             raw["expert_heat_collection_interval"]
         )
     if "algorithm_execution_interval" in raw:
-        cfg["algorithm_execution_interval"] = int(
-            raw["algorithm_execution_interval"]
-        )
+        cfg["algorithm_execution_interval"] = int(raw["algorithm_execution_interval"])
     # Backward-compatible mapping from GPU EPLB keys.
-    if (
-        "window_size" in raw
-        and "expert_heat_collection_interval" not in raw
-    ):
+    if "window_size" in raw and "expert_heat_collection_interval" not in raw:
         cfg["expert_heat_collection_interval"] = int(raw["window_size"])
-    if (
-        "step_interval" in raw
-        and "algorithm_execution_interval" not in raw
-    ):
+    if "step_interval" in raw and "algorithm_execution_interval" not in raw:
         cfg["algorithm_execution_interval"] = int(raw["step_interval"])
     if "num_redundant_experts" in raw:
         cfg["num_redundant_experts"] = int(raw["num_redundant_experts"])
@@ -282,7 +276,9 @@ def _build_ascend_eplb_config(base_config: dict | None) -> dict:
 
 def _build_vllm_instances() -> list[dict]:
     if not VLLM_INSTANCES:
-        raise RuntimeError("VLLM_INSTANCES is empty; configure at least one vLLM instance.")
+        raise RuntimeError(
+            "VLLM_INSTANCES is empty; configure at least one vLLM instance."
+        )
     instances = []
     for idx, inst in enumerate(VLLM_INSTANCES):
         tp_size = int(inst.get("tp_size", VLLM_TP_SIZE))
@@ -297,9 +293,8 @@ def _build_vllm_instances() -> list[dict]:
         )
         enable_eplb = bool(inst.get("enable_eplb", VLLM_ENABLE_EPLB))
         expert_placement_strategy = (
-            (inst.get("expert_placement_strategy") or VLLM_EXPERT_PLACEMENT_STRATEGY)
-            or None
-        )
+            inst.get("expert_placement_strategy") or VLLM_EXPERT_PLACEMENT_STRATEGY
+        ) or None
         awex_cluster_id = str(inst.get("awex_cluster_id", "") or "").strip() or None
         eplb_config = inst.get("eplb_config")
         if eplb_config is None:
@@ -412,7 +407,9 @@ def _drive_completion_traffic(
     if requests_per_update <= 0:
         return
     model_ids = {
-        addr: _discover_model_id(addr, fallback_model=fallback_model, timeout_s=timeout_s)
+        addr: _discover_model_id(
+            addr, fallback_model=fallback_model, timeout_s=timeout_s
+        )
         for addr in server_addrs
     }
     for server_addr in server_addrs:
@@ -493,7 +490,9 @@ def _run_awex_integration(result_queue, model_path: str):
 
         vllm_instances = _build_vllm_instances()
         vllm_world_size = sum(inst["world_size"] for inst in vllm_instances)
-        explicit_devices = [inst["devices"] for inst in vllm_instances if inst["devices"] is not None]
+        explicit_devices = [
+            inst["devices"] for inst in vllm_instances if inst["devices"] is not None
+        ]
         if explicit_devices and len(explicit_devices) != len(vllm_instances):
             raise RuntimeError(
                 "VLLM_INSTANCES must either specify devices for all instances or none."
@@ -601,7 +600,9 @@ def _run_awex_integration(result_queue, model_path: str):
                 expert_tensor_parallel_size=TRAIN_ETP_SIZE,
             )
             train_engine.create_process_group(train_parallel)
-            ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=128, train_batch_size=2)
+            ft_spec = FinetuneSpec(
+                total_train_epochs=1, dataset_size=128, train_batch_size=2
+            )
             train_engine.initialize(addr=None, ft_spec=ft_spec)
             train_engine.set_version(1)
             if TRAIN_CLUSTER_ID:
@@ -642,12 +643,9 @@ def _run_awex_integration(result_queue, model_path: str):
                             vllm_extra_args["additional_config"] = json.dumps(
                                 {"eplb_config": ascend_eplb_config}
                             )
-                            if (
-                                ascend_eplb_config.get("dynamic_eplb")
-                                or ascend_eplb_config.get(
-                                    "expert_map_record_path"
-                                )
-                            ):
+                            if ascend_eplb_config.get(
+                                "dynamic_eplb"
+                            ) or ascend_eplb_config.get("expert_map_record_path"):
                                 vllm_env["DYNAMIC_EPLB"] = "true"
                             if ascend_eplb_config.get("expert_map_record_path"):
                                 vllm_env["EXPERT_MAP_RECORD"] = "true"
@@ -731,11 +729,7 @@ def _run_awex_integration(result_queue, model_path: str):
                 train_engine.update_weights(update_meta)
                 if dist.is_initialized():
                     dist.barrier()
-                if (
-                    rank == 0
-                    and REQUESTS_PER_UPDATE > 0
-                    and step < max(1, NUM_UPDATES)
-                ):
+                if rank == 0 and REQUESTS_PER_UPDATE > 0 and step < max(1, NUM_UPDATES):
                     _drive_completion_traffic(
                         server_addrs=server_addrs,
                         fallback_model=model_path,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
 
 from areal.utils import logging
 
@@ -75,14 +74,14 @@ class AwexMegatronWriterAdapter:
     def save_hf_checkpoint(self, path: str) -> None:
         self._engine._save_model_to_hf(path)
 
-    def release_memory_occupation(self, tags: Optional[list[str]] = None) -> None:
+    def release_memory_occupation(self, tags: list[str] | None = None) -> None:
         if self.enable_colocate_mode:
             logger.warning(
                 "Awex colocate mode requested, but MegatronEngine does not "
                 "support fine-grained memory release. No-op."
             )
 
-    def resume_memory_occupation(self, tags: Optional[list[str]] = None) -> None:
+    def resume_memory_occupation(self, tags: list[str] | None = None) -> None:
         if self.enable_colocate_mode:
             logger.warning(
                 "Awex colocate mode requested, but MegatronEngine does not "

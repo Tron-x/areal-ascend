@@ -14,7 +14,6 @@ uvloop-based ``AsyncTaskRunner`` without event loop conflicts.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 import uuid
 from collections.abc import Callable
@@ -23,7 +22,6 @@ from threading import Lock
 from typing import Any
 
 import numpy as np
-import uvloop
 
 from areal.api import (
     InferenceEngine,
@@ -38,7 +36,8 @@ from areal.api import (
 from areal.api.cli_args import InferenceEngineConfig, PerfTracerConfig
 from areal.engine.vllm_remote import VLLMBackend
 from areal.infra import RolloutController, WorkflowExecutor
-from areal.utils import logging as areal_logging, perf_tracer, stats_tracker
+from areal.utils import logging as areal_logging
+from areal.utils import perf_tracer, stats_tracker
 
 logger = areal_logging.getLogger("MonarchVLLMEngine")
 
@@ -91,14 +90,13 @@ class MonarchVLLMEngine(InferenceEngine):
     ):
         if engine_id is None:
             import torch.distributed as dist
+
             if dist.is_initialized():
                 engine_id = str(dist.get_rank())
             else:
                 engine_id = uuid.uuid4().hex
         self.engine_id = engine_id
-        self.logger = areal_logging.getLogger(
-            f"[MonarchVLLMEngine Rank {engine_id}]"
-        )
+        self.logger = areal_logging.getLogger(f"[MonarchVLLMEngine Rank {engine_id}]")
 
         self.logger.info("Checking GeneratorActor health via Monarch RPC ...")
         result = self._generator.handle_request.call_one("/health", {}).get(timeout=60)
@@ -162,9 +160,7 @@ class MonarchVLLMEngine(InferenceEngine):
             gconfig.max_tokens - len(req.input_ids), gconfig.max_new_tokens
         )
         if max_new_tokens <= 0:
-            raise RuntimeError(
-                f"max_new_tokens ({max_new_tokens}) is non-positive"
-            )
+            raise RuntimeError(f"max_new_tokens ({max_new_tokens}) is non-positive")
         req.gconfig.max_new_tokens = max_new_tokens
 
         start_time = time.perf_counter()
@@ -180,7 +176,10 @@ class MonarchVLLMEngine(InferenceEngine):
             stop_reason not in ["stop", "tool_calls", "length"]
             and len(accumulated_output_tokens) < ori_max_new_tokens
         ):
-            while self._workflow_executor is not None and self._workflow_executor.is_paused():
+            while (
+                self._workflow_executor is not None
+                and self._workflow_executor.is_paused()
+            ):
                 await asyncio.sleep(0.5)
 
             http_req = self._backend.build_generation_request(
@@ -194,9 +193,7 @@ class MonarchVLLMEngine(InferenceEngine):
             )
 
             if not isinstance(result, dict):
-                raise ValueError(
-                    f"Expected dict response, got {type(result).__name__}"
-                )
+                raise ValueError(f"Expected dict response, got {type(result).__name__}")
 
             gen_result = self._backend.parse_generation_response(result)
             stop_reason = gen_result.stop_reason
@@ -369,7 +366,9 @@ class MonarchVLLMEngine(InferenceEngine):
             resolved = workflow
         elif isinstance(workflow, str):
             imported_obj = import_from_string(workflow)
-            if isinstance(imported_obj, type) and issubclass(imported_obj, RolloutWorkflow):
+            if isinstance(imported_obj, type) and issubclass(
+                imported_obj, RolloutWorkflow
+            ):
                 if workflow_kwargs is None:
                     raise ValueError(
                         f"workflow_kwargs required for class workflow {workflow!r}"
@@ -393,7 +392,9 @@ class MonarchVLLMEngine(InferenceEngine):
             if isinstance(obj, RolloutWorkflow):
                 resolved = obj
             else:
-                raise TypeError(f"Workflow factory returned {type(obj)}, expected RolloutWorkflow")
+                raise TypeError(
+                    f"Workflow factory returned {type(obj)}, expected RolloutWorkflow"
+                )
         else:
             raise TypeError(f"Unsupported workflow type: {type(workflow)}")
 
@@ -484,6 +485,7 @@ class MonarchVLLMEngine(InferenceEngine):
         if isinstance(reward_fn, str):
             reward_fn_path = reward_fn
             from areal.utils.dynamic_import import import_from_string
+
             workflow.reward_fn = import_from_string(reward_fn_path)
         elif callable(reward_fn):
             reward_fn_path = f"{reward_fn.__module__}.{reward_fn.__qualname__}"
@@ -497,9 +499,7 @@ class MonarchVLLMEngine(InferenceEngine):
         workflow.async_reward_fn = MonarchRewardWrapper(
             self._reward_actor, reward_fn_path
         )
-        logger.info(
-            f"Injected MonarchRewardWrapper for reward_fn={reward_fn_path}"
-        )
+        logger.info(f"Injected MonarchRewardWrapper for reward_fn={reward_fn_path}")
 
     @staticmethod
     def _resolve_should_accept_fn(should_accept_fn):
@@ -507,6 +507,7 @@ class MonarchVLLMEngine(InferenceEngine):
             return should_accept_fn
         if isinstance(should_accept_fn, str):
             import importlib
+
             module_path, _, fn_name = should_accept_fn.rpartition(".")
             mod = importlib.import_module(module_path)
             fn = getattr(mod, fn_name)

@@ -23,7 +23,7 @@ from typing import Any
 from monarch.actor import endpoint
 
 from areal.monarch_plugin.actor_base import MonarchActor
-from areal.monarch_plugin.actor_spec import ActorRef, CtxRef, ResourceKind
+from areal.monarch_plugin.actor_spec import ResourceKind
 
 logger = logging.getLogger(__name__)
 

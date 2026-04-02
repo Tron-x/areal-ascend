@@ -31,7 +31,6 @@ Awex-specific GSM8K sample scripts were moved to:
 - `examples/experimental/awex/gsm8k_grpo_awex_sample.yaml`
 
 Awex meta server bootstrap is now handled by `PPOTrainer` when
-`actor.weight_update_mode=awex`; the standard `examples/math/gsm8k_rl.py`
-entrypoint can be used directly with the AWEX sample yaml. Auto-start is only
-available in single-controller mode; SPMD runs must provide an explicit
-`awex.meta_server_addr`.
+`actor.weight_update_mode=awex`; the standard `examples/math/gsm8k_rl.py` entrypoint can
+be used directly with the AWEX sample yaml. Auto-start is only available in
+single-controller mode; SPMD runs must provide an explicit `awex.meta_server_addr`.

@@ -177,9 +177,12 @@ async def monarch_main_async(config, run_id: int = 0):
 
     topology = ClusterTopology.from_config(config, alloc_mode, env_var=env_var)
     placement = topology.placement
-    inf_device_ids = placement.inference.all_device_ids
-    train_device_ids = placement.training.all_device_ids
-    logger.info(f"Topology:\n{topology.summary()}")
+
+    # --- Compute replica placements ---
+    num_replicas = getattr(config.cluster, "num_generator_replicas", 1)
+    replica_placements = topology.compute_replica_placements(num_replicas)
+    topology_summary = topology.summary(num_replicas)
+    logger.info(f"Topology:\n{topology_summary}")
 
     fileroot = config.cluster.fileroot
     user = os.environ.get("USER", "root")
@@ -198,7 +201,11 @@ async def monarch_main_async(config, run_id: int = 0):
         placement=placement,
         host=host,
         master_port=master_port,
-        extra={"host": host, "env_var": env_var},
+        extra={
+            "host": host,
+            "env_var": env_var,
+            "replica_placements": replica_placements,
+        },
     )
 
     registry = ActorRegistry(actor_classes)

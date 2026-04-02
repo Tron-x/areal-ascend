@@ -32,10 +32,15 @@ sys.modules["monarch.actor"] = _mock_monarch_actor
 sys.modules["monarch"] = types.ModuleType("monarch")
 sys.modules["monarch._src"] = types.ModuleType("monarch._src")
 sys.modules["monarch._src.actor"] = types.ModuleType("monarch._src.actor")
-sys.modules["monarch._src.actor.actor_mesh"] = types.ModuleType("monarch._src.actor.actor_mesh")
-sys.modules["monarch._src.actor.bootstrap"] = types.ModuleType("monarch._src.actor.bootstrap")
+sys.modules["monarch._src.actor.actor_mesh"] = types.ModuleType(
+    "monarch._src.actor.actor_mesh"
+)
+sys.modules["monarch._src.actor.bootstrap"] = types.ModuleType(
+    "monarch._src.actor.bootstrap"
+)
 
 # Now import from areal.monarch_plugin
+from areal.monarch_plugin.actor_base import MonarchActor
 from areal.monarch_plugin.actor_registry import ActorRegistry
 from areal.monarch_plugin.actor_spec import (
     ActorContext,
@@ -43,8 +48,6 @@ from areal.monarch_plugin.actor_spec import (
     CtxRef,
     ResourceKind,
 )
-from areal.monarch_plugin.actor_base import MonarchActor
-
 
 # ---------------------------------------------------------------------------
 # Dummy actor classes for testing
@@ -144,18 +147,15 @@ class TestRefResolution(unittest.TestCase):
         self.ctx.actors["generator"] = MagicMock(name="generator_ref")
 
     def test_actor_ref_resolved(self):
-        result = MonarchActor._resolve_refs(
-            {"gen": ActorRef("generator")}, self.ctx
-        )
+        result = MonarchActor._resolve_refs({"gen": ActorRef("generator")}, self.ctx)
         self.assertEqual(result["gen"], self.ctx.actors["generator"])
 
     def test_actor_ref_not_found(self):
         with self.assertRaises(KeyError):
             MonarchActor._resolve_refs({"gen": ActorRef("missing")}, self.ctx)
+
     def test_ctx_ref(self):
-        result = MonarchActor._resolve_refs(
-            {"mesh": CtxRef("host")}, self.ctx
-        )
+        result = MonarchActor._resolve_refs({"mesh": CtxRef("host")}, self.ctx)
         self.assertEqual(result["mesh"], "host_mesh_obj")
 
     def test_mixed_args(self):

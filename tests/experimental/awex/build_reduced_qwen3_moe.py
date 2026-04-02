@@ -17,13 +17,13 @@ import argparse
 import json
 import re
 import shutil
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-
 
 LAYER_RE = re.compile(r"^model\.layers\.(\d+)\.")
 EXPERT_RE = re.compile(r"\.mlp\.experts\.(\d+)\.")
@@ -158,7 +158,10 @@ def _plan_shards(
 
 def _copy_support_files(src_dir: Path, dst_dir: Path) -> None:
     for item in src_dir.iterdir():
-        if item.name.startswith("model-") or item.name == "model.safetensors.index.json":
+        if (
+            item.name.startswith("model-")
+            or item.name == "model.safetensors.index.json"
+        ):
             continue
         if item.is_dir():
             if item.name.startswith("."):
@@ -168,7 +171,9 @@ def _copy_support_files(src_dir: Path, dst_dir: Path) -> None:
             shutil.copy2(item, dst_dir / item.name)
 
 
-def _update_config(path: Path, num_layers: int, num_experts: int, num_experts_per_tok: int) -> None:
+def _update_config(
+    path: Path, num_layers: int, num_experts: int, num_experts_per_tok: int
+) -> None:
     cfg = json.loads(path.read_text())
     cfg = _update_config_dict(cfg, num_layers, num_experts, num_experts_per_tok)
     path.write_text(json.dumps(cfg, indent=2) + "\n")
@@ -322,9 +327,7 @@ def _reduce_existing_checkpoint(
     weight_map: dict[str, str] = index["weight_map"]
 
     selected_keys = [
-        k
-        for k in sorted(weight_map.keys())
-        if _should_keep(k, num_layers, num_experts)
+        k for k in sorted(weight_map.keys()) if _should_keep(k, num_layers, num_experts)
     ]
     if not selected_keys:
         raise RuntimeError("No tensors selected. Check num_layers/num_experts.")
@@ -337,9 +340,7 @@ def _reduce_existing_checkpoint(
         max_shard_bytes,
     )
     num_shards = len(shard_plan)
-    print(
-        f"[reduce] Selected {len(selected_keys)} tensors into {num_shards} shard(s)."
-    )
+    print(f"[reduce] Selected {len(selected_keys)} tensors into {num_shards} shard(s).")
 
     weight_map_out: dict[str, str] = {}
     total_size = 0
@@ -396,8 +397,12 @@ def main() -> None:
         help="Hugging Face model id/path for config-only download (dummy mode).",
     )
     parser.add_argument("--output", help="Output directory for reduced checkpoint.")
-    parser.add_argument("--num-layers", type=int, default=2, help="Number of layers to keep.")
-    parser.add_argument("--num-experts", type=int, default=8, help="Number of experts to keep.")
+    parser.add_argument(
+        "--num-layers", type=int, default=2, help="Number of layers to keep."
+    )
+    parser.add_argument(
+        "--num-experts", type=int, default=8, help="Number of experts to keep."
+    )
     parser.add_argument(
         "--num-experts-per-tok",
         type=int,
@@ -432,7 +437,9 @@ def main() -> None:
         action="store_true",
         help="Do not download/save tokenizer/processor files in --hf-model mode.",
     )
-    parser.add_argument("--force", action="store_true", help="Overwrite output directory.")
+    parser.add_argument(
+        "--force", action="store_true", help="Overwrite output directory."
+    )
     args = parser.parse_args()
 
     if args.input:

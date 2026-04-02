@@ -23,8 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
 
 from areal.api import AllocationMode, AllocationType
 
@@ -41,7 +40,7 @@ class NodeDevices:
     """Devices available on a single physical node."""
 
     host_addr: str
-    device_ids: List[str]
+    device_ids: list[str]
 
     @property
     def count(self) -> int:
@@ -52,14 +51,14 @@ class NodeDevices:
 class RolePlacement:
     """Which node(s) and device(s) are assigned to a role."""
 
-    nodes: List[NodeDevices]
+    nodes: list[NodeDevices]
 
     @property
     def total_devices(self) -> int:
         return sum(n.count for n in self.nodes)
 
     @property
-    def all_device_ids(self) -> List[str]:
+    def all_device_ids(self) -> list[str]:
         result = []
         for n in self.nodes:
             result.extend(n.device_ids)
@@ -70,7 +69,7 @@ class RolePlacement:
         return len(self.nodes) > 1
 
     @property
-    def host_addrs(self) -> List[str]:
+    def host_addrs(self) -> list[str]:
         return [n.host_addr for n in self.nodes]
 
     def devices_per_node(self) -> int:
@@ -97,14 +96,25 @@ class DevicePlacement:
 
     @property
     def is_multi_node(self) -> bool:
-        all_addrs = set(self.inference.host_addrs
-                        + self.training.host_addrs
-                        + self.cpu_services.host_addrs)
+        all_addrs = set(
+            self.inference.host_addrs
+            + self.training.host_addrs
+            + self.cpu_services.host_addrs
+        )
         return len(all_addrs) > 1
 
     @property
     def total_npu_count(self) -> int:
         return self.inference.total_devices + self.training.total_devices
+
+
+@dataclass
+class ReplicaPlacement:
+    """Device assignment for one generator replica."""
+
+    replica_index: int
+    device_ids: list[str]
+    actor_name: str  # "generator" (single) or "generator_0", "generator_1" (multi)
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +148,8 @@ class ClusterTopology:
         n_nodes: int,
         n_devices_per_node: int,
         alloc_mode: AllocationMode,
-        worker_addrs: Optional[List[str]] = None,
-        node_roles: Optional[List[str]] = None,
+        worker_addrs: list[str] | None = None,
+        node_roles: list[str] | None = None,
         env_var: str = "ASCEND_RT_VISIBLE_DEVICES",
     ):
         self.n_nodes = n_nodes
@@ -154,7 +164,7 @@ class ClusterTopology:
             )
 
         self.node_roles = node_roles
-        self._placement: Optional[DevicePlacement] = None
+        self._placement: DevicePlacement | None = None
 
     @classmethod
     def from_config(
@@ -162,7 +172,7 @@ class ClusterTopology:
         config,
         alloc_mode: AllocationMode,
         env_var: str = "ASCEND_RT_VISIBLE_DEVICES",
-    ) -> "ClusterTopology":
+    ) -> ClusterTopology:
         n_nodes = getattr(config.cluster, "n_nodes", 1)
         n_devices = config.cluster.n_gpus_per_node
 
@@ -216,7 +226,7 @@ class ClusterTopology:
 
         local = self._local_addr()
         inf_ids = all_ids[:gen_count]
-        train_ids = all_ids[gen_count: gen_count + train_count]
+        train_ids = all_ids[gen_count : gen_count + train_count]
 
         return DevicePlacement(
             inference=RolePlacement([NodeDevices(local, inf_ids)]),
@@ -239,7 +249,7 @@ class ClusterTopology:
             all_ids = self._resolve_device_ids_for_node(i)
             inf_nodes.append(NodeDevices(addr, all_ids[:gen_per_node]))
             train_nodes.append(
-                NodeDevices(addr, all_ids[gen_per_node: gen_per_node + train_per_node])
+                NodeDevices(addr, all_ids[gen_per_node : gen_per_node + train_per_node])
             )
             cpu_nodes.append(NodeDevices(addr, []))
 
@@ -292,22 +302,24 @@ class ClusterTopology:
         """
         if self.n_nodes == 1:
             from monarch.actor import this_host
+
             return this_host()
         else:
             from monarch._src.actor.bootstrap import attach_to_workers
+
             logger.info(
                 f"Attaching to {self.n_nodes} worker nodes: "
-                f"{self.worker_addrs[:self.n_nodes]}"
+                f"{self.worker_addrs[: self.n_nodes]}"
             )
             return attach_to_workers(
                 name="areal_cluster",
                 ca="trust_all_connections",
-                workers=self.worker_addrs[:self.n_nodes],
+                workers=self.worker_addrs[: self.n_nodes],
             )
 
     # ----- helpers -----
 
-    def _resolve_device_ids_for_node(self, node_idx: int) -> List[str]:
+    def _resolve_device_ids_for_node(self, node_idx: int) -> list[str]:
         if node_idx == 0:
             raw = os.environ.get(self.env_var, "")
             if raw:
@@ -323,7 +335,7 @@ class ClusterTopology:
             return "127.0.0.1"
 
     @staticmethod
-    def _parse_worker_addrs(config) -> Optional[List[str]]:
+    def _parse_worker_addrs(config) -> list[str] | None:
         env_addrs = os.environ.get("MONARCH_WORKERS", "")
         if env_addrs:
             return [a.strip() for a in env_addrs.split(",") if a.strip()]
@@ -338,7 +350,7 @@ class ClusterTopology:
         return None
 
     @staticmethod
-    def _parse_node_roles(config) -> Optional[List[str]]:
+    def _parse_node_roles(config) -> list[str] | None:
         env_roles = os.environ.get("MONARCH_NODE_ROLES", "")
         if env_roles:
             return [r.strip() for r in env_roles.split(",") if r.strip()]
@@ -352,18 +364,58 @@ class ClusterTopology:
 
         return None
 
-    def summary(self) -> str:
+    def compute_replica_placements(
+        self, num_replicas: int = 1
+    ) -> list[ReplicaPlacement]:
+        """Partition inference devices across generator replicas.
+
+        When *num_replicas* is 1, returns a single entry whose ``actor_name``
+        is ``"generator"`` (backward compatible).
+        """
+        all_ids = self.placement.inference.all_device_ids
+        total = len(all_ids)
+
+        if num_replicas < 1:
+            raise ValueError(f"num_replicas must be >= 1, got {num_replicas}")
+        if total % num_replicas != 0:
+            raise ValueError(
+                f"Cannot split {total} inference devices into {num_replicas} "
+                f"equal replicas (total must be divisible by num_replicas)."
+            )
+
+        per_replica = total // num_replicas
+        placements: list[ReplicaPlacement] = []
+        for i in range(num_replicas):
+            start = i * per_replica
+            end = start + per_replica
+            ids = all_ids[start:end]
+            name = "generator" if num_replicas == 1 else f"generator_{i}"
+            placements.append(
+                ReplicaPlacement(replica_index=i, device_ids=ids, actor_name=name)
+            )
+        return placements
+
+    def summary(self, num_generator_replicas: int = 1) -> str:
         p = self.placement
         lines = [
-            f"Cluster: {self.n_nodes} node(s), "
-            f"{self.n_devices_per_node} devices/node",
+            f"Cluster: {self.n_nodes} node(s), {self.n_devices_per_node} devices/node",
             f"  Inference: {p.inference.total_devices} devices "
             f"on {len(p.inference.nodes)} node(s) "
             f"{p.inference.all_device_ids}",
-            f"  Training:  {p.training.total_devices} devices "
-            f"on {len(p.training.nodes)} node(s) "
-            f"{p.training.all_device_ids}",
-            f"  MASTER_ADDR: {p.master_addr}",
-            f"  Multi-node: {p.is_multi_node}",
         ]
+        if num_generator_replicas > 1:
+            for rp in self.compute_replica_placements(num_generator_replicas):
+                lines.append(
+                    f"    Replica {rp.replica_index} ({rp.actor_name}): "
+                    f"devices {rp.device_ids}"
+                )
+        lines.extend(
+            [
+                f"  Training:  {p.training.total_devices} devices "
+                f"on {len(p.training.nodes)} node(s) "
+                f"{p.training.all_device_ids}",
+                f"  MASTER_ADDR: {p.master_addr}",
+                f"  Multi-node: {p.is_multi_node}",
+            ]
+        )
         return "\n".join(lines)

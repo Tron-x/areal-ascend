@@ -13,7 +13,6 @@ import base64
 import logging
 import os
 import uuid
-from typing import Any, Optional
 
 import cloudpickle
 from monarch.actor import endpoint
@@ -70,6 +69,57 @@ class GeneratorActor(MonarchActor):
         registry = procs.spawn("worker_registry", WorkerRegistry)
         return {"worker_registry": registry}
 
+    # -----------------------------------------------------------------
+    # Per-replica lifecycle (called by ActorRegistry for multi-replica)
+    # -----------------------------------------------------------------
+
+    @classmethod
+    def constructor_args_for_replica(cls, ctx, replica) -> dict:
+        """Build vLLM CLI args for a specific replica."""
+        num_replicas = len(ctx.extra["replica_placements"])
+        # Per-replica DP = total DP / num_replicas (if DP > 1)
+        per_replica_dp = max(1, ctx.alloc_mode.gen.dp_size // num_replicas)
+        cli_args = cls._build_vllm_cli_args_with_dp_override(
+            ctx.config, ctx.alloc_mode, per_replica_dp
+        )
+        return {"vllm_cli_args": cli_args}
+
+    @classmethod
+    def bootstrap_factory_for_replica(cls, ctx, replica):
+        from areal.monarch_plugin.bootstraps import make_generator_bootstrap
+
+        return make_generator_bootstrap(",".join(replica.device_ids))
+
+    @classmethod
+    def init_args_for_replica(cls, ctx, replica) -> dict:
+        return {
+            "host_mesh": CtxRef("host"),
+            "worker_registry": ActorRef(f"worker_registry_{replica.actor_name}"),
+            "device_ids": replica.device_ids,
+        }
+
+    @classmethod
+    def post_spawn_for_replica(cls, procs, replica_name, ctx) -> dict:
+        from areal.monarch_plugin.executor import WorkerRegistry
+
+        registry_name = f"worker_registry_{replica_name}"
+        registry = procs.spawn(registry_name, WorkerRegistry)
+        return {registry_name: registry}
+
+    @classmethod
+    def _build_vllm_cli_args_with_dp_override(
+        cls, config, alloc_mode, dp_override: int
+    ) -> list[str]:
+        """Build vLLM CLI args with an overridden data_parallel_size."""
+        args_dict = vLLMConfig.build_args(
+            vllm_config=config.vllm,
+            tp_size=alloc_mode.gen.tp_size,
+            pp_size=alloc_mode.gen.pp_size,
+        )
+        if dp_override != int(args_dict.get("data_parallel_size") or 1):
+            args_dict["data_parallel_size"] = dp_override
+        return cls._args_dict_to_cli(args_dict)
+
     @staticmethod
     def build_vllm_cli_args(config, alloc_mode) -> list[str]:
         """Build the CLI arg list for vLLM."""
@@ -78,6 +128,11 @@ class GeneratorActor(MonarchActor):
             tp_size=alloc_mode.gen.tp_size,
             pp_size=alloc_mode.gen.pp_size,
         )
+        return GeneratorActor._args_dict_to_cli(args_dict)
+
+    @staticmethod
+    def _args_dict_to_cli(args_dict: dict) -> list[str]:
+        """Convert a vLLM args dict to a CLI arg list."""
         cli: list[str] = []
         for k, v in args_dict.items():
             if v is None or v is False or v == "" or (isinstance(v, list) and not v):
@@ -119,9 +174,8 @@ class GeneratorActor(MonarchActor):
         from vllm.engine.arg_utils import EngineArgs
         from vllm.entrypoints.llm import UsageContext
         from vllm.entrypoints.openai.cli_args import make_arg_parser
-        from vllm.v1.engine.async_llm import AsyncLLM
-        from vllm.v1.executor.abstract import Executor
         from vllm.utils.argparse_utils import FlexibleArgumentParser
+        from vllm.v1.engine.async_llm import AsyncLLM
 
         logger.info(f"[GeneratorActor] setup: device_ids={device_ids}")
         logger.info(f"[GeneratorActor] vLLM CLI args: {self._cli_args}")
@@ -234,7 +288,9 @@ class GeneratorActor(MonarchActor):
         request_output = None
         if prompt is not None:
             async for output in self.llm.generate(
-                prompt={"prompt_token_ids": prompt} if isinstance(prompt, list) else prompt,
+                prompt={"prompt_token_ids": prompt}
+                if isinstance(prompt, list)
+                else prompt,
                 sampling_params=params,
                 request_id=request_id,
             ):
@@ -257,11 +313,13 @@ class GeneratorActor(MonarchActor):
     @staticmethod
     def _build_abort_response() -> dict:
         return {
-            "choices": [{
-                "finish_reason": "abort",
-                "logprobs": {"tokens": [], "token_logprobs": []},
-                "text": "",
-            }]
+            "choices": [
+                {
+                    "finish_reason": "abort",
+                    "logprobs": {"tokens": [], "token_logprobs": []},
+                    "text": "",
+                }
+            ]
         }
 
     @staticmethod
@@ -282,14 +340,16 @@ class GeneratorActor(MonarchActor):
             logprobs_list = [0.0] * len(comp_output.token_ids)
 
         return {
-            "choices": [{
-                "finish_reason": comp_output.finish_reason or "stop",
-                "text": comp_output.text,
-                "logprobs": {
-                    "tokens": tokens,
-                    "token_logprobs": logprobs_list,
-                },
-            }]
+            "choices": [
+                {
+                    "finish_reason": comp_output.finish_reason or "stop",
+                    "text": comp_output.text,
+                    "logprobs": {
+                        "tokens": tokens,
+                        "token_logprobs": logprobs_list,
+                    },
+                }
+            ]
         }
 
     # -----------------------------------------------------------------

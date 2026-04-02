@@ -166,7 +166,9 @@ def _run_mode(
 ) -> dict:
     from awex.meta.meta_server import start_meta_server, stop_meta_server
 
-    megatron_device, vllm_devices = _select_devices(tp_size=1, device_backend=device_backend)
+    megatron_device, vllm_devices = _select_devices(
+        tp_size=1, device_backend=device_backend
+    )
     model_path = _resolve_model_path(model_kind)
 
     if not os.path.exists(model_path):
@@ -218,7 +220,9 @@ def _run_mode(
         train_engine = MegatronEngine(train_config)
         alloc_mode = AllocationMode.from_str("vllm:d1p1t1+megatron:d1p1t1")
         train_engine.create_process_group(alloc_mode.train)
-        ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=16, train_batch_size=2)
+        ft_spec = FinetuneSpec(
+            total_train_epochs=1, dataset_size=16, train_batch_size=2
+        )
         train_engine.initialize(addr=None, ft_spec=ft_spec)
         train_engine.set_version(1)
 

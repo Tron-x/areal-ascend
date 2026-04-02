@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from areal.api.cli_args import BaseExperimentConfig
 from areal.utils.environ import is_single_controller

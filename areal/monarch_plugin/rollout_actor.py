@@ -26,7 +26,6 @@ import time
 
 import numpy as np
 import torch
-
 from monarch.actor import endpoint
 
 from areal.monarch_plugin.actor_base import MonarchActor
@@ -102,9 +101,9 @@ class RolloutActor(MonarchActor):
             Training data parallel size (for WorkflowExecutor init).
         """
         from areal.api.cli_args import (
+            GRPOConfig,
             InferenceEngineConfig,
             load_expr_config,
-            GRPOConfig,
             to_structured_cfg,
         )
         from areal.dataset import get_custom_dataset
@@ -133,9 +132,7 @@ class RolloutActor(MonarchActor):
             dataset_config=config.train_dataset,
         )
 
-        rollout_config = to_structured_cfg(
-            config.rollout, InferenceEngineConfig
-        )
+        rollout_config = to_structured_cfg(config.rollout, InferenceEngineConfig)
         engine = MonarchVLLMEngine(
             rollout_config,
             self._generator,
@@ -146,9 +143,7 @@ class RolloutActor(MonarchActor):
         self._engine = engine
 
         self._workflow = self._extract_workflow(script_path)
-        self._workflow_kwargs = self._extract_workflow_kwargs(
-            script_path, config
-        )
+        self._workflow_kwargs = self._extract_workflow_kwargs(script_path, config)
         self._group_size = config.gconfig.n_samples
         self._dynamic_bs = config.dynamic_bs
 
@@ -250,11 +245,7 @@ class RolloutActor(MonarchActor):
 
     @endpoint
     def get_stats(self) -> dict:
-        avg = (
-            self._total_time / self._rollout_count
-            if self._rollout_count > 0
-            else 0
-        )
+        avg = self._total_time / self._rollout_count if self._rollout_count > 0 else 0
         return {
             "rollout_count": self._rollout_count,
             "total_time": self._total_time,
@@ -263,11 +254,7 @@ class RolloutActor(MonarchActor):
 
     @endpoint
     def shutdown(self) -> None:
-        avg = (
-            self._total_time / self._rollout_count
-            if self._rollout_count > 0
-            else 0
-        )
+        avg = self._total_time / self._rollout_count if self._rollout_count > 0 else 0
         logger.info(
             f"[RolloutActor] Shutting down. "
             f"{self._rollout_count} rollouts, avg {avg:.1f}s each"

@@ -50,7 +50,7 @@ from areal.infra.utils.launcher import (
     wait_llm_server_addrs,
 )
 from areal.utils import logging, name_resolve, names
-from areal.utils.network import find_free_ports, gethostip
+from areal.utils.network import find_free_ports
 from areal.utils.recover import check_if_recover
 
 logger = logging.getLogger("MonarchLauncher")
@@ -59,6 +59,7 @@ logger = logging.getLogger("MonarchLauncher")
 # ---------------------------------------------------------------------------
 # Bootstrap functions (run inside each Monarch-spawned process)
 # ---------------------------------------------------------------------------
+
 
 def npu_bootstrap_no_device():
     """Bootstrap for VLLMServerActor: hide NPUs from the Monarch process.
@@ -286,9 +287,7 @@ class TrainerActor(Actor):
 
         start_step = 0
         if self._trainer.recover_info is not None:
-            start_step = (
-                self._trainer.recover_info.last_step_info.next().global_step
-            )
+            start_step = self._trainer.recover_info.last_step_info.next().global_step
 
         logger.info(
             f"TrainerActor[rank={self._rank}] ready: "
@@ -354,9 +353,7 @@ class TrainerActor(Actor):
                     args=step_args,
                 ),
             ):
-                rollout_batch["values"] = trainer.critic.compute_values(
-                    rollout_batch
-                )
+                rollout_batch["values"] = trainer.critic.compute_values(rollout_batch)
                 trainer.critic.get_device_stats().log("critic values")
 
         # --- 3. Recompute proximal log-probs ---
@@ -369,9 +366,7 @@ class TrainerActor(Actor):
                     args=step_args,
                 ),
             ):
-                rollout_batch["prox_logp"] = trainer.actor.compute_logp(
-                    rollout_batch
-                )
+                rollout_batch["prox_logp"] = trainer.actor.compute_logp(rollout_batch)
                 trainer.actor.get_device_stats().log("recompute logp")
 
         # --- 4. Reference log-probs (optional) ---
@@ -384,9 +379,7 @@ class TrainerActor(Actor):
                     args=step_args,
                 ),
             ):
-                rollout_batch["ref_logp"] = trainer.ref.compute_logp(
-                    rollout_batch
-                )
+                rollout_batch["ref_logp"] = trainer.ref.compute_logp(rollout_batch)
                 trainer.ref.get_device_stats().log("ref logp")
 
         # --- 5. Teacher log-probs (optional) ---
@@ -403,9 +396,9 @@ class TrainerActor(Actor):
                     rollout_batch
                 )
                 rollout_batch["rl_loss_weight"] = config.teacher.rl_loss_weight
-                rollout_batch[
-                    "distill_loss_weight"
-                ] = config.teacher.distill_loss_weight
+                rollout_batch["distill_loss_weight"] = (
+                    config.teacher.distill_loss_weight
+                )
                 trainer.teacher.get_device_stats().log("teacher logp")
 
         # --- 6. Compute advantages (GRPO) ---
@@ -475,9 +468,7 @@ class TrainerActor(Actor):
         # --- 12. Save HF checkpoint ---
         with (
             stats_tracker.record_timing("save"),
-            perf_tracer.trace_scope(
-                "train.save", category=Category.IO, args=step_args
-            ),
+            perf_tracer.trace_scope("train.save", category=Category.IO, args=step_args),
         ):
             trainer._save_hf(
                 epoch=epoch, epoch_step=step_in_epoch, global_step=global_step
@@ -599,9 +590,7 @@ async def monarch_main_async(config, run_id: int = 0):
     )
 
     inf_device_ids = all_device_ids[:gen_gpu_count]
-    train_device_ids = all_device_ids[
-        gen_gpu_count : gen_gpu_count + train_gpu_count
-    ]
+    train_device_ids = all_device_ids[gen_gpu_count : gen_gpu_count + train_gpu_count]
 
     logger.info(
         f"Device allocation: inference={inf_device_ids}, training={train_device_ids}"
@@ -609,9 +598,7 @@ async def monarch_main_async(config, run_id: int = 0):
 
     fileroot = config.cluster.fileroot
     user = os.environ.get("USER", "root")
-    log_dir = (
-        f"{fileroot}/logs/{user}/{config.experiment_name}/{config.trial_name}"
-    )
+    log_dir = f"{fileroot}/logs/{user}/{config.experiment_name}/{config.trial_name}"
     os.makedirs(log_dir, exist_ok=True)
 
     host = this_host()
@@ -631,9 +618,7 @@ async def monarch_main_async(config, run_id: int = 0):
                 config.sglang = to_structured_cfg(config.sglang, SGLangConfig)
                 random_seed = config.sglang.random_seed
 
-            config.rollout = to_structured_cfg(
-                config.rollout, InferenceEngineConfig
-            )
+            config.rollout = to_structured_cfg(config.rollout, InferenceEngineConfig)
 
             backend_spec = {
                 "sglang": {
@@ -663,12 +648,8 @@ async def monarch_main_async(config, run_id: int = 0):
                 **rollout_env_vars,
                 env_var: ",".join(inf_device_ids),
                 "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", ""),
-                "TRANSFORMERS_OFFLINE": os.environ.get(
-                    "TRANSFORMERS_OFFLINE", ""
-                ),
-                "VLLM_USE_MODELSCOPE": os.environ.get(
-                    "VLLM_USE_MODELSCOPE", ""
-                ),
+                "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE", ""),
+                "VLLM_USE_MODELSCOPE": os.environ.get("VLLM_USE_MODELSCOPE", ""),
                 "HF_ENDPOINT": os.environ.get("HF_ENDPOINT", ""),
             }
 
@@ -702,8 +683,7 @@ async def monarch_main_async(config, run_id: int = 0):
                 raise e
 
             logger.info(
-                f"vLLM servers ready: "
-                f"AREAL_LLM_SERVER_ADDRS={','.join(server_addrs)}"
+                f"vLLM servers ready: AREAL_LLM_SERVER_ADDRS={','.join(server_addrs)}"
             )
 
         # ================================================================
@@ -735,12 +715,8 @@ async def monarch_main_async(config, run_id: int = 0):
                 "AREAL_SPMD_MODE": "1",
                 env_var: ",".join(train_device_ids),
                 "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", ""),
-                "TRANSFORMERS_OFFLINE": os.environ.get(
-                    "TRANSFORMERS_OFFLINE", ""
-                ),
-                "VLLM_USE_MODELSCOPE": os.environ.get(
-                    "VLLM_USE_MODELSCOPE", ""
-                ),
+                "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE", ""),
+                "VLLM_USE_MODELSCOPE": os.environ.get("VLLM_USE_MODELSCOPE", ""),
                 "HF_ENDPOINT": os.environ.get("HF_ENDPOINT", ""),
             }
 
@@ -750,8 +726,7 @@ async def monarch_main_async(config, run_id: int = 0):
 
             train_device_id = int(train_device_ids[0])
             logger.info(
-                f"Spawning training ProcMesh on NPU {train_device_id} "
-                f"(rank 0/{nprocs})"
+                f"Spawning training ProcMesh on NPU {train_device_id} (rank 0/{nprocs})"
             )
             train_procs = host.spawn_procs(
                 per_host={"npu": 1},
@@ -773,23 +748,18 @@ async def monarch_main_async(config, run_id: int = 0):
             # ============================================================
             # Phase C: Initialize trainer (model load, FSDP, optimizer)
             # ============================================================
-            logger.info(
-                "Initializing TrainerActor (loading model, FSDP setup) ..."
-            )
+            logger.info("Initializing TrainerActor (loading model, FSDP setup) ...")
             info = await trainer_actor.initialize.call_one()
             max_steps = info["max_steps"]
             start_step = info["start_step"]
             logger.info(
-                f"TrainerActor ready: max_steps={max_steps}, "
-                f"start_step={start_step}"
+                f"TrainerActor ready: max_steps={max_steps}, start_step={start_step}"
             )
 
             # ============================================================
             # Phase D: Step-by-step training loop
             # ============================================================
-            logger.info(
-                f"Starting training loop: steps {start_step} → {max_steps}"
-            )
+            logger.info(f"Starting training loop: steps {start_step} → {max_steps}")
             for global_step in range(start_step, max_steps):
                 result = await trainer_actor.train_step.call_one(global_step)
                 logger.info(

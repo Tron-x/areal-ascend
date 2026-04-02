@@ -1,15 +1,15 @@
 # Awex Experimental Test Scripts
 
-This folder contains practical scripts for validating and benchmarking Awex
-weight exchange between Megatron and vLLM.
+This folder contains practical scripts for validating and benchmarking Awex weight
+exchange between Megatron and vLLM.
 
 ## What each script is for
 
-| Script | Use case | Output |
-| --- | --- | --- |
-| `build_reduced_qwen3_moe.py` | Build a smaller MoE checkpoint for local validation. Supports both slicing from local full weights and generating a config-only dummy checkpoint from HF. | A local HF checkpoint (`config.json` + `*.safetensors` + index). |
-| `test_awex_megatron_vllm_integration.py` | End-to-end integration test: Megatron writes weights and vLLM receives/loads via Awex. | `pytest` pass/fail. |
-| `bench_weight_transfer.py` | Latency micro-benchmark for weight update path (`awex_nccl` / `awex_file` / `xccl`). | JSON timing summary on stdout (optional `--out`). |
+| Script                                   | Use case                                                                                                                                                  | Output                                                           |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `build_reduced_qwen3_moe.py`             | Build a smaller MoE checkpoint for local validation. Supports both slicing from local full weights and generating a config-only dummy checkpoint from HF. | A local HF checkpoint (`config.json` + `*.safetensors` + index). |
+| `test_awex_megatron_vllm_integration.py` | End-to-end integration test: Megatron writes weights and vLLM receives/loads via Awex.                                                                    | `pytest` pass/fail.                                              |
+| `bench_weight_transfer.py`               | Latency micro-benchmark for weight update path (`awex_nccl` / `awex_file` / `xccl`).                                                                      | JSON timing summary on stdout (optional `--out`).                |
 
 ## Prerequisites
 
@@ -55,6 +55,7 @@ python tests/experimental/awex/build_reduced_qwen3_moe.py \
 ```
 
 Common options:
+
 - `--no-tokenizer`: skip tokenizer/processor download in dummy mode.
 - `--seed`: control deterministic random init in dummy mode.
 - `--no-trust-remote-code`: disable `trust_remote_code`.
@@ -84,6 +85,7 @@ pytest tests/experimental/awex/test_awex_megatron_vllm_integration.py -k awex -v
 ```
 
 Helpful env vars:
+
 - `AREAL_AWEX_MODEL`: `dense` or `moe`.
 - `AREAL_AWEX_DENSE_MODEL_PATH`: local dense model path.
 - `AREAL_AWEX_MOE_MODEL_PATH`: local reduced MoE path.
@@ -122,6 +124,7 @@ python tests/experimental/awex/bench_weight_transfer.py \
 ```
 
 Optional:
+
 - `--out /tmp/awex_bench.json` to save benchmark JSON.
 
 ## NPU note (experimental)

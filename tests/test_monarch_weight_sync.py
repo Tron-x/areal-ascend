@@ -128,9 +128,7 @@ class TestResolveXcclAllocMode(unittest.TestCase):
         config = self._make_config()
         alloc_mode = AllocationMode.from_str("vllm:d4p1t1+d4p1t1")
 
-        result = resolve_xccl_alloc_mode(
-            config, alloc_mode, train_world_size=4
-        )
+        result = resolve_xccl_alloc_mode(config, alloc_mode, train_world_size=4)
         self.assertEqual(result.gen.world_size, 1)
         self.assertEqual(result.train.world_size, 4)
 
@@ -144,9 +142,7 @@ class TestResolveXcclAllocMode(unittest.TestCase):
         config = self._make_config()
         alloc_mode = AllocationMode.from_str("vllm:d4p1t1+d4p1t1")
 
-        result = resolve_xccl_alloc_mode(
-            config, alloc_mode, train_world_size=4
-        )
+        result = resolve_xccl_alloc_mode(config, alloc_mode, train_world_size=4)
         self.assertEqual(result.gen.world_size, 2)
         self.assertEqual(result.train.world_size, 4)
 
@@ -159,9 +155,7 @@ class TestResolveXcclAllocMode(unittest.TestCase):
         config = self._make_config()
         alloc_mode = AllocationMode.from_str("vllm:d4p1t1+d4p1t1")
 
-        result = resolve_xccl_alloc_mode(
-            config, alloc_mode, train_world_size=4
-        )
+        result = resolve_xccl_alloc_mode(config, alloc_mode, train_world_size=4)
         self.assertEqual(result.gen.world_size, 4)
         self.assertEqual(result.gen.tp_size, 2)
 

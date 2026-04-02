@@ -80,6 +80,134 @@ class ActorRegistry:
         return order
 
     # ------------------------------------------------------------------
+    # Multi-replica generator support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_multi_replica(ctx: ActorContext) -> bool:
+        """Return True if generator should be spawned as multi-replica."""
+        placements = ctx.extra.get("replica_placements")
+        return placements is not None and len(placements) > 1
+
+    async def _spawn_generator_replicas(self, ctx: ActorContext, host) -> None:
+        """Spawn N GeneratorActor replicas and wrap them in a GeneratorService."""
+        from areal.monarch_plugin.actor_base import MonarchActor, _per_host
+        from areal.monarch_plugin.generator_actor import GeneratorActor
+        from areal.monarch_plugin.generator_service import GeneratorService
+
+        cls = GeneratorActor
+        placements: list = ctx.extra["replica_placements"]
+
+        replica_refs: dict[str, Any] = {}
+
+        for rp in placements:
+            name = rp.actor_name  # "generator_0", "generator_1", ...
+
+            # 1. Per-replica ProcMesh with subset of device IDs
+            bootstrap = cls.bootstrap_factory_for_replica(ctx, rp)
+            resource = cls.resolve_resource(ctx)
+            nprocs = cls.resolve_nprocs(ctx)
+            per_host = _per_host(resource, nprocs)
+
+            logger.info(
+                f"Spawning ProcMesh for replica '{name}' (devices={rp.device_ids})"
+            )
+            procs = host.spawn_procs(per_host=per_host, bootstrap=bootstrap, name=name)
+            ctx.procs[name] = procs
+
+            # 2. Per-replica post_spawn (WorkerRegistry with unique name)
+            extras = cls.post_spawn_for_replica(procs, name, ctx)
+            if extras:
+                ctx.extra_actors.update(extras)
+
+            # 3. Per-replica constructor args (vLLM CLI with per-replica DP)
+            ctor_kwargs = cls.constructor_args_for_replica(ctx, rp)
+            resolved = MonarchActor._resolve_refs(ctor_kwargs, ctx)
+
+            logger.info(f"Spawning replica actor '{name}' ({cls.__name__})")
+            actor_ref = procs.spawn(name, cls, **resolved)
+            ctx.actors[name] = actor_ref
+            replica_refs[name] = actor_ref
+
+        # 4. Replace individual refs with GeneratorService proxy
+        per_replica_workers = ctx.alloc_mode.gen.tp_size * ctx.alloc_mode.gen.pp_size
+        service = GeneratorService(
+            replica_refs, placements, per_replica_workers=per_replica_workers
+        )
+        ctx.actors["generator"] = service
+
+        logger.info(
+            f"Created GeneratorService with {len(replica_refs)} replicas: "
+            f"{list(replica_refs.keys())}"
+        )
+
+    async def _initialize_generator_replicas(self, ctx: ActorContext) -> Any:
+        """Initialize all generator replicas and return aggregated result."""
+        from areal.monarch_plugin.actor_base import MonarchActor
+        from areal.monarch_plugin.generator_actor import GeneratorActor
+
+        cls = GeneratorActor
+        placements = ctx.extra["replica_placements"]
+        results: dict[str, Any] = {}
+
+        for rp in placements:
+            name = rp.actor_name
+            actor_ref = ctx.actors[name]
+            method_name = cls.init_method()
+            if method_name is None:
+                continue
+
+            init_kwargs = cls.init_args_for_replica(ctx, rp)
+            resolved = MonarchActor._resolve_refs(init_kwargs, ctx)
+            method = getattr(actor_ref, method_name)
+
+            logger.info(f"Initialising replica '{name}' via {method_name}()")
+            if resolved:
+                result = await method.call_one(**resolved)
+            else:
+                result = await method.call_one()
+
+            logger.info(f"  '{name}' initialised: {result}")
+            results[name] = result
+
+        # Return the first replica's result for compatibility
+        return results.get(placements[0].actor_name, {})
+
+    async def _shutdown_generator_replicas(self, ctx: ActorContext) -> None:
+        """Shutdown all generator replicas in reverse order."""
+        placements = ctx.extra.get("replica_placements", [])
+
+        # Shutdown extra_actors for replica WorkerRegistries
+        replica_extra_names = [
+            f"worker_registry_{rp.replica_index}" for rp in placements
+        ]
+        for name in replica_extra_names:
+            actor_ref = ctx.extra_actors.get(name)
+            if actor_ref is not None:
+                try:
+                    await actor_ref.shutdown.call_one()
+                except Exception as e:
+                    logger.warning(f"Error shutting down extra actor '{name}': {e}")
+
+        # Shutdown replicas in reverse order
+        for rp in reversed(placements):
+            name = rp.actor_name
+            actor_ref = ctx.actors.get(name)
+            procs = ctx.procs.get(name)
+
+            if actor_ref is not None:
+                try:
+                    await actor_ref.shutdown.call_one()
+                except Exception as e:
+                    logger.warning(f"Error shutting down replica '{name}': {e}")
+
+            if procs is not None:
+                try:
+                    procs.stop().get()
+                except Exception as e:
+                    logger.warning(f"Error stopping ProcMesh '{name}': {e}")
+
+    # ------------------------------------------------------------------
     # Spawn
     # ------------------------------------------------------------------
 
@@ -92,11 +220,14 @@ class ActorRegistry:
         self._spawn_order = order
         logger.info(f"Actor spawn order: {order}")
 
-        spawned: list[str] = []
+        multi_replica = self._is_multi_replica(ctx)
+
         for name in order:
-            cls = self._classes[name]
-            await cls.spawn(ctx, host)
-            spawned.append(name)
+            if name == "generator" and multi_replica:
+                await self._spawn_generator_replicas(ctx, host)
+            else:
+                cls = self._classes[name]
+                await cls.spawn(ctx, host)
 
         return {**ctx.actors, **ctx.extra_actors}
 
@@ -112,11 +243,17 @@ class ActorRegistry:
         if not self._spawn_order:
             self._spawn_order = self._topo_sort()
 
+        multi_replica = self._is_multi_replica(ctx)
         results: dict[str, Any] = {}
+
         for name in self._spawn_order:
-            cls = self._classes[name]
-            result = await cls.initialize_actor(ctx)
-            results[name] = result
+            if name == "generator" and multi_replica:
+                result = await self._initialize_generator_replicas(ctx)
+                results["generator"] = result
+            else:
+                cls = self._classes[name]
+                result = await cls.initialize_actor(ctx)
+                results[name] = result
 
         return results
 
@@ -129,6 +266,8 @@ class ActorRegistry:
         order = list(reversed(self._spawn_order))
         logger.info(f"Shutdown order: {order}")
 
+        multi_replica = self._is_multi_replica(ctx)
+
         # Shutdown extra actors first (e.g. worker_registry)
         for name, actor_ref in ctx.extra_actors.items():
             try:
@@ -138,11 +277,14 @@ class ActorRegistry:
 
         # Shutdown main actors in reverse order
         for name in order:
-            cls = self._classes[name]
-            try:
-                await cls.shutdown_actor(ctx)
-            except Exception as e:
-                logger.warning(f"Error during shutdown of '{name}': {e}")
+            if name == "generator" and multi_replica:
+                await self._shutdown_generator_replicas(ctx)
+            else:
+                cls = self._classes[name]
+                try:
+                    await cls.shutdown_actor(ctx)
+                except Exception as e:
+                    logger.warning(f"Error during shutdown of '{name}': {e}")
 
         logger.info("All actors shut down.")
 

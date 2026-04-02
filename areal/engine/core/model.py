@@ -93,7 +93,9 @@ def get_model_update_meta(config: BaseExperimentConfig) -> WeightUpdateMeta:
     if weight_update_mode == "awex":
         awex_cfg = getattr(config, "awex", None)
         if awex_cfg is None:
-            raise ValueError("Awex config is required when weight_update_mode is 'awex'.")
+            raise ValueError(
+                "Awex config is required when weight_update_mode is 'awex'."
+            )
         if not awex_cfg.meta_server_addr:
             raise ValueError("awex.meta_server_addr must be set when using awex.")
         comm_backend = awex_cfg.comm_backend

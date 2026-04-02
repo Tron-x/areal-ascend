@@ -95,12 +95,19 @@ class _EmptyDataLoader:
 
 
 class PPOTrainer:
+    # Class-level flag: when True, train() returns immediately after
+    # computing max_steps (used by external orchestrators that drive
+    # the loop themselves).
+    _skip_train_loop: bool = False
+
     def __init__(
         self,
         config: PPOConfig,
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
     ):
+        from areal.utils.trainer_hooks import get_hook
+
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             # Set up file logging for controller process
@@ -114,6 +121,13 @@ class PPOTrainer:
         self.scheduler = None
         if is_single_controller():
             self.scheduler = self._init_scheduler()
+
+        # Read trainer hooks (set by external orchestrators via trainer_hooks).
+        self._rollout_engine_factory = get_hook("rollout_engine_factory")
+        self._suppress_context_exit = bool(get_hook("suppress_context_exit"))
+        self._weight_update_alloc_mode_override = get_hook(
+            "weight_update_alloc_mode_override"
+        )
 
         # Set seed.
         seeding.set_random_seed(config.seed, key=f"trainer{rank}")
@@ -271,6 +285,9 @@ class PPOTrainer:
             raise ValueError(
                 f"Invalid weight update mode: {self.config.actor.weight_update_mode}"
             )
+        # Allow external orchestrators to override the XCCL alloc_mode.
+        if self._weight_update_alloc_mode_override is not None:
+            self.weight_update_meta.alloc_mode = self._weight_update_alloc_mode_override
         self.actor.connect_engine(self.rollout, self.weight_update_meta)
 
         # Set up evaluation (skip in online mode)
@@ -319,6 +336,16 @@ class PPOTrainer:
         steps_per_epoch = len(self.train_dataloader)
         max_steps = total_epochs * steps_per_epoch
 
+        # If an external orchestrator is driving the loop step-by-step,
+        # bail out now.  The orchestrator will call run_single_step() directly.
+        if self._skip_train_loop:
+            self._train_loop_info = {
+                "start_step": start_step,
+                "max_steps": max_steps,
+                "steps_per_epoch": steps_per_epoch,
+            }
+            return
+
         # Initialize proxy workers if not using RolloutWorkflow
         if workflow is None:
             openai_cfg = self.config.rollout.openai
@@ -339,9 +366,44 @@ class PPOTrainer:
                 and global_step >= config.total_train_steps
             ):
                 break
-            epoch = global_step // steps_per_epoch
-            step = global_step % steps_per_epoch
+            self.run_single_step(
+                global_step,
+                workflow=workflow,
+                eval_workflow=eval_workflow,
+                workflow_kwargs=workflow_kwargs,
+                eval_workflow_kwargs=eval_workflow_kwargs,
+                dynamic_filter_fn=dynamic_filter_fn,
+            )
 
+    def run_single_step(
+        self,
+        global_step: int,
+        *,
+        workflow: WorkflowLike | None = None,
+        eval_workflow: WorkflowLike | None = None,
+        workflow_kwargs: dict[str, Any] | None = None,
+        eval_workflow_kwargs: dict[str, Any] | None = None,
+        dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None = None,
+        rollout_batch: dict[str, Any] | None = None,
+        steps_per_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        """Execute a single training step.
+
+        When *rollout_batch* is provided, the rollout phase is skipped and
+        training proceeds directly on the given batch (used by async pipeline
+        orchestrators).  Otherwise a fresh rollout is produced from the
+        dataloader.
+
+        Returns a dict with ``{"global_step", "epoch", "epoch_step"}``.
+        """
+        config = self.config
+        if steps_per_epoch is None:
+            steps_per_epoch = len(self.train_dataloader)
+        epoch = global_step // steps_per_epoch
+        step = global_step % steps_per_epoch
+
+        # ---- Rollout phase (skip when batch is externally supplied) --------
+        if rollout_batch is None:
             with (
                 stats_tracker.record_timing("rollout"),
                 perf_tracer.trace_scope(
@@ -361,186 +423,231 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+        else:
+            # Batch came from an external source (e.g. ReplayBufferActor).
+            # Deserialise list/numpy values back to device tensors.
+            rollout_batch = self._deserialise_batch(rollout_batch)
 
-            if self.critic is not None:
-                with (
-                    stats_tracker.record_timing("critic_values"),
-                    perf_tracer.trace_scope(
-                        "train.compute_values",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    rollout_batch["values"] = self.critic.compute_values(rollout_batch)
-                    self.critic.get_device_stats().log("critic values")
-
-            if config.actor.should_compute_prox_logp():
-                with (
-                    stats_tracker.record_timing("recompute_logp"),
-                    perf_tracer.trace_scope(
-                        "train.recompute_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    rollout_batch["prox_logp"] = self.actor.compute_logp(rollout_batch)
-                    self.actor.get_device_stats().log("recompute logp")
-
-            if self.ref is not None:
-                with (
-                    stats_tracker.record_timing("ref_logp"),
-                    perf_tracer.trace_scope(
-                        "train.ref_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    rollout_batch["ref_logp"] = self.ref.compute_logp(rollout_batch)
-                    self.ref.get_device_stats().log("ref logp")
-
-            if self.teacher is not None:
-                with (
-                    stats_tracker.record_timing("teacher_logp"),
-                    perf_tracer.trace_scope(
-                        "train.teacher_logp",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    rollout_batch["teacher_logp"] = self.teacher.compute_logp(
-                        rollout_batch
-                    )
-                    rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
-                    rollout_batch["distill_loss_weight"] = (
-                        self.config.teacher.distill_loss_weight
-                    )
-                    self.teacher.get_device_stats().log("teacher logp")
-
+        # ---- Compute values / log-probs ------------------------------------
+        if self.critic is not None:
             with (
-                stats_tracker.record_timing("compute_advantage"),
+                stats_tracker.record_timing("critic_values"),
                 perf_tracer.trace_scope(
-                    "train.compute_advantage",
+                    "train.compute_values",
                     category=Category.COMPUTE,
                     args={"global_step": global_step},
                 ),
             ):
-                adv_batch = self.actor.compute_advantages(rollout_batch)
-                self.actor.get_device_stats().log("compute advantages")
+                rollout_batch["values"] = self.critic.compute_values(rollout_batch)
+                self.critic.get_device_stats().log("critic values")
 
-            # Wait for async checkpoint staging to complete before modifying parameters
-            self.saver.maybe_wait_for_staging()
-
+        if config.actor.should_compute_prox_logp():
             with (
-                stats_tracker.record_timing("train_step"),
+                stats_tracker.record_timing("recompute_logp"),
                 perf_tracer.trace_scope(
-                    "train.ppo_update",
+                    "train.recompute_logp",
                     category=Category.COMPUTE,
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
-                self.actor.step_lr_scheduler()
-                self.actor.get_device_stats().log("ppo update")
+                rollout_batch["prox_logp"] = self.actor.compute_logp(rollout_batch)
+                self.actor.get_device_stats().log("recompute logp")
 
-            if self.critic is not None:
-                with (
-                    stats_tracker.record_timing("critic_train_step"),
-                    perf_tracer.trace_scope(
-                        "train.critic_ppo_update",
-                        category=Category.COMPUTE,
-                        args={"global_step": global_step},
-                    ),
-                ):
-                    self.critic.ppo_update(adv_batch)
-                    self.critic.step_lr_scheduler()
-                    self.critic.get_device_stats().log("ppo critic update")
-
-            # pause inference for updating weights, save, and evaluation
-            self.rollout.pause()
-
+        if self.ref is not None:
             with (
-                stats_tracker.record_timing("update_weights"),
+                stats_tracker.record_timing("ref_logp"),
                 perf_tracer.trace_scope(
-                    "train.update_weights",
-                    category=Category.COMM,
+                    "train.ref_logp",
+                    category=Category.COMPUTE,
                     args={"global_step": global_step},
                 ),
             ):
-                # Use versioned path for weight updates
-                new_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(new_version)
-                self.actor.update_weights(versioned_meta)
+                rollout_batch["ref_logp"] = self.ref.compute_logp(rollout_batch)
+                self.ref.get_device_stats().log("ref logp")
 
-                self.actor.set_version(new_version)
-                if self.critic is not None:
-                    self.critic.set_version(new_version)
-                self.rollout.set_version(new_version)
-                if self.eval_rollout is not None:
-                    self.eval_rollout.set_version(new_version)
-
+        if self.teacher is not None:
             with (
-                stats_tracker.record_timing("save"),
+                stats_tracker.record_timing("teacher_logp"),
                 perf_tracer.trace_scope(
-                    "train.save",
-                    category=Category.IO,
+                    "train.teacher_logp",
+                    category=Category.COMPUTE,
                     args={"global_step": global_step},
                 ),
             ):
-                self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
-
-            with (
-                stats_tracker.record_timing("checkpoint_for_recover"),
-                perf_tracer.trace_scope(
-                    "train.checkpoint",
-                    category=Category.IO,
-                    args={"global_step": global_step},
-                ),
-            ):
-                self._save_recover_checkpoint(
-                    epoch=epoch, epoch_step=step, global_step=global_step
+                rollout_batch["teacher_logp"] = self.teacher.compute_logp(rollout_batch)
+                rollout_batch["rl_loss_weight"] = self.config.teacher.rl_loss_weight
+                rollout_batch["distill_loss_weight"] = (
+                    self.config.teacher.distill_loss_weight
                 )
+                self.teacher.get_device_stats().log("teacher logp")
 
+        # ---- Advantage estimation ------------------------------------------
+        with (
+            stats_tracker.record_timing("compute_advantage"),
+            perf_tracer.trace_scope(
+                "train.compute_advantage",
+                category=Category.COMPUTE,
+                args={"global_step": global_step},
+            ),
+        ):
+            adv_batch = self.actor.compute_advantages(rollout_batch)
+            self.actor.get_device_stats().log("compute advantages")
+
+        # Wait for async checkpoint staging to complete before modifying parameters
+        self.saver.maybe_wait_for_staging()
+
+        # ---- PPO updates ---------------------------------------------------
+        with (
+            stats_tracker.record_timing("train_step"),
+            perf_tracer.trace_scope(
+                "train.ppo_update",
+                category=Category.COMPUTE,
+                args={"global_step": global_step},
+            ),
+        ):
+            self.actor.ppo_update(adv_batch)
+            self.actor.step_lr_scheduler()
+            self.actor.get_device_stats().log("ppo update")
+
+        if self.critic is not None:
             with (
-                stats_tracker.record_timing("eval"),
+                stats_tracker.record_timing("critic_train_step"),
                 perf_tracer.trace_scope(
-                    "train.eval",
+                    "train.critic_ppo_update",
                     category=Category.COMPUTE,
                     args={"global_step": global_step},
                 ),
             ):
-                self._evaluate(
-                    eval_workflow=eval_workflow,
-                    eval_workflow_kwargs=eval_workflow_kwargs,
-                    epoch=epoch,
-                    epoch_step=step,
-                    global_step=global_step,
-                )
+                self.critic.ppo_update(adv_batch)
+                self.critic.step_lr_scheduler()
+                self.critic.get_device_stats().log("ppo critic update")
 
-            with (
-                stats_tracker.record_timing("clear_batches"),
-                perf_tracer.trace_scope(
-                    "train.clear_batches",
-                    category=Category.INSTR,
-                    args={"global_step": global_step},
-                ),
-            ):
-                # Since all RTensor objects are affiliated IPs,
-                # calling `clear_batches` once should be sufficient.
-                self.actor.clear_batches(rollout_batch, adv_batch)
+        # ---- Pause inference for weight sync + save + eval -----------------
+        self.rollout.pause()
 
-            with perf_tracer.trace_scope(
-                "train.log_stats",
+        with (
+            stats_tracker.record_timing("update_weights"),
+            perf_tracer.trace_scope(
+                "train.update_weights",
+                category=Category.COMM,
+                args={"global_step": global_step},
+            ),
+        ):
+            new_version = global_step + 1
+            versioned_meta = self.weight_update_meta.with_version(new_version)
+            self.actor.update_weights(versioned_meta)
+
+            self.actor.set_version(new_version)
+            if self.critic is not None:
+                self.critic.set_version(new_version)
+            self.rollout.set_version(new_version)
+            if self.eval_rollout is not None:
+                self.eval_rollout.set_version(new_version)
+
+        with (
+            stats_tracker.record_timing("save"),
+            perf_tracer.trace_scope(
+                "train.save",
+                category=Category.IO,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._save_hf(epoch=epoch, epoch_step=step, global_step=global_step)
+
+        with (
+            stats_tracker.record_timing("checkpoint_for_recover"),
+            perf_tracer.trace_scope(
+                "train.checkpoint",
+                category=Category.IO,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._save_recover_checkpoint(
+                epoch=epoch, epoch_step=step, global_step=global_step
+            )
+
+        with (
+            stats_tracker.record_timing("eval"),
+            perf_tracer.trace_scope(
+                "train.eval",
+                category=Category.COMPUTE,
+                args={"global_step": global_step},
+            ),
+        ):
+            self._evaluate(
+                eval_workflow=eval_workflow,
+                eval_workflow_kwargs=eval_workflow_kwargs,
+                epoch=epoch,
+                epoch_step=step,
+                global_step=global_step,
+            )
+
+        with (
+            stats_tracker.record_timing("clear_batches"),
+            perf_tracer.trace_scope(
+                "train.clear_batches",
                 category=Category.INSTR,
                 args={"global_step": global_step},
-            ):
-                self._export_and_commit_stats(
-                    epoch=epoch, epoch_step=step, global_step=global_step
-                )
+            ),
+        ):
+            self.actor.clear_batches(rollout_batch, adv_batch)
 
-            # Resume rollout
-            self.rollout.resume()
+        with perf_tracer.trace_scope(
+            "train.log_stats",
+            category=Category.INSTR,
+            args={"global_step": global_step},
+        ):
+            self._export_and_commit_stats(
+                epoch=epoch, epoch_step=step, global_step=global_step
+            )
 
-            self._save_perf_tracer(step=global_step)
+        # Resume rollout
+        self.rollout.resume()
+
+        self._save_perf_tracer(step=global_step)
+
+        return {
+            "global_step": global_step,
+            "epoch": epoch,
+            "epoch_step": step,
+        }
+
+    def _deserialise_batch(self, batch_data: dict) -> dict:
+        """Convert a serialised batch (list/numpy values) back to device tensors.
+
+        Used when ``run_single_step`` receives a batch from an external source
+        (e.g. ReplayBufferActor) that serialised tensors as plain Python lists.
+        If the values are already tensors on the correct device, they are
+        passed through unchanged.
+        """
+        import numpy as np
+        import torch
+
+        if not batch_data:
+            return batch_data
+        # Fast path: if values are already tensors, nothing to do.
+        first_val = next(iter(batch_data.values()))
+        if isinstance(first_val, torch.Tensor):
+            return batch_data
+
+        device = next(self.actor.model.parameters()).device
+        restored: dict = {}
+        for k, v in batch_data.items():
+            if isinstance(v, list):
+                try:
+                    t = torch.tensor(v)
+                    restored[k] = (
+                        t.to(dtype=torch.float32, device=device)
+                        if t.is_floating_point()
+                        else t.to(device=device)
+                    )
+                except (ValueError, TypeError):
+                    restored[k] = v
+            elif isinstance(v, np.ndarray):
+                restored[k] = torch.from_numpy(v).to(device=device)
+            else:
+                restored[k] = v
+        return restored
 
     def close(self):
         self.saver.finalize()
@@ -709,6 +816,15 @@ class PPOTrainer:
         is_eval: bool = False,
         lora_path: str | None = None,
     ) -> InferenceEngine | RolloutController:
+        # Delegate to externally-injected factory when available.
+        if self._rollout_engine_factory is not None:
+            engine = self._rollout_engine_factory(
+                rollout_config, is_eval=is_eval, lora_path=lora_path
+            )
+            if engine is not None:
+                return engine
+            # Factory returned None → fall through to default path.
+
         if lora_path is not None and not is_single_controller():
             raise ValueError(
                 "LoRA is only supported in single-controller mode. "
@@ -1025,6 +1141,8 @@ class PPOTrainer:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        if self._suppress_context_exit:
+            return
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
         self.close()

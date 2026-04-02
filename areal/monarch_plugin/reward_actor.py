@@ -60,16 +60,18 @@ class RewardActor(MonarchActor):
         the subprocess-level timeout in SandboxActor already guards against
         runaway code, and the reward parsing itself is fast enough.
         """
+
         def _noop_timeout(timeout_seconds=None):
             def decorator(func):
                 return func
+
             return decorator
 
         try:
-            import math_verify.utils
-            import math_verify.parser
-            import math_verify.metric
             import math_verify.grader
+            import math_verify.metric
+            import math_verify.parser
+            import math_verify.utils
 
             math_verify.utils.timeout = _noop_timeout
             math_verify.parser.timeout = _noop_timeout
@@ -141,8 +143,7 @@ class RewardActor(MonarchActor):
             reward = float(reward)
         except Exception:
             logger.error(
-                f"[RewardActor] Error computing reward:\n"
-                f"{traceback.format_exc()}"
+                f"[RewardActor] Error computing reward:\n{traceback.format_exc()}"
             )
             reward = 0.0
 
@@ -183,8 +184,7 @@ class RewardActor(MonarchActor):
                 rewards.append(float(r))
             except Exception:
                 logger.error(
-                    f"[RewardActor] Batch item error:\n"
-                    f"{traceback.format_exc()}"
+                    f"[RewardActor] Batch item error:\n{traceback.format_exc()}"
                 )
                 rewards.append(0.0)
         return rewards
@@ -231,9 +231,7 @@ class MonarchRewardWrapper:
     async def _ensure_setup(self):
         if not self._setup_done:
             result = await self._actor.setup.call_one(self._fn_path)
-            logger.info(
-                f"[MonarchRewardWrapper] RewardActor setup: {result}"
-            )
+            logger.info(f"[MonarchRewardWrapper] RewardActor setup: {result}")
             self._setup_done = True
 
     async def __call__(
