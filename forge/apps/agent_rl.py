@@ -1,31 +1,28 @@
-"""Agentic RL training with async rollout/train pipeline.
+"""Agentic RL training -- TorchForge-style async orchestration.
 
-Supports two execution modes:
+Two execution modes:
 
 **Synchronous** (``async_pipeline=False``, default): rollout and training
-alternate on each step, same as the original GRPO loop.
+alternate on each step via ``trainer.train_step``.
 
-**Async pipeline** (``async_pipeline=True``): rollout and training run as
-independent concurrent loops connected through a ReplayBuffer, achieving
-near-2x GPU utilization by keeping Generator and Trainer GPUs busy
-simultaneously.
+**Async pipeline** (``async_pipeline=True``): two concurrent loops
+connected through a ReplayBuffer, following TorchForge's pattern:
 
-Architecture (async mode)::
+- ``continuous_rollouts``: orchestrator calls Generator/AgentActor
+  directly, computes reward, pushes Episode to ReplayBuffer
+- ``continuous_training``: polls ReplayBuffer, trains, syncs weights
 
-    rollout_producer_loop:
-        DataProvider.get_batch -> RolloutProducer.produce_step
-          -> AgentActor.run_episode (Generator GPUs)
-          -> ReplayBuffer.add_batch
-
-    train_consumer_loop:
-        ReplayBuffer.wait_and_sample -> TrainerActor.train_on_buffered_batch
-          (Trainer GPUs) -> TrainerActor.sync_weights -> Generator
+No intermediate DataProvider or RolloutProducer actors needed -- the
+orchestrator drives everything, while Generator/Reward/Sandbox actors
+handle the heavy GPU work.
 
 Usage::
 
-    python -m forge.apps.agent_rl \\
-        examples/math/gsm8k_rl.py \\
-        --config examples/math/gsm8k_agent.yaml
+    # Sync mode (default)
+    python -m forge.apps.agent_rl examples/math/gsm8k_rl.py ...
+
+    # Async pipeline mode
+    FORGE_ASYNC_PIPELINE=1 python -m forge.apps.agent_rl examples/math/gsm8k_rl.py ...
 """
 
 from __future__ import annotations
@@ -33,12 +30,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import traceback
 
 from forge.actors.agent import AgentActor
 from forge.actors.generator import Generator
 from forge.actors.replay_buffer import ReplayBuffer
 from forge.actors.reward import RewardActor
-from forge.actors.rollout_producer import RolloutProducer
 from forge.actors.sandbox import SandboxActor
 from forge.actors.trainer import TrainerActor
 from forge.adapters.areal import AReaLConfigBridge, AReaLTrainBackend
@@ -49,62 +46,119 @@ logger = logging.getLogger("AgentRLApp")
 
 
 # ======================================================================
-# Async pipeline loops
+# Async pipeline: TorchForge-style concurrent loops
 # ======================================================================
 
 
-async def rollout_producer_loop(
-    data_provider,
-    rollout_producer,
-    max_steps: int,
-    shutdown_event: asyncio.Event,
+async def continuous_rollouts(
+    generator,
+    reward,
+    replay_buffer,
+    agent=None,
+    shutdown_event: asyncio.Event | None = None,
+    n_samples: int = 1,
 ):
-    """Continuously produce rollout batches and push to ReplayBuffer.
+    """Produce rollout episodes and push them to the ReplayBuffer.
 
-    Runs on Generator GPUs (via AgentActor/Generator RPC).
+    Runs in the orchestrator process. All GPU work is offloaded to
+    Generator / RewardActor / AgentActor via Monarch RPC.
+
+    Follows TorchForge's ``continuous_rollouts`` pattern:
+    ``generator.generate`` -> reward -> ``replay_buffer.add``.
     """
-    step = 0
-    while step < max_steps and not shutdown_event.is_set():
+    rollout_count = 0
+    shutdown = shutdown_event or asyncio.Event()
+
+    while not shutdown.is_set():
         try:
-            data_mesh = await data_provider.get_batch.call()
-            data_items = next(iter(data_mesh.values()))
-            if not data_items:
-                logger.warning("[Rollout] DataProvider returned empty batch, retrying")
-                await asyncio.sleep(1.0)
-                continue
+            if agent is not None:
+                episode = await _rollout_via_agent(agent, rollout_count)
+            else:
+                episode = await _rollout_via_generator(generator, reward, rollout_count)
 
-            result_mesh = await rollout_producer.produce_step.call(
-                data_items, step=step, version=step
-            )
-            _, result = next(iter(result_mesh.items()))
-            logger.info(
-                f"[Rollout] Step {step}: produced {result.get('produced', 0)} "
-                f"episodes in {result.get('elapsed', 0):.1f}s"
-            )
-            step += 1
+            if episode is not None:
+                await replay_buffer.add.call_one(
+                    episode, version=rollout_count, step=rollout_count
+                )
+                rollout_count += 1
+                if rollout_count % 10 == 0:
+                    logger.info(f"[Rollout] Produced {rollout_count} episodes")
+
         except Exception as e:
-            logger.error(f"[Rollout] Error at step {step}: {e}")
-            if shutdown_event.is_set():
+            logger.error(f"[Rollout] Error at episode {rollout_count}: {e}")
+            traceback.print_exc()
+            if shutdown.is_set():
                 break
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.0)
 
-    logger.info(f"[Rollout] Producer finished after {step} steps")
+    logger.info(f"[Rollout] Finished after {rollout_count} episodes")
 
 
-async def train_consumer_loop(
+async def _rollout_via_agent(agent, step: int) -> dict | None:
+    """Run a multi-turn episode through AgentActor."""
+    data = {"prompt": f"step_{step}", "step": step}
+    result_mesh = await agent.run_episode.call(data)
+    _, result = next(iter(result_mesh.items()))
+    return result
+
+
+async def _rollout_via_generator(generator, reward, step: int) -> dict | None:
+    """Single-turn generation + reward (no AgentActor)."""
+    prompt = f"step_{step}"
+    gen_mesh = await generator.generate.call(prompt)
+    _, gen_results = next(iter(gen_mesh.items()))
+
+    if isinstance(gen_results, list) and gen_results:
+        gen_result = gen_results[0]
+    elif isinstance(gen_results, dict):
+        gen_result = gen_results
+    else:
+        return None
+
+    text = gen_result.get("text", "")
+    token_ids = gen_result.get("token_ids", [])
+    logprobs = gen_result.get("logprobs", [])
+    version = gen_result.get("generator_version", -1)
+
+    if not isinstance(logprobs, list):
+        logprobs = [0.0] * len(token_ids)
+
+    r = 0.0
+    try:
+        reward_mesh = await reward.compute_reward.call(prompt=prompt, completion=text)
+        _, r = next(iter(reward_mesh.items()))
+    except Exception as e:
+        logger.warning(f"[Rollout] Reward failed: {e}")
+
+    return {
+        "input_ids": token_ids,
+        "logprobs": logprobs,
+        "loss_mask": [1] * len(token_ids),
+        "versions": [version] * len(token_ids),
+        "attention_mask": [1] * len(token_ids),
+        "rewards": float(r),
+    }
+
+
+async def continuous_training(
     trainer,
     replay_buffer,
+    generator,
     max_steps: int,
-    start_step: int,
-    shutdown_event: asyncio.Event,
-    poll_interval: float = 1.0,
+    start_step: int = 0,
+    shutdown_event: asyncio.Event | None = None,
+    poll_interval: float = 0.5,
 ):
-    """Continuously sample from ReplayBuffer and train.
+    """Consume from ReplayBuffer, train, sync weights.
 
-    Runs on Trainer GPUs.
+    Follows TorchForge's ``continuous_training`` pattern:
+    ``replay_buffer.sample`` -> ``trainer.train_step`` ->
+    ``trainer.push_weights`` -> ``generator.update_weights``.
     """
     step = start_step
-    while step < max_steps and not shutdown_event.is_set():
+    shutdown = shutdown_event or asyncio.Event()
+
+    while (max_steps == -1 or step < max_steps) and not shutdown.is_set():
         batch_mesh = await replay_buffer.wait_and_sample.call(
             batch_size=1, current_step=step
         )
@@ -114,31 +168,27 @@ async def train_consumer_loop(
             await asyncio.sleep(poll_interval)
             continue
 
-        logger.info(f"[Train] Step {step}/{max_steps} — got batch from buffer")
+        logger.info(f"[Train] Step {step}/{max_steps} — training on buffered batch")
 
         result_mesh = await trainer.train_on_buffered_batch.call(
             batch[0], step, skip_weight_sync=False
         )
-        results = list(result_mesh.items())
-        _, result = results[0]
+        _, result = next(iter(result_mesh.items()))
+
         logger.info(f"[Train] Step {step} complete: {result}")
         step += 1
 
-    shutdown_event.set()
-    logger.info(f"[Train] Consumer finished after {step - start_step} steps")
+    shutdown.set()
+    logger.info(f"[Train] Finished after {step - start_step} steps")
 
 
 # ======================================================================
-# Synchronous fallback loop
+# Synchronous fallback
 # ======================================================================
 
 
-async def sync_training_loop(
-    trainer,
-    max_steps: int,
-    start_step: int,
-):
-    """Original synchronous rollout+train loop (no pipeline)."""
+async def sync_training_loop(trainer, max_steps: int, start_step: int):
+    """Original synchronous rollout+train loop."""
     step = start_step
     while step < max_steps:
         logger.info(f"[Train] Step {step}/{max_steps}")
@@ -151,7 +201,7 @@ async def sync_training_loop(
 
 
 # ======================================================================
-# Main entry point
+# Main
 # ======================================================================
 
 
@@ -181,11 +231,7 @@ async def agent_rl_main(config=None, run_id: int = 0):
 
     await init_provisioner()
 
-    # -- Infrastructure actors -------------------------------------------------
-    # Deploy as plain actors (ActorMesh) rather than services (ServiceInterface)
-    # because Monarch's ActorMesh is picklable across process boundaries,
-    # while ServiceInterface contains asyncio.Future objects that cannot
-    # be serialized.
+    # -- Actors ----------------------------------------------------------------
 
     generator = await Generator.options(
         procs=1, with_gpus=True, mesh_name="generator"
@@ -197,12 +243,6 @@ async def agent_rl_main(config=None, run_id: int = 0):
     await reward.setup.call(forge_cfg.reward_fn_path)
 
     sandbox = await SandboxActor.options(procs=1, mesh_name="sandbox").as_actor()
-
-    # -- Agent Framework layer -------------------------------------------------
-    # NOTE: AgentActor is deployed as a single actor (not a multi-replica
-    # service) because Monarch ServiceInterface objects contain asyncio
-    # Futures that cannot be pickled across process boundaries. The
-    # RolloutProducer handles parallelism instead.
 
     max_turns = raw_cfg.get("max_turns", 3) if hasattr(raw_cfg, "get") else 3
     turn_discount = (
@@ -217,21 +257,17 @@ async def agent_rl_main(config=None, run_id: int = 0):
         turn_discount=turn_discount,
     )
 
-    # -- ReplayBuffer ----------------------------------------------------------
-
     replay_buffer = await ReplayBuffer.options(procs=1, mesh_name="buffer").as_actor(
         max_size=forge_cfg.replay_buffer_size,
         eviction_policy="age",
         max_age_steps=forge_cfg.max_staleness_steps,
     )
 
-    # -- Check server-only mode ------------------------------------------------
+    # -- Training backend ------------------------------------------------------
 
     if bridge.is_llm_server_only(alloc_mode):
         logger.info("LLM_SERVER_ONLY mode -- serving only, no training")
         return
-
-    # -- Training backend ------------------------------------------------------
 
     xccl_alloc = bridge.resolve_xccl_alloc_mode(
         raw_cfg, alloc_mode, train_world_size=forge_cfg.train_world_size
@@ -262,20 +298,61 @@ async def agent_rl_main(config=None, run_id: int = 0):
     start_step = info.get("start_step", 0)
     logger.info(f"Trainer ready: max_steps={max_steps}, start={start_step}")
 
-    # -- Run training ----------------------------------------------------------
+    # -- Run -------------------------------------------------------------------
 
     try:
         if async_pipeline:
-            await _run_async_pipeline(
-                forge_cfg=forge_cfg,
-                generator=generator,
-                reward=reward,
-                agent=agent,
-                replay_buffer=replay_buffer,
-                trainer=trainer,
-                max_steps=max_steps,
-                start_step=start_step,
+            shutdown_event = asyncio.Event()
+            logger.info(
+                f"Starting async pipeline (max_steps={max_steps}, start={start_step})"
             )
+
+            rollout_task = asyncio.create_task(
+                continuous_rollouts(
+                    generator=generator,
+                    reward=reward,
+                    replay_buffer=replay_buffer,
+                    agent=agent,
+                    shutdown_event=shutdown_event,
+                )
+            )
+            training_task = asyncio.create_task(
+                continuous_training(
+                    trainer=trainer,
+                    replay_buffer=replay_buffer,
+                    generator=generator,
+                    max_steps=max_steps,
+                    start_step=start_step,
+                    shutdown_event=shutdown_event,
+                )
+            )
+
+            def _on_task_done(task: asyncio.Task, name: str):
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc:
+                    logger.error(f"{name} failed: {type(exc).__name__}: {exc}")
+                    traceback.print_exception(type(exc), exc, exc.__traceback__)
+                    shutdown_event.set()
+
+            rollout_task.add_done_callback(lambda t: _on_task_done(t, "rollout_task"))
+            training_task.add_done_callback(lambda t: _on_task_done(t, "training_task"))
+
+            try:
+                await training_task
+            except Exception as e:
+                logger.error(f"Training task failed: {e}")
+            finally:
+                shutdown_event.set()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(rollout_task, return_exceptions=True),
+                        timeout=10,
+                    )
+                except TimeoutError:
+                    rollout_task.cancel()
+                    await asyncio.gather(rollout_task, return_exceptions=True)
         else:
             await sync_training_loop(trainer, max_steps, start_step)
     except Exception as e:
@@ -286,63 +363,6 @@ async def agent_rl_main(config=None, run_id: int = 0):
         await shutdown()
 
     logger.info("Agent RL training complete.")
-
-
-async def _run_async_pipeline(
-    *,
-    forge_cfg,
-    generator,
-    reward,
-    agent,
-    replay_buffer,
-    trainer,
-    max_steps: int,
-    start_step: int,
-):
-    """Set up and run the async rollout/train pipeline."""
-    from forge.adapters.areal.data_provider import AReaLDataProvider
-
-    data_provider = await AReaLDataProvider.options(
-        procs=1, mesh_name="data_provider"
-    ).as_actor(
-        cli_args=forge_cfg.training_args,
-        env_vars=forge_cfg.trainer_env,
-    )
-    await data_provider.setup.call()
-
-    n_samples = 1
-    rollout_producer = await RolloutProducer.options(
-        procs=1, mesh_name="rollout_producer"
-    ).as_actor(
-        generator=generator,
-        reward=reward,
-        agent=agent,
-        replay_buffer=replay_buffer,
-        n_samples=n_samples,
-    )
-
-    shutdown_event = asyncio.Event()
-
-    logger.info(
-        f"Starting async pipeline: rollout producer + train consumer "
-        f"(max_steps={max_steps}, start={start_step})"
-    )
-
-    await asyncio.gather(
-        rollout_producer_loop(
-            data_provider=data_provider,
-            rollout_producer=rollout_producer,
-            max_steps=max_steps,
-            shutdown_event=shutdown_event,
-        ),
-        train_consumer_loop(
-            trainer=trainer,
-            replay_buffer=replay_buffer,
-            max_steps=max_steps,
-            start_step=start_step,
-            shutdown_event=shutdown_event,
-        ),
-    )
 
 
 def main():
