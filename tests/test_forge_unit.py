@@ -503,3 +503,183 @@ class TestDataProviderProtocol:
                 return []
 
         assert not isinstance(Incomplete(), DataProvider)
+
+
+# ======================================================================
+# RL Loss functions (pure math, CPU tensors, no GPU needed)
+# ======================================================================
+
+
+class TestRLLossOps:
+    def test_masked_mean(self):
+        import torch
+
+        from forge.rl.loss.ops import masked_mean
+
+        values = torch.tensor([[1.0, 2.0, 3.0]])
+        mask = torch.tensor([[1.0, 1.0, 0.0]])
+        result = masked_mean(values, mask)
+        assert abs(result.item() - 1.5) < 1e-6
+
+    def test_masked_mean_with_scale(self):
+        import torch
+
+        from forge.rl.loss.ops import masked_mean
+
+        values = torch.tensor([[1.0, 2.0, 3.0]])
+        mask = torch.tensor([[1.0, 1.0, 0.0]])
+        result = masked_mean(values, mask, loss_scale=torch.tensor(4.0))
+        assert abs(result.item() - 0.75) < 1e-6
+
+    def test_create_shifted_targets(self):
+        import torch
+
+        from forge.rl.loss.ops import create_shifted_targets
+
+        ids = torch.tensor([[10, 20, 30, 40]])
+        targets = create_shifted_targets(ids)
+        assert targets[0, 0].item() == 20
+        assert targets[0, 1].item() == 30
+        assert targets[0, 2].item() == 40
+        assert targets[0, 3].item() == -100
+
+    def test_create_shifted_targets_with_mask(self):
+        import torch
+
+        from forge.rl.loss.ops import create_shifted_targets
+
+        ids = torch.tensor([[10, 20, 30, 40]])
+        mask = torch.tensor([[0, 1, 1, 0]])
+        targets = create_shifted_targets(ids, loss_mask=mask)
+        assert targets[0, 0].item() == -100
+        assert targets[0, 1].item() == 30
+        assert targets[0, 3].item() == -100
+
+    def test_compute_ratio_on_policy(self):
+        import torch
+
+        from forge.rl.loss.ops import compute_ratio
+
+        logprobs = torch.tensor([[- 1.0, -2.0, -1.5]])
+        gen_logprobs = torch.tensor([[-1.0, -2.0, -1.5]])
+        mask = torch.ones(1, 3)
+        ratio, log_ratio, metrics = compute_ratio(logprobs, gen_logprobs, mask)
+        assert torch.allclose(ratio, torch.ones(1, 3), atol=1e-6)
+        assert torch.allclose(log_ratio, torch.zeros(1, 3), atol=1e-6)
+
+    def test_compute_kl_k3_zero_when_same(self):
+        import torch
+
+        from forge.rl.loss.ops import compute_kl
+
+        lp = torch.tensor([[-1.0, -2.0]])
+        kl, metrics = compute_kl(lp, lp, torch.ones(1, 2), kl_type="k3")
+        assert torch.allclose(kl, torch.zeros(1, 2), atol=1e-6)
+
+    def test_pg_ppo_clip_no_clip_when_on_policy(self):
+        import torch
+
+        from forge.rl.loss.ops import pg_ppo_clip
+
+        ratio = torch.ones(1, 3)
+        advantages = torch.tensor([[0.5, -0.3, 0.1]])
+        mask = torch.ones(1, 3)
+        loss, metrics = pg_ppo_clip(ratio, advantages, mask)
+        expected = -ratio * advantages
+        assert torch.allclose(loss, expected, atol=1e-6)
+
+    def test_aggregate_fixed_horizon(self):
+        import torch
+
+        from forge.rl.loss.ops import aggregate
+
+        loss = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        result, _ = aggregate(loss, mask, agg_type="fixed_horizon")
+        assert abs(result.item() - 3.0 / 4.0) < 1e-6
+
+    def test_aggregate_token_mean(self):
+        import torch
+
+        from forge.rl.loss.ops import aggregate
+
+        loss = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        result, _ = aggregate(loss, mask, agg_type="token_mean")
+        assert abs(result.item() - 1.5) < 1e-6
+
+
+class TestGRPOLoss:
+    def test_grpo_runs(self):
+        import torch
+
+        from forge.rl.loss.grpo import GRPOLoss
+
+        B, S, V = 2, 8, 32
+        logits = torch.randn(B, S, V, requires_grad=True)
+        target_ids = torch.randint(0, V, (B, S))
+        advantages = torch.randn(B, S)
+        gen_logprobs = torch.randn(B, S)
+        loss_mask = torch.ones(B, S)
+
+        loss_fn = GRPOLoss(beta=0.0)
+        output = loss_fn(logits, target_ids, advantages, gen_logprobs, loss_mask)
+        assert output.loss.shape == ()
+        assert output.loss.requires_grad
+        assert len(output.metrics) > 0
+
+    def test_grpo_with_kl(self):
+        import torch
+
+        from forge.rl.loss.grpo import GRPOLoss
+
+        B, S, V = 2, 8, 32
+        logits = torch.randn(B, S, V)
+        target_ids = torch.randint(0, V, (B, S))
+        advantages = torch.randn(B, S)
+        gen_logprobs = torch.randn(B, S)
+        ref_logprobs = torch.randn(B, S)
+        loss_mask = torch.ones(B, S)
+
+        loss_fn = GRPOLoss(beta=0.1)
+        output = loss_fn(
+            logits, target_ids, advantages, gen_logprobs, loss_mask,
+            ref_logprobs=ref_logprobs,
+        )
+        assert output.loss.shape == ()
+        assert any("kl_ref" in m.key for m in output.metrics)
+
+    def test_grpo_beta_zero_no_ref_needed(self):
+        import torch
+
+        from forge.rl.loss.grpo import GRPOLoss
+
+        loss_fn = GRPOLoss(beta=0.0)
+        output = loss_fn(
+            torch.randn(1, 4, 16),
+            torch.randint(0, 16, (1, 4)),
+            torch.randn(1, 4),
+            torch.randn(1, 4),
+            torch.ones(1, 4),
+        )
+        assert output.loss.shape == ()
+
+
+class TestDAPOLoss:
+    def test_dapo_runs(self):
+        import torch
+
+        from forge.rl.loss.dapo import DAPOLoss
+
+        B, S, V = 2, 8, 32
+        logits = torch.randn(B, S, V, requires_grad=True)
+        target_ids = torch.randint(0, V, (B, S))
+        advantages = torch.randn(B, S)
+        gen_logprobs = torch.randn(B, S)
+        loss_mask = torch.ones(B, S)
+
+        loss_fn = DAPOLoss()
+        output = loss_fn(logits, target_ids, advantages, gen_logprobs, loss_mask)
+        assert output.loss.shape == ()
+        assert output.loss.requires_grad
+        assert any("dual_clip" in m.key for m in output.metrics)
