@@ -683,3 +683,119 @@ class TestDAPOLoss:
         assert output.loss.shape == ()
         assert output.loss.requires_grad
         assert any("dual_clip" in m.key for m in output.metrics)
+
+
+# ======================================================================
+# Observability (metrics + tracer)
+# ======================================================================
+
+
+class TestMetricAccumulators:
+    def test_mean_accumulator(self):
+        from forge.observability.metrics import MeanAccumulator, Reduce
+
+        acc = MeanAccumulator(Reduce.MEAN)
+        acc.append(1.0)
+        acc.append(3.0)
+        assert abs(acc.get_value() - 2.0) < 1e-6
+        state = acc.get_state()
+        assert state["sum"] == 4.0
+        assert state["count"] == 2
+        acc.reset()
+        assert acc.get_value() == 0.0
+
+    def test_sum_accumulator(self):
+        from forge.observability.metrics import Reduce, SumAccumulator
+
+        acc = SumAccumulator(Reduce.SUM)
+        acc.append(5.0)
+        acc.append(3.0)
+        assert abs(acc.get_value() - 8.0) < 1e-6
+
+    def test_max_accumulator(self):
+        from forge.observability.metrics import MaxAccumulator, Reduce
+
+        acc = MaxAccumulator(Reduce.MAX)
+        acc.append(1.0)
+        acc.append(5.0)
+        acc.append(3.0)
+        assert abs(acc.get_value() - 5.0) < 1e-6
+
+    def test_min_accumulator(self):
+        from forge.observability.metrics import MinAccumulator, Reduce
+
+        acc = MinAccumulator(Reduce.MIN)
+        acc.append(5.0)
+        acc.append(1.0)
+        acc.append(3.0)
+        assert abs(acc.get_value() - 1.0) < 1e-6
+
+    def test_std_accumulator(self):
+        from forge.observability.metrics import Reduce, StdAccumulator
+
+        acc = StdAccumulator(Reduce.STD)
+        for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]:
+            acc.append(v)
+        assert abs(acc.get_value() - 2.0) < 0.1
+
+    def test_mean_cross_rank_reduce(self):
+        from forge.observability.metrics import MeanAccumulator, Reduce
+
+        states = [
+            {"reduction_type": "mean", "sum": 10.0, "count": 5},
+            {"reduction_type": "mean", "sum": 20.0, "count": 10},
+        ]
+        result = MeanAccumulator.get_reduced_value_from_states(states)
+        assert abs(result - 2.0) < 1e-6
+
+
+class TestMetricCollector:
+    def test_record_and_flush(self):
+        from forge.observability.metrics import MetricCollector, Reduce
+
+        collector = MetricCollector()
+        from forge.observability.metrics import Metric
+
+        collector.push(Metric("loss", 1.0, Reduce.MEAN))
+        collector.push(Metric("loss", 3.0, Reduce.MEAN))
+        collector.push(Metric("count", 1, Reduce.SUM))
+        collector.push(Metric("count", 1, Reduce.SUM))
+
+        result = collector.flush(step=0)
+        assert abs(result["loss"] - 2.0) < 1e-6
+        assert abs(result["count"] - 2.0) < 1e-6
+
+        result2 = collector.flush(step=1)
+        assert result2.get("loss", 0.0) == 0.0
+
+    def test_reduce_metrics_states(self):
+        from forge.observability.metrics import reduce_metrics_states
+
+        states = [
+            {"loss": {"reduction_type": "mean", "sum": 6.0, "count": 3}},
+            {"loss": {"reduction_type": "mean", "sum": 4.0, "count": 2}},
+        ]
+        result = reduce_metrics_states(states)
+        assert abs(result["loss"] - 2.0) < 1e-6
+
+
+class TestTracer:
+    def test_tracer_basic(self):
+        import time
+
+        from forge.observability.tracer import Tracer
+
+        t = Tracer("test", log_to_metrics=False)
+        t.start()
+        time.sleep(0.01)
+        elapsed = t.step("work")
+        assert elapsed > 0.005
+        total = t.stop()
+        assert total >= elapsed
+
+    def test_tracer_context_manager(self):
+        from forge.observability.tracer import Tracer
+
+        with Tracer("ctx", log_to_metrics=False) as t:
+            t.step("a")
+        assert len(t._steps) == 1
