@@ -41,7 +41,7 @@ from typing import Any
 
 from aiohttp import web
 
-from forge.core.agent import GenerationResult
+from forge.core.types import GenerationResult
 from forge.service.model_proxy import ModelProxy
 
 logger = logging.getLogger(__name__)

@@ -342,7 +342,7 @@ class TestSimpleReActAgent:
 
     def test_format_feedback_success(self):
         from forge.agents.react import SimpleReActAgent
-        from forge.core.agent import AgentAction, ToolResult
+        from forge.core.types import AgentAction, ToolResult
 
         agent = SimpleReActAgent()
         action = AgentAction(response="test")
@@ -353,7 +353,7 @@ class TestSimpleReActAgent:
 
     def test_format_feedback_error(self):
         from forge.agents.react import SimpleReActAgent
-        from forge.core.agent import AgentAction, ToolResult
+        from forge.core.types import AgentAction, ToolResult
 
         agent = SimpleReActAgent()
         action = AgentAction(response="test")
@@ -371,7 +371,7 @@ class TestSimpleReActAgent:
 
     def test_protocol_compliance(self):
         from forge.agents.react import SimpleReActAgent
-        from forge.core.agent import AgentLogic
+        from forge.core.protocols import AgentLogic
 
         agent = SimpleReActAgent()
         assert isinstance(agent, AgentLogic)
@@ -442,7 +442,7 @@ class TestChatTemplate:
 
 class TestCoreDataClasses:
     def test_generation_result_defaults(self):
-        from forge.core.agent import GenerationResult
+        from forge.core.types import GenerationResult
 
         r = GenerationResult()
         assert r.text == ""
@@ -451,14 +451,14 @@ class TestCoreDataClasses:
         assert r.version == -1
 
     def test_tool_call(self):
-        from forge.core.agent import ToolCall
+        from forge.core.types import ToolCall
 
         tc = ToolCall(type="code_execution", content="print(1)")
         assert tc.type == "code_execution"
         assert tc.metadata == {}
 
     def test_agent_action_defaults(self):
-        from forge.core.agent import AgentAction
+        from forge.core.types import AgentAction
 
         a = AgentAction()
         assert a.response == ""
@@ -466,7 +466,7 @@ class TestCoreDataClasses:
         assert a.done is False
 
     def test_tool_result(self):
-        from forge.core.agent import ToolResult
+        from forge.core.types import ToolResult
 
         tr = ToolResult(success=True, output="ok")
         assert tr.success is True

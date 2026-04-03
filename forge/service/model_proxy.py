@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from forge.core.agent import GenerationResult
+from forge.core.types import GenerationResult
 
 if TYPE_CHECKING:
     from forge.core.chat_template import ChatTemplate

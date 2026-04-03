@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 
-from forge.core.agent import AgentAction, ToolCall, ToolResult
+from forge.core.types import AgentAction, ToolCall, ToolResult
 
 
 def _extract_code_blocks(text: str) -> list[str]:

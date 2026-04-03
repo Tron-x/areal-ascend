@@ -28,10 +28,10 @@ from typing import TYPE_CHECKING, Any
 from monarch.actor import endpoint
 
 from forge.actors.base import ForgeActor
-from forge.core.agent import AgentAction, GenerationResult, ToolCall, ToolResult
+from forge.core.types import AgentAction, GenerationResult, ToolCall, ToolResult
 
 if TYPE_CHECKING:
-    from forge.core.agent import AgentLogic
+    from forge.core.protocols import AgentLogic
     from forge.service.model_proxy import ModelProxy
 
 logger = logging.getLogger(__name__)

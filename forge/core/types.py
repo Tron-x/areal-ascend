@@ -99,3 +99,80 @@ class TrainBatch:
 
 Group = list[Episode]
 """A group of episodes for the same prompt (GRPO: G completions per prompt)."""
+
+
+# ======================================================================
+# Agent types (moved from core/agent.py for a flatter core/ structure)
+# ======================================================================
+
+
+@dataclass
+class ToolCall:
+    """A single tool invocation requested by the agent.
+
+    Attributes:
+        type: Tool identifier (e.g. ``"code_execution"``, ``"web_search"``).
+        content: Payload for the tool (source code, query string, etc.).
+        metadata: Optional extra data for the tool.
+    """
+
+    type: str
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ToolResult:
+    """Outcome of executing a ``ToolCall``.
+
+    Attributes:
+        success: Whether the tool executed without errors.
+        output: The tool's stdout / return value.
+        error: Error message if ``success`` is False.
+        tool_call: The original request that produced this result.
+    """
+
+    success: bool
+    output: str = ""
+    error: str = ""
+    tool_call: ToolCall | None = None
+
+
+@dataclass
+class GenerationResult:
+    """LLM generation output with RL training metadata.
+
+    The ``text`` field is all an ``AgentLogic`` needs.  The remaining
+    fields are collected by ``AgentActor`` for training data assembly
+    and are opaque to agent logic implementations.
+
+    Attributes:
+        text: Generated text.
+        token_ids: Output token IDs (for training).
+        logprobs: Per-token log-probabilities (for PPO/GRPO advantage).
+        version: Generator weight version at generation time.
+        raw: Full upstream response dict (preserved for adapters).
+    """
+
+    text: str = ""
+    token_ids: list[int] = field(default_factory=list)
+    logprobs: list[float] = field(default_factory=list)
+    version: int = -1
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AgentAction:
+    """Output of a single agent reasoning step.
+
+    Attributes:
+        response: The model's textual response for this turn.
+        tool_calls: Tool invocations extracted from the response.
+        done: If True, the agent considers the episode finished.
+        metadata: Arbitrary data the agent logic wants to carry forward.
+    """
+
+    response: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    done: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)

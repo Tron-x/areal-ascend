@@ -86,6 +86,44 @@ class RewardFn(Protocol):
         ...
 
 
+@runtime_checkable
+class AgentLogic(Protocol):
+    """Pluggable agent strategy -- pure logic, no infrastructure awareness.
+
+    Implementations define *what* the agent does (extract tools, decide
+    when to stop, format feedback) while ``AgentActor`` handles *how*
+    (call Generator via ModelProxy, execute tools, collect training data).
+
+    Built-in implementations:
+        - ``forge.agents.react.SimpleReActAgent``   (code-execution ReAct loop)
+    """
+
+    def process_response(
+        self,
+        response: str,
+        messages: list[dict[str, str]],
+    ) -> Any:
+        """Analyse a generation response and decide what to do.
+
+        Returns an ``AgentAction`` describing extracted tool calls and
+        whether the episode is considered finished.
+        """
+        ...
+
+    def should_continue(self, turn: int, reward: float) -> bool:
+        """Decide whether to proceed to the next turn."""
+        ...
+
+    def format_feedback(
+        self,
+        action: Any,
+        tool_results: list,
+        reward: float,
+    ) -> str:
+        """Build the user-feedback message appended before the next turn."""
+        ...
+
+
 # ======================================================================
 # Legacy backend protocols (backward compat for engines/areal)
 # ======================================================================
