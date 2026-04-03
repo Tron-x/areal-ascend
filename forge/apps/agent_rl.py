@@ -337,15 +337,23 @@ async def agent_rl_main(config=None, run_id: int = 0):
                 f"Starting async pipeline (max_steps={max_steps}, start={start_step})"
             )
 
-            rollout_task = asyncio.create_task(
-                continuous_rollouts(
-                    generator=generator,
-                    reward=reward,
-                    replay_buffer=replay_buffer,
-                    agent=agent,
-                    shutdown_event=shutdown_event,
-                )
+            num_rollout_threads = forge_cfg.rollout_threads
+            logger.info(
+                f"Launching {num_rollout_threads} rollout thread(s) + 1 training thread"
             )
+
+            rollout_tasks = [
+                asyncio.create_task(
+                    continuous_rollouts(
+                        generator=generator,
+                        reward=reward,
+                        replay_buffer=replay_buffer,
+                        agent=agent,
+                        shutdown_event=shutdown_event,
+                    )
+                )
+                for _ in range(num_rollout_threads)
+            ]
             training_task = asyncio.create_task(
                 continuous_training(
                     trainer=trainer,
@@ -366,7 +374,10 @@ async def agent_rl_main(config=None, run_id: int = 0):
                     traceback.print_exception(type(exc), exc, exc.__traceback__)
                     shutdown_event.set()
 
-            rollout_task.add_done_callback(lambda t: _on_task_done(t, "rollout_task"))
+            for i, rt in enumerate(rollout_tasks):
+                rt.add_done_callback(
+                    lambda t, i=i: _on_task_done(t, f"rollout_task_{i}")
+                )
             training_task.add_done_callback(lambda t: _on_task_done(t, "training_task"))
 
             try:
@@ -377,12 +388,13 @@ async def agent_rl_main(config=None, run_id: int = 0):
                 shutdown_event.set()
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(rollout_task, return_exceptions=True),
+                        asyncio.gather(*rollout_tasks, return_exceptions=True),
                         timeout=10,
                     )
                 except TimeoutError:
-                    rollout_task.cancel()
-                    await asyncio.gather(rollout_task, return_exceptions=True)
+                    for rt in rollout_tasks:
+                        rt.cancel()
+                    await asyncio.gather(*rollout_tasks, return_exceptions=True)
         else:
             await sync_training_loop(trainer, max_steps, start_step)
     except Exception as e:

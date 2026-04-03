@@ -15,11 +15,21 @@ Primitives:
 from forge.rl.advantage import compute_advantages_grpo
 from forge.rl.collate import collate_episodes
 from forge.rl.loss import DAPOLoss, GRPOLoss, LossOutput
+from forge.rl.rewards import (
+    composite_reward,
+    process_reward,
+    reward_to_go,
+    spread_final_reward,
+)
 
 __all__ = [
     "DAPOLoss",
     "GRPOLoss",
     "LossOutput",
     "collate_episodes",
+    "composite_reward",
     "compute_advantages_grpo",
+    "process_reward",
+    "reward_to_go",
+    "spread_final_reward",
 ]

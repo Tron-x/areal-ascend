@@ -78,6 +78,7 @@ class ForgeConfig:
     async_pipeline: bool = False
     replay_buffer_size: int = 4096
     max_staleness_steps: int = 2
+    rollout_threads: int = 1
 
     fileroot: str = "/tmp/forge"
     log_dir: str = ""

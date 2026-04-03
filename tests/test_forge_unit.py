@@ -1264,3 +1264,97 @@ class TestReToolAgent:
 
         agent = ReToolAgent()
         assert isinstance(agent, AgentLogic)
+
+
+# ======================================================================
+# Reward utilities
+# ======================================================================
+
+
+class TestRewardToGo:
+    def test_sparse_final_reward(self):
+        from forge.rl.rewards import reward_to_go
+
+        result = reward_to_go([0, 0, 0, 1.0])
+        assert len(result) == 4
+        assert abs(result[-1] - 1.0) < 1e-6
+        assert abs(result[0] - 1.0) < 1e-6
+
+    def test_with_discount(self):
+        from forge.rl.rewards import reward_to_go
+
+        result = reward_to_go([0, 0, 0, 1.0], gamma=0.9)
+        assert abs(result[-1] - 1.0) < 1e-6
+        assert abs(result[0] - 0.729) < 1e-3
+
+    def test_dense_rewards(self):
+        from forge.rl.rewards import reward_to_go
+
+        result = reward_to_go([1.0, 1.0, 1.0], gamma=1.0)
+        assert abs(result[0] - 3.0) < 1e-6
+        assert abs(result[1] - 2.0) < 1e-6
+        assert abs(result[2] - 1.0) < 1e-6
+
+    def test_empty(self):
+        from forge.rl.rewards import reward_to_go
+
+        assert reward_to_go([]) == []
+
+
+class TestSpreadFinalReward:
+    def test_basic(self):
+        from forge.rl.rewards import spread_final_reward
+
+        result = spread_final_reward(5, 1.0)
+        assert len(result) == 5
+        assert all(abs(r - 1.0) < 1e-6 for r in result)
+
+    def test_with_discount(self):
+        from forge.rl.rewards import spread_final_reward
+
+        result = spread_final_reward(3, 1.0, gamma=0.5)
+        assert abs(result[2] - 1.0) < 1e-6
+        assert abs(result[1] - 0.5) < 1e-6
+        assert abs(result[0] - 0.25) < 1e-6
+
+
+class TestProcessReward:
+    def test_default_rules(self):
+        from forge.rl.rewards import process_reward
+
+        events = [
+            {"tool_success": True},
+            {"tool_error": True},
+            {},
+            {"answer_found": True},
+        ]
+        rewards = process_reward(events)
+        assert rewards[0] > 0
+        assert rewards[1] < 0
+        assert rewards[2] == 0.0
+        assert rewards[3] > 0
+
+    def test_custom_rules(self):
+        from forge.rl.rewards import process_reward
+
+        events = [{"good": True}, {"bad": True}]
+        rewards = process_reward(events, rules={"good": 1.0, "bad": -2.0})
+        assert abs(rewards[0] - 1.0) < 1e-6
+        assert abs(rewards[1] - (-2.0)) < 1e-6
+
+
+class TestCompositeReward:
+    def test_equal_weights(self):
+        from forge.rl.rewards import composite_reward
+
+        r = composite_reward({"correctness": 1.0, "speed": 0.5})
+        assert abs(r - 1.5) < 1e-6
+
+    def test_custom_weights(self):
+        from forge.rl.rewards import composite_reward
+
+        r = composite_reward(
+            {"correctness": 1.0, "speed": 0.5},
+            weights={"correctness": 2.0, "speed": 0.5},
+        )
+        assert abs(r - 2.25) < 1e-6
