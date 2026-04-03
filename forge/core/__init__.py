@@ -17,13 +17,19 @@ from forge.core.chat_template import (
     ChatTemplate,
     SimpleChatTemplate,
 )
-from forge.core.protocols import InferenceBridge, RewardBackend, TrainBackend
+from forge.core.protocols import (
+    DataProvider,
+    InferenceBridge,
+    RewardBackend,
+    TrainBackend,
+)
 
 __all__ = [
     "AgentAction",
     "AgentLogic",
     "CHATML",
     "ChatTemplate",
+    "DataProvider",
     "GenerationResult",
     "InferenceBridge",
     "LLAMA_STYLE",

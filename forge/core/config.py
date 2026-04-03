@@ -42,6 +42,12 @@ class ForgeConfig:
                     (external process via ModelProxyServer HTTP API).
         external_agent_command: Command for CLI-Native mode (e.g. ``["python", "agent.py"]``).
         external_agent_timeout: Max seconds for external agent process.
+
+        async_pipeline: If True, run rollout and training as concurrent loops
+                        connected via ReplayBuffer for ~2x GPU utilization.
+        replay_buffer_size: Maximum entries in the ReplayBuffer.
+        max_staleness_steps: Max age (in training steps) before buffer entries
+                             are evicted.  Controls how off-policy data can be.
     """
 
     experiment_name: str = ""
@@ -68,6 +74,10 @@ class ForgeConfig:
     agent_mode: str = "managed"
     external_agent_command: list[str] = field(default_factory=list)
     external_agent_timeout: float = 300.0
+
+    async_pipeline: bool = False
+    replay_buffer_size: int = 4096
+    max_staleness_steps: int = 2
 
     fileroot: str = "/tmp/forge"
     log_dir: str = ""

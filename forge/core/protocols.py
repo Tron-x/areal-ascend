@@ -59,6 +59,20 @@ class TrainBackend(Protocol):
         """Train on a pre-produced rollout batch."""
         ...
 
+    def train_on_buffered_batch(
+        self, batch_data: dict, global_step: int, skip_weight_sync: bool = False
+    ) -> dict:
+        """Train on a batch from ReplayBuffer, optionally deferring weight sync."""
+        ...
+
+    def sync_weights(self, global_step: int) -> dict:
+        """Push updated weights to Generator independently of training."""
+        ...
+
+    def get_train_metadata(self) -> dict:
+        """Return training metadata (max_steps, steps_per_epoch, etc.)."""
+        ...
+
     def shutdown(self) -> None:
         """Release resources (models, process groups, etc.)."""
         ...
@@ -142,4 +156,31 @@ class RewardBackend(Protocol):
 
     def get_stats(self) -> dict:
         """Return backend statistics (call count, timing, etc.)."""
+        ...
+
+
+@runtime_checkable
+class DataProvider(Protocol):
+    """Provides data batches for rollout, decoupled from the training pipeline.
+
+    Allows the rollout producer to iterate over training data independently
+    of the ``TrainerActor``, enabling true parallel rollout and training.
+    """
+
+    def get_batch(self) -> list[dict]:
+        """Return the next batch of raw data items.
+
+        Each item is a dict with keys like ``prompt``, ``answer``,
+        ``messages``, etc. -- the format consumed by rollout workflows.
+
+        Raises ``StopIteration`` when the epoch is exhausted.
+        """
+        ...
+
+    def reset(self) -> None:
+        """Reset the iterator to the beginning of the dataset."""
+        ...
+
+    def __len__(self) -> int:
+        """Total number of batches per epoch."""
         ...

@@ -229,11 +229,11 @@ class AReaLTrainBackend:
         return self.train_on_batch(batch_data, global_step)
 
     def do_rollout(self, global_step: int) -> dict:
-        from areal.utils import perf_tracer, stats_tracker
-        from areal.utils.perf_tracer import Category
-
         import numpy as np
         import torch
+
+        from areal.utils import perf_tracer, stats_tracker
+        from areal.utils.perf_tracer import Category
 
         trainer = self._trainer
         step_in_epoch = global_step % self._steps_per_epoch
@@ -277,9 +277,6 @@ class AReaLTrainBackend:
         return serialised
 
     def train_on_batch(self, batch_data: dict, global_step: int) -> dict:
-        from areal.utils import perf_tracer, stats_tracker
-        from areal.utils.perf_tracer import Category
-
         trainer = self._trainer
         epoch = global_step // self._steps_per_epoch
         step_in_epoch = global_step % self._steps_per_epoch
@@ -315,6 +312,84 @@ class AReaLTrainBackend:
             "global_step": global_step,
             "epoch": epoch,
             "epoch_step": step_in_epoch,
+        }
+
+    def train_on_buffered_batch(
+        self, batch_data: dict, global_step: int, skip_weight_sync: bool = False
+    ) -> dict:
+        """Train on a batch from ReplayBuffer, optionally deferring weight sync.
+
+        When ``skip_weight_sync=True``, the caller is responsible for invoking
+        ``sync_weights()`` separately.  This enables the async pipeline to
+        overlap the next rollout with the weight transfer.
+        """
+
+        trainer = self._trainer
+        epoch = global_step // self._steps_per_epoch
+        step_in_epoch = global_step % self._steps_per_epoch
+
+        ctx = _StepContext(
+            trainer=trainer,
+            config=trainer.config,
+            step_args={"global_step": global_step, "epoch_step": step_in_epoch},
+            global_step=global_step,
+            epoch=epoch,
+            step_in_epoch=step_in_epoch,
+        )
+
+        rollout_batch = _batch_to_device(batch_data, trainer)
+
+        self._compute_logps(ctx, rollout_batch)
+        adv_batch = self._compute_advantages(ctx, rollout_batch)
+
+        trainer.saver.maybe_wait_for_staging()
+
+        self._ppo_update(ctx, adv_batch)
+        self._critic_update(ctx, adv_batch)
+
+        if not skip_weight_sync:
+            self._sync_weights(ctx)
+
+        eval_workflow = self._train_kwargs.get("eval_workflow")
+        eval_wf_kwargs = self._train_kwargs.get("eval_workflow_kwargs")
+        self._save_and_evaluate(
+            ctx, rollout_batch, adv_batch, eval_workflow, eval_wf_kwargs
+        )
+        self._log_and_resume(ctx)
+
+        return {
+            "global_step": global_step,
+            "epoch": epoch,
+            "epoch_step": step_in_epoch,
+        }
+
+    def sync_weights(self, global_step: int) -> dict:
+        """Push updated weights to Generator, standalone from training.
+
+        Called by the orchestrator after ``train_on_buffered_batch``
+        when weight sync is deferred.
+        """
+        epoch = global_step // self._steps_per_epoch
+        step_in_epoch = global_step % self._steps_per_epoch
+
+        ctx = _StepContext(
+            trainer=self._trainer,
+            config=self._trainer.config,
+            step_args={"global_step": global_step, "epoch_step": step_in_epoch},
+            global_step=global_step,
+            epoch=epoch,
+            step_in_epoch=step_in_epoch,
+        )
+        self._sync_weights(ctx)
+        return {"synced_version": global_step + 1}
+
+    def get_train_metadata(self) -> dict:
+        """Return training metadata for the orchestrator."""
+        return {
+            "max_steps": self._max_steps,
+            "steps_per_epoch": self._steps_per_epoch,
+            "rank": self._rank,
+            "world_size": self._world_size,
         }
 
     def shutdown(self) -> None:

@@ -1,9 +1,12 @@
-"""ReplayBuffer actor with eviction and sampling policies.
+"""ReplayBuffer actor with eviction, sampling, and version-aware filtering.
 
-Ported from TorchForge's ReplayBuffer with AReaL-specific adaptations:
-- Age-based eviction (samples that are too old relative to training step)
+Serves as the bridge between the rollout producer and training consumer
+in the async pipeline.  Supports:
+- Age-based eviction (samples too old relative to training step)
 - Count-based eviction (max buffer size)
-- Round-robin or prioritized sampling
+- Version-based filtering (reject data from stale policy versions)
+- Blocking wait-and-sample (avoids busy polling in consumer loop)
+- Batch add (multiple items at once from rollout producer)
 """
 
 from __future__ import annotations
@@ -110,19 +113,58 @@ class ReplayBuffer(ForgeActor):
         }
 
     @endpoint
+    def add_batch(
+        self,
+        items: list[dict[str, Any]],
+        version: int = -1,
+        step: int = -1,
+    ) -> dict:
+        """Add multiple experience entries to the buffer at once.
+
+        Args:
+            items: List of rollout data dicts.
+            version: Policy version that generated this data.
+            step: Global training step at insertion time.
+
+        Returns:
+            Buffer statistics after insertion.
+        """
+        now = time.time()
+        for data in items:
+            entry = BufferEntry(
+                data=data,
+                version=version,
+                insert_time=now,
+                insert_step=step,
+            )
+            self._buffer.append(entry)
+            self._total_added += 1
+
+        self._evict()
+
+        return {
+            "buffer_size": len(self._buffer),
+            "total_added": self._total_added,
+            "total_evicted": self._total_evicted,
+            "batch_added": len(items),
+        }
+
+    @endpoint
     def sample(
         self,
         batch_size: int = 1,
         current_step: int = -1,
+        min_version: int = -1,
     ) -> list[dict] | None:
         """Sample a batch from the buffer.
 
         Args:
             batch_size: Number of entries to sample.
             current_step: Current training step (for staleness filtering).
+            min_version: Minimum policy version to accept (reject older data).
 
         Returns:
-            List of data dicts, or None if buffer is empty.
+            List of data dicts, or None if buffer is empty / no valid entries.
         """
         if not self._buffer:
             return None
@@ -133,7 +175,14 @@ class ReplayBuffer(ForgeActor):
         if not self._buffer:
             return None
 
-        candidates = list(self._buffer)
+        if min_version >= 0:
+            candidates = [e for e in self._buffer if e.version >= min_version]
+        else:
+            candidates = list(self._buffer)
+
+        if not candidates:
+            return None
+
         k = min(batch_size, len(candidates))
         selected = random.sample(candidates, k)
 
@@ -147,6 +196,31 @@ class ReplayBuffer(ForgeActor):
         return [entry.data for entry in selected]
 
     @endpoint
+    def wait_and_sample(
+        self,
+        batch_size: int = 1,
+        current_step: int = -1,
+        min_version: int = -1,
+    ) -> list[dict] | None:
+        """Sample from the buffer, returning None only if truly empty.
+
+        Unlike ``sample``, this performs eviction and version filtering
+        but always returns whatever is available. The caller should
+        retry with a sleep if None is returned.
+
+        In the async pipeline, the orchestrator polls this endpoint::
+
+            while batch is None:
+                batch = await buffer.wait_and_sample.call_one(...)
+                await asyncio.sleep(0.5)
+        """
+        return self.sample(
+            batch_size=batch_size,
+            current_step=current_step,
+            min_version=min_version,
+        )
+
+    @endpoint
     def size(self) -> int:
         return len(self._buffer)
 
@@ -156,11 +230,14 @@ class ReplayBuffer(ForgeActor):
 
     @endpoint
     def get_stats(self) -> dict:
+        versions = [e.version for e in self._buffer]
         return {
             "buffer_size": len(self._buffer),
             "total_added": self._total_added,
             "total_sampled": self._total_sampled,
             "total_evicted": self._total_evicted,
+            "min_version": min(versions) if versions else -1,
+            "max_version": max(versions) if versions else -1,
         }
 
     def _evict(self):
