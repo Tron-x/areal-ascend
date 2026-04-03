@@ -949,3 +949,180 @@ class TestGroupBufferMaxGroups:
         buf.add_episode("p2", {"r": 0}, version=0, step=0)
         assert buf.get_stats()["pending_groups"] == 2
         assert buf.get_stats()["total_groups_expired"] == 1
+
+
+# ======================================================================
+# Tool system
+# ======================================================================
+
+
+class TestToolSpec:
+    def test_to_openai_spec(self):
+        from forge.tools.protocol import ToolSpec
+
+        spec = ToolSpec(
+            name="code_interpreter",
+            description="Run Python",
+            parameters={"type": "object", "properties": {"code": {"type": "string"}}},
+        )
+        openai = spec.to_openai_spec()
+        assert openai["type"] == "function"
+        assert openai["function"]["name"] == "code_interpreter"
+        assert "code" in openai["function"]["parameters"]["properties"]
+
+
+class TestCodeBlockParser:
+    def test_parse_code_tag(self):
+        from forge.tools.parsers import CodeBlockParser
+
+        p = CodeBlockParser()
+        calls = p.parse("Think step by step.\n<code>print(42)</code>\nDone.")
+        assert len(calls) == 1
+        assert calls[0].name == "code_interpreter"
+        assert calls[0].arguments["code"] == "print(42)"
+
+    def test_parse_markdown_python(self):
+        from forge.tools.parsers import CodeBlockParser
+
+        p = CodeBlockParser()
+        calls = p.parse("```python\nx = 1+1\nprint(x)\n```")
+        assert len(calls) == 1
+        assert "print(x)" in calls[0].arguments["code"]
+
+    def test_parse_multiple(self):
+        from forge.tools.parsers import CodeBlockParser
+
+        p = CodeBlockParser()
+        calls = p.parse("<code>a=1</code> then <code>b=2</code>")
+        assert len(calls) == 2
+
+    def test_no_match(self):
+        from forge.tools.parsers import CodeBlockParser
+
+        p = CodeBlockParser()
+        assert p.parse("No code here.") == []
+        assert p.has_tool_call("No code here.") is False
+
+    def test_has_tool_call(self):
+        from forge.tools.parsers import CodeBlockParser
+
+        p = CodeBlockParser()
+        assert p.has_tool_call("<code>x</code>") is True
+        assert p.has_tool_call("```python\nx\n```") is True
+
+
+class TestToolCallParser:
+    def test_parse_qwen3_format(self):
+        from forge.tools.parsers import ToolCallParser
+
+        p = ToolCallParser()
+        resp = '<tool_call>\n{"name": "code_interpreter", "arguments": {"code": "print(1)"}}\n</tool_call>'
+        calls = p.parse(resp)
+        assert len(calls) == 1
+        assert calls[0].name == "code_interpreter"
+        assert calls[0].arguments["code"] == "print(1)"
+
+    def test_incomplete_tag_auto_close(self):
+        from forge.tools.parsers import ToolCallParser
+
+        p = ToolCallParser()
+        resp = '<tool_call>{"name": "test", "arguments": {}}'
+        calls = p.parse(resp)
+        assert len(calls) == 1
+
+    def test_invalid_json_skipped(self):
+        from forge.tools.parsers import ToolCallParser
+
+        p = ToolCallParser()
+        resp = "<tool_call>not json</tool_call>"
+        assert p.parse(resp) == []
+
+
+class TestFunctionCallParser:
+    def test_parse_qwen3_coder(self):
+        from forge.tools.parsers import FunctionCallParser
+
+        p = FunctionCallParser()
+        resp = "<function=list_dir><parameter=path>.</parameter></function>"
+        calls = p.parse(resp)
+        assert len(calls) == 1
+        assert calls[0].name == "list_dir"
+        assert calls[0].arguments["path"] == "."
+
+    def test_parse_numeric_params(self):
+        from forge.tools.parsers import FunctionCallParser
+
+        p = FunctionCallParser()
+        resp = "<function=calc><parameter=x>42</parameter><parameter=y>3.14</parameter></function>"
+        calls = p.parse(resp)
+        assert calls[0].arguments["x"] == 42
+        assert abs(calls[0].arguments["y"] - 3.14) < 0.01
+
+
+class TestCompositeParser:
+    def test_finds_all_formats(self):
+        from forge.tools.parsers import CompositeParser
+
+        p = CompositeParser()
+        resp = (
+            "<code>print(1)</code>\n"
+            '<tool_call>{"name": "search", "arguments": {"q": "test"}}</tool_call>\n'
+            "<function=calc><parameter=x>5</parameter></function>"
+        )
+        calls = p.parse(resp)
+        assert len(calls) == 3
+
+    def test_has_tool_call_any_format(self):
+        from forge.tools.parsers import CompositeParser
+
+        p = CompositeParser()
+        assert p.has_tool_call("<code>x</code>") is True
+        assert p.has_tool_call("<tool_call>x</tool_call>") is True
+        assert p.has_tool_call("<function=f>x</function>") is True
+        assert p.has_tool_call("plain text") is False
+
+
+class TestToolRegistry:
+    def test_register_and_list(self):
+        from forge.tools.protocol import ToolSpec
+        from forge.tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(ToolSpec(name="test_tool", description="A test"))
+        assert "test_tool" in reg.list_tools()
+
+    def test_get_specs_openai(self):
+        from forge.tools.protocol import ToolSpec
+        from forge.tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(ToolSpec(name="t1", description="Tool 1"))
+        reg.register(ToolSpec(name="t2", description="Tool 2"))
+        specs = reg.get_tool_specs()
+        assert len(specs) == 2
+        assert all(s["type"] == "function" for s in specs)
+
+
+class TestPythonSandbox:
+    def test_safety_check_blocks_os(self):
+        from forge.tools.python_sandbox import PythonSandbox
+
+        sb = PythonSandbox()
+        safe, msg = sb.check_safety("import os\nos.system('rm -rf /')")
+        assert safe is False
+        assert "os" in msg.lower()
+
+    def test_safety_check_allows_math(self):
+        from forge.tools.python_sandbox import PythonSandbox
+
+        sb = PythonSandbox(allowed_modules={"math"})
+        safe, msg = sb.check_safety("import math\nprint(math.sqrt(4))")
+        assert safe is True
+
+    def test_safety_check_disabled_skips_in_execute(self):
+        from forge.tools.python_sandbox import PythonSandbox
+
+        sb = PythonSandbox(safety_check=False)
+        # When safety_check=False, execute() skips check_safety entirely
+        # check_safety() itself always runs the patterns regardless
+        assert sb.safety_check is False
