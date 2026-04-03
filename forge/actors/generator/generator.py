@@ -242,6 +242,31 @@ class Generator(ForgeActor):
         logger.info(f"Weight update complete, now v{version}")
 
     @endpoint
+    def get_chat_template(self) -> dict:
+        """Return the model's chat template metadata.
+
+        Useful for other actors (e.g. AgentActor) that need to discover
+        the correct prompt format at runtime without loading the tokenizer
+        themselves.
+
+        Returns:
+            Dict with ``model`` (model path) and ``chat_template``
+            (Jinja2 template string, or None if the tokenizer has none).
+        """
+        model_path = getattr(self.engine_args, "model", "")
+        template_str = None
+        try:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=True
+            )
+            template_str = tokenizer.chat_template
+        except Exception as e:
+            logger.warning(f"Could not load chat template for {model_path}: {e}")
+        return {"model": model_path, "chat_template": template_str}
+
+    @endpoint
     async def handle_request(self, ep: str, payload: dict) -> dict:
         """Dispatch a request based on the endpoint path.
 

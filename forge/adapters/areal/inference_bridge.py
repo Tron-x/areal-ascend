@@ -105,9 +105,7 @@ class AReaLInferenceBridge(InferenceEngine):
         if func is not None:
             try:
                 asyncio.get_running_loop()
-                self.logger.info(
-                    "GeneratorActor health check deferred (Service mode)"
-                )
+                self.logger.info("GeneratorActor health check deferred (Service mode)")
             except RuntimeError:
                 result = asyncio.run(func("handle_request", "/health", {}))
                 self.logger.info(f"GeneratorActor healthy: {result}")
@@ -212,9 +210,7 @@ class AReaLInferenceBridge(InferenceEngine):
                 )
 
             if not isinstance(result, dict):
-                raise ValueError(
-                    f"Expected dict response, got {type(result).__name__}"
-                )
+                raise ValueError(f"Expected dict response, got {type(result).__name__}")
 
             gen_result = self._backend.parse_generation_response(result)
             stop_reason = gen_result.stop_reason
@@ -477,8 +473,19 @@ class AReaLInferenceBridge(InferenceEngine):
 
         max_turns = getattr(workflow, "max_turns", 2)
 
+        chat_template = None
+        if tokenizer_path:
+            try:
+                from forge.utils.chat_template import auto_chat_template
+
+                chat_template = auto_chat_template(model_path=tokenizer_path)
+                logger.info(f"Created chat template from tokenizer: {chat_template}")
+            except Exception as e:
+                logger.warning(f"Failed to create chat template: {e}")
+
         agent_workflow = MonarchAgentWorkflow(
             agent_actor=self._agent_actor,
+            chat_template=chat_template,
             tokenizer_path=tokenizer_path,
             reward_fn_path=reward_fn_path,
             gconfig=gconfig_dict,
@@ -529,9 +536,7 @@ class AReaLInferenceBridge(InferenceEngine):
             if not callable(fn):
                 raise TypeError(f"Imported {should_accept_fn} is not callable")
             return fn
-        raise TypeError(
-            f"Unsupported should_accept_fn type: {type(should_accept_fn)}"
-        )
+        raise TypeError(f"Unsupported should_accept_fn type: {type(should_accept_fn)}")
 
     def prepare_batch(
         self,

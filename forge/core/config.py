@@ -21,6 +21,8 @@ class ForgeConfig:
         trial_name: Name of the trial within the experiment.
         run_id: Run identifier (for recovery).
 
+        model_path: HuggingFace model ID or local path (used for tokenizer / chat template).
+
         train_world_size: Number of training processes (FSDP/DP).
         gen_world_size: Number of inference GPUs.
         master_addr: Distributed master address.
@@ -35,11 +37,18 @@ class ForgeConfig:
 
         backend_type: Adapter backend to use (``"areal"``, ``"slime"``, etc.).
         backend_config: Opaque dict passed to the adapter for backend-specific settings.
+
+        agent_mode: ``"managed"`` (AgentLogic-driven) or ``"cli_native"``
+                    (external process via ModelProxyServer HTTP API).
+        external_agent_command: Command for CLI-Native mode (e.g. ``["python", "agent.py"]``).
+        external_agent_timeout: Max seconds for external agent process.
     """
 
     experiment_name: str = ""
     trial_name: str = ""
     run_id: int = 0
+
+    model_path: str = ""
 
     train_world_size: int = 4
     gen_world_size: int = 4
@@ -55,6 +64,10 @@ class ForgeConfig:
 
     backend_type: str = "areal"
     backend_config: dict[str, Any] = field(default_factory=dict)
+
+    agent_mode: str = "managed"
+    external_agent_command: list[str] = field(default_factory=list)
+    external_agent_timeout: float = 300.0
 
     fileroot: str = "/tmp/forge"
     log_dir: str = ""

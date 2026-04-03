@@ -1,8 +1,10 @@
 """Agentic RL training entry point -- multi-turn agent with code execution.
 
-Extends the GRPO pattern with AgentActor (multi-turn loops),
-SandboxActor (code execution), and session-based routing for
-KV cache locality.
+Extends the GRPO pattern with the decoupled agent architecture:
+
+- ``SimpleReActAgent``  (AgentLogic) -- defines the multi-turn strategy
+- ``ModelProxy``        (bridge)     -- wraps Generator with ChatTemplate
+- ``AgentActor``        (Monarch)    -- orchestrates the episode loop
 
 Usage::
 
@@ -17,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
 
 from forge.actors.agent import AgentActor
 from forge.actors.generator import Generator
@@ -26,27 +27,30 @@ from forge.actors.reward import RewardActor
 from forge.actors.sandbox import SandboxActor
 from forge.actors.trainer import TrainerActor
 from forge.adapters.areal import AReaLConfigBridge, AReaLTrainBackend
+from forge.agents.react import SimpleReActAgent
 from forge.bootstraps import ensure_ascend_custom_opp_path
 from forge.provisioner import init_provisioner, shutdown
+from forge.service.model_proxy import ModelProxy
+from forge.utils.chat_template import auto_chat_template
 
 logger = logging.getLogger("AgentRLApp")
 
 
 async def agent_rl_main(config=None, run_id: int = 0):
-    """Async agentic RL orchestration with multi-turn agent workflows.
+    """Async agentic RL orchestration with decoupled agent architecture.
 
-    Architecture::
+    Architecture (ROLL-inspired three-layer separation)::
 
-        continuous_rollouts:
-            AgentActor.run_episode (session-affine routing)
-              -> Generator.generate (text generation)
-              -> SandboxActor.execute_code (code execution)
-              -> RewardActor.compute_reward (scoring)
-            -> ReplayBuffer.add
-
-        continuous_training:
-            ReplayBuffer.sample -> Trainer.train_on_batch
-            -> Generator.update_weights
+        AgentLogic (SimpleReActAgent)
+            |  pure strategy: parse response, extract code, feedback
+            v
+        AgentActor (Monarch actor)
+            |  orchestrator: drives loop, collects training data
+            |-- ModelProxy -> Generator.generate (text generation)
+            |-- SandboxActor.execute_code (code execution)
+            |-- RewardActor.compute_reward (scoring)
+            v
+        ReplayBuffer -> TrainerActor (weight update)
     """
     ensure_ascend_custom_opp_path()
 
@@ -68,6 +72,8 @@ async def agent_rl_main(config=None, run_id: int = 0):
 
     await init_provisioner()
 
+    # -- Infrastructure actors -------------------------------------------------
+
     generator = await Generator.options(
         procs=1, with_gpus=True, mesh_name="generator"
     ).as_service(
@@ -83,22 +89,36 @@ async def agent_rl_main(config=None, run_id: int = 0):
         num_replicas=4, procs=1, mesh_name="sandbox"
     ).as_service()
 
+    # -- Agent Framework layer (decoupled) -------------------------------------
+
+    chat_template = auto_chat_template(model_path=forge_cfg.model_path)
+    logger.info(f"Chat template: {chat_template}")
+
+    model_proxy = ModelProxy(generator, chat_template=chat_template)
+
     max_turns = raw_cfg.get("max_turns", 3) if hasattr(raw_cfg, "get") else 3
-    turn_discount = raw_cfg.get("turn_discount", 0.9) if hasattr(raw_cfg, "get") else 0.9
+    turn_discount = (
+        raw_cfg.get("turn_discount", 0.9) if hasattr(raw_cfg, "get") else 0.9
+    )
+    agent_logic = SimpleReActAgent(max_turns=max_turns, turn_discount=turn_discount)
+    logger.info(f"Agent logic: {agent_logic}")
 
     agent = await AgentActor.options(
         num_replicas=2, procs=1, mesh_name="agent"
     ).as_service(
-        generator=generator,
+        agent_logic=agent_logic,
+        model_proxy=model_proxy,
         reward=reward,
         sandbox=sandbox,
-        max_turns=max_turns,
-        turn_discount=turn_discount,
     )
+
+    # -- Replay buffer (for future async rollout/train) ------------------------
 
     _replay_buffer = await ReplayBuffer.options(  # noqa: F841
         procs=1, mesh_name="buffer"
     ).as_actor(max_size=4096, eviction_policy="age", max_age_steps=2)
+
+    # -- Training loop ---------------------------------------------------------
 
     if bridge.is_llm_server_only(alloc_mode):
         logger.info("LLM_SERVER_ONLY mode -- serving only, no training")

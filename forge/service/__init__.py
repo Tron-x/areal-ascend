@@ -7,6 +7,8 @@ from forge.service.interface import (
     SessionContext,
 )
 from forge.service.metrics import ServiceMetrics
+from forge.service.model_proxy import ModelProxy
+from forge.service.model_proxy_server import ModelProxyServer
 from forge.service.replica import (
     Replica,
     ReplicaMetrics,
@@ -21,6 +23,8 @@ from forge.service.service import Service
 
 __all__ = [
     "LeastLoadedRouter",
+    "ModelProxy",
+    "ModelProxyServer",
     "Replica",
     "ReplicaMetrics",
     "ReplicaState",

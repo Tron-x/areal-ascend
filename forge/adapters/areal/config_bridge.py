@@ -80,6 +80,7 @@ class AReaLConfigBridge:
             experiment_name=config.experiment_name,
             trial_name=config.trial_name,
             run_id=run_id,
+            model_path=config.vllm.model,
             train_world_size=train_ws,
             gen_world_size=alloc_mode.gen.world_size,
             master_addr=master_addr,
