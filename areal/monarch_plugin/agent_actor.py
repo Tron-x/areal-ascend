@@ -14,16 +14,18 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any
 
 from monarch.actor import endpoint
 
-from areal.monarch_plugin.actor_base import MonarchActor
-from areal.monarch_plugin.actor_spec import ActorRef, ResourceKind
+from areal.monarch_plugin.actor import AReaLMonarchActor
 
 logger = logging.getLogger(__name__)
 
-_CODE_BLOCK_RE = re.compile(r"```(?:python|py)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_CODE_BLOCK_RE = re.compile(
+    r"```(?:python|py)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE
+)
 
 
 def _extract_code_blocks(text: str) -> list[str]:
@@ -42,7 +44,7 @@ def _parse_token_ids(tokens: list[str]) -> list[int]:
     return ids
 
 
-class AgentActor(MonarchActor):
+class AgentActor(AReaLMonarchActor):
     """Multi-turn agent that orchestrates generation, tool use, and reward.
 
     Lifecycle:
@@ -57,16 +59,8 @@ class AgentActor(MonarchActor):
       AgentActor ──RPC──→ RewardActor (reward computation)
     """
 
-    resource = ResourceKind.CPU
-    dependencies = ["generator", "sandbox", "reward"]
-
-    @classmethod
-    def constructor_args(cls, ctx) -> dict:
-        return {
-            "generator_actor": ActorRef("generator"),
-            "sandbox_actor": ActorRef("sandbox"),
-            "reward_actor": ActorRef("reward"),
-        }
+    procs = 1
+    with_gpus = False
 
     def __init__(self, generator_actor, sandbox_actor, reward_actor):
         self._generator = generator_actor
@@ -108,7 +102,11 @@ class AgentActor(MonarchActor):
         self._reward_fn_path = reward_fn_path
         self._max_turns = max_turns
 
-        await self._reward.setup.call_one(reward_fn_path)
+        func = getattr(self._reward, "call_all", None)
+        if func is not None:
+            await func("setup", reward_fn_path)
+        else:
+            await self._reward.setup.call_one(reward_fn_path)
 
         logger.info(
             f"[AgentActor] Setup complete: tokenizer={tokenizer_path}, "
@@ -175,9 +173,15 @@ class AgentActor(MonarchActor):
                 "logprobs": 1,
             }
 
-            gen_result = await self._generator.handle_request.call_one(
-                "/v1/completions", payload
-            )
+            func = getattr(self._generator, "call", None)
+            if func is not None:
+                gen_result = await func(
+                    "handle_request", "/v1/completions", payload
+                )
+            else:
+                gen_result = await self._generator.handle_request.call_one(
+                    "/v1/completions", payload
+                )
 
             choice = gen_result["choices"][0]
             gen_text = choice.get("text", "")
@@ -201,7 +205,9 @@ class AgentActor(MonarchActor):
             if code_blocks and self._sandbox is not None:
                 self._code_exec_count += 1
                 for code in code_blocks:
-                    exec_result = await self._sandbox.execute_code.call_one(code, 10.0)
+                    exec_result = await self._sandbox.execute_code.call_one(
+                        code, 10.0
+                    )
                     if exec_result["success"]:
                         exec_output += exec_result.get("result", "")
                     else:
@@ -209,9 +215,16 @@ class AgentActor(MonarchActor):
 
             prompt_text = tokenizer.decode(input_ids)
             task_data = {k: v for k, v in data.items() if k != "messages"}
-            reward = await self._reward.compute_reward.call_one(
-                prompt_text, gen_text, input_ids, gen_token_ids, task_data
-            )
+            func = getattr(self._reward, "call", None)
+            if func is not None:
+                reward = await func(
+                    "compute_reward",
+                    prompt_text, gen_text, input_ids, gen_token_ids, task_data
+                )
+            else:
+                reward = await self._reward.compute_reward.call_one(
+                    prompt_text, gen_text, input_ids, gen_token_ids, task_data
+                )
 
             if reward > 0:
                 break
@@ -257,7 +270,9 @@ class AgentActor(MonarchActor):
     @endpoint
     async def get_stats(self) -> dict:
         avg_turns = (
-            self._total_turns / self._episode_count if self._episode_count > 0 else 0
+            self._total_turns / self._episode_count
+            if self._episode_count > 0
+            else 0
         )
         return {
             "episode_count": self._episode_count,
@@ -268,7 +283,11 @@ class AgentActor(MonarchActor):
 
     @endpoint
     async def shutdown(self) -> None:
-        avg = self._total_turns / self._episode_count if self._episode_count > 0 else 0
+        avg = (
+            self._total_turns / self._episode_count
+            if self._episode_count > 0
+            else 0
+        )
         logger.info(
             f"[AgentActor] Shutting down. "
             f"{self._episode_count} episodes, "

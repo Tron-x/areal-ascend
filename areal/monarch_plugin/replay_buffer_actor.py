@@ -22,13 +22,12 @@ from typing import Any
 
 from monarch.actor import endpoint
 
-from areal.monarch_plugin.actor_base import MonarchActor
-from areal.monarch_plugin.actor_spec import ResourceKind
+from areal.monarch_plugin.actor import AReaLMonarchActor
 
 logger = logging.getLogger(__name__)
 
 
-class ReplayBufferActor(MonarchActor):
+class ReplayBufferActor(AReaLMonarchActor):
     """Monarch Actor that buffers rollout batches for async training.
 
     Each entry is a dict with:
@@ -41,12 +40,8 @@ class ReplayBufferActor(MonarchActor):
       whose ``policy_version < current_version - max_staleness``.
     """
 
-    resource = ResourceKind.CPU
-    dependencies: list[str] = []
-
-    @classmethod
-    def constructor_args(cls, ctx) -> dict:
-        return {"max_size": 8}
+    procs = 1
+    with_gpus = False
 
     def __init__(self, max_size: int = 16):
         self._buffer: deque[dict[str, Any]] = deque(maxlen=max_size)

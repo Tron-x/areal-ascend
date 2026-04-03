@@ -25,16 +25,17 @@ import logging
 import time
 
 import numpy as np
+import pickle
 import torch
+
 from monarch.actor import endpoint
 
-from areal.monarch_plugin.actor_base import MonarchActor
-from areal.monarch_plugin.actor_spec import ActorRef, ResourceKind
+from areal.monarch_plugin.actor import AReaLMonarchActor
 
 logger = logging.getLogger(__name__)
 
 
-class RolloutActor(MonarchActor):
+class RolloutActor(AReaLMonarchActor):
     """CPU-only Monarch Actor that produces rollout batches independently.
 
     Lifecycle:
@@ -44,29 +45,8 @@ class RolloutActor(MonarchActor):
       get_stats() / shutdown()
     """
 
-    resource = ResourceKind.CPU
-    dependencies = ["generator", "reward", "agent"]
-
-    @classmethod
-    def constructor_args(cls, ctx) -> dict:
-        return {
-            "generator_actor": ActorRef("generator"),
-            "reward_actor": ActorRef("reward"),
-            "agent_actor": ActorRef("agent"),
-        }
-
-    @classmethod
-    def init_method(cls) -> str | None:
-        return "setup"
-
-    @classmethod
-    def init_args(cls, ctx) -> dict:
-        import sys
-
-        return {
-            "cli_args": sys.argv[1:],
-            "train_dp_size": 1,
-        }
+    procs = 1
+    with_gpus = False
 
     def __init__(self, generator_actor, reward_actor=None, agent_actor=None):
         self._generator = generator_actor
@@ -101,9 +81,9 @@ class RolloutActor(MonarchActor):
             Training data parallel size (for WorkflowExecutor init).
         """
         from areal.api.cli_args import (
-            GRPOConfig,
             InferenceEngineConfig,
             load_expr_config,
+            GRPOConfig,
             to_structured_cfg,
         )
         from areal.dataset import get_custom_dataset
@@ -132,18 +112,22 @@ class RolloutActor(MonarchActor):
             dataset_config=config.train_dataset,
         )
 
-        rollout_config = to_structured_cfg(config.rollout, InferenceEngineConfig)
+        rollout_config = to_structured_cfg(
+            config.rollout, InferenceEngineConfig
+        )
         engine = MonarchVLLMEngine(
             rollout_config,
             self._generator,
             reward_actor=self._reward,
             agent_actor=self._agent,
         )
-        engine.initialize(train_data_parallel_size=train_dp_size)
+        engine.initialize(train_data_parallel_size=1)
         self._engine = engine
 
         self._workflow = self._extract_workflow(script_path)
-        self._workflow_kwargs = self._extract_workflow_kwargs(script_path, config)
+        self._workflow_kwargs = self._extract_workflow_kwargs(
+            script_path, config
+        )
         self._group_size = config.gconfig.n_samples
         self._dynamic_bs = config.dynamic_bs
 
@@ -217,14 +201,8 @@ class RolloutActor(MonarchActor):
             [t for t in trajectories if t is not None]
         )
 
-        serialised = {}
-        for k, v in rollout_batch.items():
-            if isinstance(v, torch.Tensor):
-                serialised[k] = v.cpu().numpy().tolist()
-            elif isinstance(v, np.ndarray):
-                serialised[k] = v.tolist()
-            else:
-                serialised[k] = v
+        # Use pickle for efficient binary serialization instead of slow list conversion
+        serialised = pickle.dumps(rollout_batch)
 
         elapsed = time.monotonic() - t0
         self._rollout_count += 1
@@ -233,7 +211,7 @@ class RolloutActor(MonarchActor):
         logger.info(
             f"[RolloutActor] Rollout step {global_step} done "
             f"in {elapsed:.1f}s "
-            f"(batch keys: {list(serialised.keys())})"
+            f"(batch keys: {list(rollout_batch.keys())})"
         )
         return serialised
 
@@ -245,7 +223,11 @@ class RolloutActor(MonarchActor):
 
     @endpoint
     def get_stats(self) -> dict:
-        avg = self._total_time / self._rollout_count if self._rollout_count > 0 else 0
+        avg = (
+            self._total_time / self._rollout_count
+            if self._rollout_count > 0
+            else 0
+        )
         return {
             "rollout_count": self._rollout_count,
             "total_time": self._total_time,
@@ -254,7 +236,11 @@ class RolloutActor(MonarchActor):
 
     @endpoint
     def shutdown(self) -> None:
-        avg = self._total_time / self._rollout_count if self._rollout_count > 0 else 0
+        avg = (
+            self._total_time / self._rollout_count
+            if self._rollout_count > 0
+            else 0
+        )
         logger.info(
             f"[RolloutActor] Shutting down. "
             f"{self._rollout_count} rollouts, avg {avg:.1f}s each"

@@ -1,9 +1,10 @@
-"""GeneratorActor -- Monarch actor wrapping vLLM's AsyncLLM.
+"""GeneratorActor -- Monarch actor wrapping vLLM's LLMEngine (in-process).
 
-Replaces the vLLM HTTP subprocess with an in-process AsyncLLM engine
-managed by AReaLMonarchExecutor.  Exposes a ``handle_request`` endpoint
-that mirrors the HTTP routes from ``areal_vllm_server.py``, so the
-existing VLLMBackend request/response format is fully reusable.
+Uses MonarchVLLMEngine (which wraps LLMEngine with InprocClient) instead of
+AsyncLLM to avoid the EngineCore subprocess.  This ensures collective_rpc
+Monarch RPCs execute in the actor's own process where the transport is
+properly initialised, eliminating the deadlock that occurred when the
+EngineCore ran as a non-Monarch subprocess.
 """
 
 from __future__ import annotations
@@ -13,112 +14,30 @@ import base64
 import logging
 import os
 import uuid
+from typing import Any, Optional
 
 import cloudpickle
 from monarch.actor import endpoint
 
 from areal.api.cli_args import vLLMConfig
-from areal.monarch_plugin.actor_base import MonarchActor
-from areal.monarch_plugin.actor_spec import ActorRef, CtxRef, ResourceKind
+from areal.monarch_plugin.actor import AReaLMonarchActor
 
 logger = logging.getLogger(__name__)
 
 
-class GeneratorActor(MonarchActor):
-    """Monarch actor embedding vLLM's AsyncLLM for in-process inference.
+class GeneratorActor(AReaLMonarchActor):
+    """Monarch actor embedding vLLM for in-process inference.
 
     Lifecycle
     ---------
     __init__   -> store vLLM CLI arg list
-    setup()    -> serialise HostMesh, create AsyncLLM + AReaLMonarchExecutor
+    setup()    -> serialise HostMesh, create MonarchVLLMEngine + workers
     handle_request(endpoint, payload) -> dispatch (generation / weight-sync)
     shutdown() -> cleanup
     """
 
-    resource = ResourceKind.NPU_SINGLE
-    dependencies: list[str] = []
-
-    @classmethod
-    def constructor_args(cls, ctx) -> dict:
-        return {"vllm_cli_args": cls.build_vllm_cli_args(ctx.config, ctx.alloc_mode)}
-
-    @classmethod
-    def init_method(cls) -> str | None:
-        return "setup"
-
-    @classmethod
-    def init_args(cls, ctx) -> dict:
-        return {
-            "host_mesh": CtxRef("host"),
-            "worker_registry": ActorRef("worker_registry"),
-            "device_ids": ctx.placement.inference.all_device_ids,
-        }
-
-    @classmethod
-    def bootstrap_factory(cls, ctx):
-        from areal.monarch_plugin.bootstraps import make_generator_bootstrap
-
-        return make_generator_bootstrap(
-            ",".join(ctx.placement.inference.all_device_ids)
-        )
-
-    @classmethod
-    def post_spawn(cls, procs, ctx) -> dict:
-        from areal.monarch_plugin.executor import WorkerRegistry
-
-        registry = procs.spawn("worker_registry", WorkerRegistry)
-        return {"worker_registry": registry}
-
-    # -----------------------------------------------------------------
-    # Per-replica lifecycle (called by ActorRegistry for multi-replica)
-    # -----------------------------------------------------------------
-
-    @classmethod
-    def constructor_args_for_replica(cls, ctx, replica) -> dict:
-        """Build vLLM CLI args for a specific replica."""
-        num_replicas = len(ctx.extra["replica_placements"])
-        # Per-replica DP = total DP / num_replicas (if DP > 1)
-        per_replica_dp = max(1, ctx.alloc_mode.gen.dp_size // num_replicas)
-        cli_args = cls._build_vllm_cli_args_with_dp_override(
-            ctx.config, ctx.alloc_mode, per_replica_dp
-        )
-        return {"vllm_cli_args": cli_args}
-
-    @classmethod
-    def bootstrap_factory_for_replica(cls, ctx, replica):
-        from areal.monarch_plugin.bootstraps import make_generator_bootstrap
-
-        return make_generator_bootstrap(",".join(replica.device_ids))
-
-    @classmethod
-    def init_args_for_replica(cls, ctx, replica) -> dict:
-        return {
-            "host_mesh": CtxRef("host"),
-            "worker_registry": ActorRef(f"worker_registry_{replica.actor_name}"),
-            "device_ids": replica.device_ids,
-        }
-
-    @classmethod
-    def post_spawn_for_replica(cls, procs, replica_name, ctx) -> dict:
-        from areal.monarch_plugin.executor import WorkerRegistry
-
-        registry_name = f"worker_registry_{replica_name}"
-        registry = procs.spawn(registry_name, WorkerRegistry)
-        return {registry_name: registry}
-
-    @classmethod
-    def _build_vllm_cli_args_with_dp_override(
-        cls, config, alloc_mode, dp_override: int
-    ) -> list[str]:
-        """Build vLLM CLI args with an overridden data_parallel_size."""
-        args_dict = vLLMConfig.build_args(
-            vllm_config=config.vllm,
-            tp_size=alloc_mode.gen.tp_size,
-            pp_size=alloc_mode.gen.pp_size,
-        )
-        if dp_override != int(args_dict.get("data_parallel_size") or 1):
-            args_dict["data_parallel_size"] = dp_override
-        return cls._args_dict_to_cli(args_dict)
+    procs = 1
+    with_gpus = True
 
     @staticmethod
     def build_vllm_cli_args(config, alloc_mode) -> list[str]:
@@ -128,11 +47,6 @@ class GeneratorActor(MonarchActor):
             tp_size=alloc_mode.gen.tp_size,
             pp_size=alloc_mode.gen.pp_size,
         )
-        return GeneratorActor._args_dict_to_cli(args_dict)
-
-    @staticmethod
-    def _args_dict_to_cli(args_dict: dict) -> list[str]:
-        """Convert a vLLM args dict to a CLI arg list."""
         cli: list[str] = []
         for k, v in args_dict.items():
             if v is None or v is False or v == "" or (isinstance(v, list) and not v):
@@ -150,7 +64,7 @@ class GeneratorActor(MonarchActor):
 
     def __init__(self, vllm_cli_args: list):
         self._cli_args = vllm_cli_args
-        self.llm = None
+        self.engine = None
         self.workers = None
         self._paused = False
 
@@ -160,7 +74,7 @@ class GeneratorActor(MonarchActor):
 
     @endpoint
     async def setup(self, host_mesh, worker_registry, device_ids: list):
-        """Initialise AsyncLLM with AReaLMonarchExecutor.
+        """Initialise MonarchVLLMEngine with AReaLMonarchExecutor.
 
         Parameters
         ----------
@@ -168,17 +82,21 @@ class GeneratorActor(MonarchActor):
             From ``this_host()`` in the orchestrator.
         worker_registry : WorkerRegistry actor mesh
             Bridge for MonarchExecutor to register workers.
-        device_ids : list[str]
-            NPU device IDs to allocate (e.g. ``["0"]``).
+        device_ids : list[str] | None
+            NPU device IDs to allocate (e.g. ``["0"]``). If None,
+            discovers from ``ASCEND_RT_VISIBLE_DEVICES``.
         """
         from vllm.engine.arg_utils import EngineArgs
         from vllm.entrypoints.llm import UsageContext
-        from vllm.entrypoints.openai.cli_args import make_arg_parser
         from vllm.utils.argparse_utils import FlexibleArgumentParser
-        from vllm.v1.engine.async_llm import AsyncLLM
 
-        logger.info(f"[GeneratorActor] setup: device_ids={device_ids}")
+        logger.info(f"[GeneratorActor] setup: requested device_ids={device_ids}")
         logger.info(f"[GeneratorActor] vLLM CLI args: {self._cli_args}")
+
+        if device_ids is None:
+            raw_ids = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")
+            device_ids = [d.strip() for d in raw_ids.split(",") if d.strip()]
+            logger.info(f"[GeneratorActor] Auto-discovered device_ids: {device_ids}")
 
         os.environ["VLLM_MONARCH_GPU_IDS"] = ",".join(str(d) for d in device_ids)
 
@@ -189,6 +107,8 @@ class GeneratorActor(MonarchActor):
         os.environ["VLLM_MONARCH_WORKER_REGISTRY"] = serialized_reg
 
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
 
         parser = FlexibleArgumentParser(description="vLLM for Monarch")
         parser = make_arg_parser(parser)
@@ -203,13 +123,16 @@ class GeneratorActor(MonarchActor):
         )
         vllm_config.scheduler_config.async_scheduling = False
 
-        logger.info("[GeneratorActor] Creating AsyncLLM ...")
-        self.llm = AsyncLLM(
+        from areal.monarch_plugin.service.vllm_engine import MonarchVLLMEngine
+
+        logger.info("[GeneratorActor] Creating MonarchVLLMEngine (in-process) ...")
+        self.engine = MonarchVLLMEngine(
             vllm_config=vllm_config,
             executor_class=AReaLMonarchExecutor,
-            log_stats=True,
         )
-        logger.info("[GeneratorActor] AsyncLLM created")
+        loop = asyncio.get_running_loop()
+        self.engine.start(loop)
+        logger.info("[GeneratorActor] MonarchVLLMEngine started")
 
         self.workers = await worker_registry.get_workers.call_one()
         if self.workers is None:
@@ -222,12 +145,7 @@ class GeneratorActor(MonarchActor):
 
     @endpoint
     async def handle_request(self, ep: str, payload: dict) -> dict:
-        """Dispatch a request based on the endpoint path.
-
-        The endpoint/payload format is identical to the HTTP API served by
-        ``areal_vllm_server.py``, so VLLMBackend can build and parse them
-        without changes.
-        """
+        """Dispatch a request based on the endpoint path."""
         if ep == "/v1/completions":
             return await self._generate_completion(payload)
         if ep == "/v1/chat/completions":
@@ -237,17 +155,17 @@ class GeneratorActor(MonarchActor):
         if ep == "/areal_continue_generation":
             return await self._continue_generation()
         if ep == "/areal_init_weights_update_group":
-            return self._init_weights_update_group(payload)
+            return await self._init_weights_update_group(payload)
         if ep == "/areal_set_update_weight_meta":
-            return self._set_weight_meta(payload)
+            return await self._set_weight_meta(payload)
         if ep == "/areal_set_update_weight_meta_lora":
-            return self._set_weight_meta_lora(payload)
+            return await self._set_weight_meta_lora(payload)
         if ep == "/areal_update_weights_xccl":
             return await self._update_weights_xccl()
         if ep == "/areal_update_weights_lora_xccl":
             return await self._update_weights_lora_xccl()
         if ep == "/areal_update_weights":
-            return self._update_weights_disk(payload)
+            return await self._update_weights_disk(payload)
         if ep == "/health":
             return {"status": "ok"}
         raise ValueError(f"Unknown endpoint: {ep}")
@@ -257,12 +175,7 @@ class GeneratorActor(MonarchActor):
     # -----------------------------------------------------------------
 
     async def _generate_completion(self, payload: dict) -> dict:
-        """Run vLLM generation and return an OpenAI-compatible response dict.
-
-        This replicates the logic in ``areal_vllm_server.py``'s wrapped
-        ``/v1/completions`` handler but calls ``AsyncLLM.generate()``
-        directly instead of going through HTTP.
-        """
+        """Run vLLM generation and return an OpenAI-compatible response dict."""
         from vllm.sampling_params import SamplingParams
 
         if self._paused:
@@ -285,25 +198,20 @@ class GeneratorActor(MonarchActor):
 
         request_id = str(uuid.uuid4())
 
-        request_output = None
         if prompt is not None:
-            async for output in self.llm.generate(
-                prompt={"prompt_token_ids": prompt}
-                if isinstance(prompt, list)
-                else prompt,
-                sampling_params=params,
-                request_id=request_id,
-            ):
-                request_output = output
+            gen_prompt = {"prompt_token_ids": prompt} if isinstance(prompt, list) else prompt
         elif messages is not None:
-            async for output in self.llm.generate(
-                prompt={"messages": messages},
-                sampling_params=params,
-                request_id=request_id,
-            ):
-                request_output = output
+            gen_prompt = {"messages": messages}
         else:
             raise ValueError("payload must contain 'prompt' or 'messages'")
+
+        request_output = None
+        async for output in self.engine.generate(
+            prompt=gen_prompt,
+            sampling_params=params,
+            request_id=request_id,
+        ):
+            request_output = output
 
         if request_output is None:
             return self._build_abort_response()
@@ -313,13 +221,11 @@ class GeneratorActor(MonarchActor):
     @staticmethod
     def _build_abort_response() -> dict:
         return {
-            "choices": [
-                {
-                    "finish_reason": "abort",
-                    "logprobs": {"tokens": [], "token_logprobs": []},
-                    "text": "",
-                }
-            ]
+            "choices": [{
+                "finish_reason": "abort",
+                "logprobs": {"tokens": [], "token_logprobs": []},
+                "text": "",
+            }]
         }
 
     @staticmethod
@@ -340,16 +246,14 @@ class GeneratorActor(MonarchActor):
             logprobs_list = [0.0] * len(comp_output.token_ids)
 
         return {
-            "choices": [
-                {
-                    "finish_reason": comp_output.finish_reason or "stop",
-                    "text": comp_output.text,
-                    "logprobs": {
-                        "tokens": tokens,
-                        "token_logprobs": logprobs_list,
-                    },
-                }
-            ]
+            "choices": [{
+                "finish_reason": comp_output.finish_reason or "stop",
+                "text": comp_output.text,
+                "logprobs": {
+                    "tokens": tokens,
+                    "token_logprobs": logprobs_list,
+                },
+            }]
         }
 
     # -----------------------------------------------------------------
@@ -358,24 +262,25 @@ class GeneratorActor(MonarchActor):
 
     async def _pause_generation(self) -> dict:
         self._paused = True
-        await self.llm.pause_generation(
-            wait_for_inflight_requests=False, clear_cache=True
-        )
+        self.engine.pause_generation()
         return {"success": True, "message": "Generation paused"}
 
     async def _continue_generation(self) -> dict:
-        await self.llm.resume_generation()
+        self.engine.resume_generation()
         self._paused = False
         return {"success": True, "message": "Generation resumed"}
 
     # -----------------------------------------------------------------
-    # Weight sync (xccl)  -- forwarded to workers via collective_rpc
+    # Weight sync -- forwarded to workers via collective_rpc
     # -----------------------------------------------------------------
 
-    def _collective_rpc(self, method: str, *args):
-        """Call a method on all workers and return aggregated results."""
-        future = self.workers.execute_method.call(method, *args)
-        result = future.get(timeout=300)
+    async def _collective_rpc(self, method: str, *args):
+        """Call a method on all workers (offloaded to thread to avoid blocking)."""
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: self.workers.execute_method.call(method, *args).get(timeout=300),
+        )
         ret_list = [v for _, v in result.items()]
         return self._build_response(ret_list)
 
@@ -389,8 +294,8 @@ class GeneratorActor(MonarchActor):
             message += f"TP rank: {rank} {'success' if ok else 'failed: ' + msg}\n"
         return {"success": success, "message": message}
 
-    def _init_weights_update_group(self, payload: dict) -> dict:
-        return self._collective_rpc(
+    async def _init_weights_update_group(self, payload: dict) -> dict:
+        return await self._collective_rpc(
             "init_update_weight_group",
             payload["master_address"],
             payload["master_port"],
@@ -400,8 +305,8 @@ class GeneratorActor(MonarchActor):
             payload["group_name"],
         )
 
-    def _set_weight_meta(self, payload: dict) -> dict:
-        return self._collective_rpc(
+    async def _set_weight_meta(self, payload: dict) -> dict:
+        return await self._collective_rpc(
             "set_weight_meta",
             payload["names"],
             payload["dtypes"],
@@ -409,8 +314,8 @@ class GeneratorActor(MonarchActor):
             payload["group_name"],
         )
 
-    def _set_weight_meta_lora(self, payload: dict) -> dict:
-        return self._collective_rpc(
+    async def _set_weight_meta_lora(self, payload: dict) -> dict:
+        return await self._collective_rpc(
             "set_weight_meta_lora",
             payload["names"],
             payload["dtypes"],
@@ -426,19 +331,19 @@ class GeneratorActor(MonarchActor):
         )
 
     async def _update_weights_xccl(self) -> dict:
-        await self.llm.pause_generation(
-            wait_for_inflight_requests=False, clear_cache=True
-        )
-        return self._collective_rpc("update_weight_xccl")
+        self.engine.pause_generation()
+        result = await self._collective_rpc("update_weight_xccl")
+        self.engine.resume_generation()
+        return result
 
     async def _update_weights_lora_xccl(self) -> dict:
-        await self.llm.pause_generation(
-            wait_for_inflight_requests=False, clear_cache=True
-        )
-        return self._collective_rpc("update_weight_lora_xccl")
+        self.engine.pause_generation()
+        result = await self._collective_rpc("update_weight_lora_xccl")
+        self.engine.resume_generation()
+        return result
 
-    def _update_weights_disk(self, payload: dict) -> dict:
-        return self._collective_rpc("update_weights", payload["model_path"])
+    async def _update_weights_disk(self, payload: dict) -> dict:
+        return await self._collective_rpc("update_weights", payload["model_path"])
 
     # -----------------------------------------------------------------
     # Shutdown
@@ -447,7 +352,7 @@ class GeneratorActor(MonarchActor):
     @endpoint
     async def shutdown(self) -> None:
         logger.info("[GeneratorActor] Shutting down ...")
-        if self.llm is not None:
-            self.llm.shutdown()
-            self.llm = None
+        if self.engine is not None:
+            self.engine.shutdown()
+            self.engine = None
         logger.info("[GeneratorActor] Shutdown complete")

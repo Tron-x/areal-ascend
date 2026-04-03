@@ -22,18 +22,13 @@ from typing import Any
 
 from monarch.actor import endpoint
 
-from areal.monarch_plugin.actor_base import MonarchActor
-from areal.monarch_plugin.actor_spec import ResourceKind
+from areal.monarch_plugin.actor import AReaLMonarchActor
 
 logger = logging.getLogger(__name__)
 
 
-class RewardActor(MonarchActor):
-    """CPU-only Monarch Actor for reward computation."""
-
-    resource = ResourceKind.CPU
-    dependencies: list[str] = []
-    """Monarch Actor that loads and executes a reward function.
+class RewardActor(AReaLMonarchActor):
+    """CPU-only Monarch Actor for reward computation.
 
     Lifecycle:
       __init__  -> empty state
@@ -42,6 +37,9 @@ class RewardActor(MonarchActor):
       compute_rewards_batch() -> batch reward computation
       shutdown() -> cleanup
     """
+
+    procs = 1
+    with_gpus = False
 
     def __init__(self):
         self._reward_fn = None
@@ -60,18 +58,16 @@ class RewardActor(MonarchActor):
         the subprocess-level timeout in SandboxActor already guards against
         runaway code, and the reward parsing itself is fast enough.
         """
-
         def _noop_timeout(timeout_seconds=None):
             def decorator(func):
                 return func
-
             return decorator
 
         try:
-            import math_verify.grader
-            import math_verify.metric
-            import math_verify.parser
             import math_verify.utils
+            import math_verify.parser
+            import math_verify.metric
+            import math_verify.grader
 
             math_verify.utils.timeout = _noop_timeout
             math_verify.parser.timeout = _noop_timeout
@@ -143,7 +139,8 @@ class RewardActor(MonarchActor):
             reward = float(reward)
         except Exception:
             logger.error(
-                f"[RewardActor] Error computing reward:\n{traceback.format_exc()}"
+                f"[RewardActor] Error computing reward:\n"
+                f"{traceback.format_exc()}"
             )
             reward = 0.0
 
@@ -184,7 +181,8 @@ class RewardActor(MonarchActor):
                 rewards.append(float(r))
             except Exception:
                 logger.error(
-                    f"[RewardActor] Batch item error:\n{traceback.format_exc()}"
+                    f"[RewardActor] Batch item error:\n"
+                    f"{traceback.format_exc()}"
                 )
                 rewards.append(0.0)
         return rewards
@@ -230,8 +228,14 @@ class MonarchRewardWrapper:
 
     async def _ensure_setup(self):
         if not self._setup_done:
-            result = await self._actor.setup.call_one(self._fn_path)
-            logger.info(f"[MonarchRewardWrapper] RewardActor setup: {result}")
+            func = getattr(self._actor, "call_all", None)
+            if func is not None:
+                result = await func("setup", self._fn_path)
+            else:
+                result = await self._actor.setup.call_one(self._fn_path)
+            logger.info(
+                f"[MonarchRewardWrapper] RewardActor setup: {result}"
+            )
             self._setup_done = True
 
     async def __call__(
@@ -243,7 +247,14 @@ class MonarchRewardWrapper:
         **kwargs: Any,
     ) -> float:
         await self._ensure_setup()
-        reward = await self._actor.compute_reward.call_one(
-            prompt, completion, prompt_ids, completion_ids, kwargs
-        )
+        func = getattr(self._actor, "call", None)
+        if func is not None:
+            reward = await func(
+                "compute_reward",
+                prompt, completion, prompt_ids, completion_ids, kwargs
+            )
+        else:
+            reward = await self._actor.compute_reward.call_one(
+                prompt, completion, prompt_ids, completion_ids, kwargs
+            )
         return reward

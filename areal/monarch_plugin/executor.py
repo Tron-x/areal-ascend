@@ -17,11 +17,9 @@ import base64
 import logging
 import os
 import socket
-from collections.abc import Callable
-from typing import Any
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cloudpickle
-import torch
 from monarch.actor import Actor, context, enable_transport, endpoint
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.worker.worker_base import WorkerWrapperBase
@@ -32,7 +30,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 
 def _get_host_ip() -> str:
     if host_ip := os.environ.get("VLLM_HOST_IP"):
@@ -53,7 +50,7 @@ def _build_worker_configs(
     gpus_per_host: int,
     master_addr: str,
     master_port: int,
-    gpu_ids: list[str] | None = None,
+    gpu_ids: List[str] | None = None,
 ) -> tuple[list[dict[str, str]], list[dict]]:
     if gpu_ids:
         device_list = ",".join(gpu_ids)
@@ -81,36 +78,30 @@ def _build_worker_configs(
             "TORCH_DISABLE_ADDR2LINE": "1",
         }
 
-        if torch.cuda.is_available():
-            env_vars["CUDA_VISIBLE_DEVICES"] = device_list
-        elif hasattr(torch, "npu") and torch.npu.is_available():
-            env_vars["ASCEND_RT_VISIBLE_DEVICES"] = device_list
-        else:
-            env_vars["CUDA_VISIBLE_DEVICES"] = device_list
+        from areal.infra.platforms import current_platform
+        if current_platform.device_control_env_var:
+            env_vars[current_platform.device_control_env_var] = device_list
 
         all_envs.append(env_vars)
-        all_kwargs.append(
-            {
-                "vllm_config": vllm_config,
-                "local_rank": local_rank,
-                "rank": rank,
-                "distributed_init_method": "env://",
-                "is_driver_worker": is_driver,
-                "shared_worker_lock": None,
-            }
-        )
+        all_kwargs.append({
+            "vllm_config": vllm_config,
+            "local_rank": local_rank,
+            "rank": rank,
+            "distributed_init_method": "env://",
+            "is_driver_worker": is_driver,
+            "shared_worker_lock": None,
+        })
 
     return all_envs, all_kwargs
 
 
 # ---------------------------------------------------------------------------
-# WorkerRegistry -- bridge between EngineCore subprocess and GeneratorActor
+# WorkerRegistry -- bridge between EngineCore and GeneratorActor
 # ---------------------------------------------------------------------------
 
-
 class WorkerRegistry(Actor):
-    """Rendezvous point so MonarchExecutor (inside EngineCore subprocess)
-    can hand the worker ActorMesh back to GeneratorActor."""
+    """Rendezvous point so MonarchExecutor can hand the worker ActorMesh
+    back to GeneratorActor."""
 
     def __init__(self):
         self._workers = None
@@ -128,7 +119,6 @@ class WorkerRegistry(Actor):
 # ---------------------------------------------------------------------------
 # _FutureWrapper -- adapts Monarch Future to vLLM's expected interface
 # ---------------------------------------------------------------------------
-
 
 class _FutureWrapper:
     def __init__(self, monarch_future, timeout):
@@ -153,18 +143,11 @@ class _FutureWrapper:
 # AReaLWorkerWrapper -- Monarch actor wrapping vLLM worker
 # ---------------------------------------------------------------------------
 
-
 class AReaLWorkerWrapper(WorkerWrapperBase, Actor):
     """vLLM worker that is also a Monarch actor.
 
     Exposes ``execute_method`` so that ``collective_rpc`` can invoke any
-    method on the underlying worker, including VLLMWorkerExtension methods
-    (``init_update_weight_group``, ``set_weight_meta``, ``update_weight_xccl``,
-    etc.).
-
-    Note: vLLM 0.14 WorkerWrapperBase.__init__ only takes (rpc_rank, global_rank).
-    The vllm_config is passed to the actor by the executor spawn call but is
-    stored for later use by init_worker.
+    method on the underlying worker, including VLLMWorkerExtension methods.
     """
 
     def __init__(self, vllm_config):
@@ -172,6 +155,7 @@ class AReaLWorkerWrapper(WorkerWrapperBase, Actor):
         WorkerWrapperBase.__init__(self, rpc_rank=rank, global_rank=rank)
         Actor.__init__(self)
         self._vllm_config_ref = vllm_config
+        logger.info(f"[AReaLWorkerWrapper] Initialised rank={rank}")
 
     def init_worker(self, all_kwargs):
         monarch_rank = self.rpc_rank
@@ -180,6 +164,7 @@ class AReaLWorkerWrapper(WorkerWrapperBase, Actor):
             f"Rank mismatch: Monarch={monarch_rank}, expected={expected_rank}"
         )
         super().init_worker(all_kwargs)
+        logger.info(f"[AReaLWorkerWrapper] init_worker complete, rank={monarch_rank}")
 
     @endpoint
     def execute_method(self, method: str, *args, **kwargs):
@@ -189,7 +174,6 @@ class AReaLWorkerWrapper(WorkerWrapperBase, Actor):
     @endpoint
     def destroy_process_group(self) -> None:
         import torch.distributed as dist
-
         if dist.is_initialized():
             logger.info("[AReaLWorkerWrapper] Destroying process group")
             dist.destroy_process_group()
@@ -220,17 +204,16 @@ def _capture_cann_env() -> dict:
     return {k: os.environ[k] for k in _CANN_ENV_KEYS if k in os.environ}
 
 
-def _make_worker_bootstrap(cann_env: dict):
-    """Create a bootstrap that restores CANN env vars in the worker process.
-
-    LD_LIBRARY_PATH must be set before any library loading occurs.
-    ASCEND_OPP_PATH / ASCEND_HOME_PATH are used by torch_npu and
-    vllm_ascend to locate libopapi.so at runtime.
-    """
+def _make_worker_bootstrap(cann_env: dict, device_ids_str: str | None = None):
+    """Create a bootstrap that restores CANN env vars in the worker process."""
+    from areal.infra.platforms import current_platform
+    device_env_var = current_platform.device_control_env_var
 
     def _bootstrap():
         for k, v in cann_env.items():
             os.environ[k] = v
+        if device_ids_str is not None and device_env_var:
+            os.environ[device_env_var] = device_ids_str
 
     return _bootstrap
 
@@ -248,7 +231,10 @@ class AReaLMonarchExecutor(Executor):
     worker_class = AReaLWorkerWrapper
 
     def _init_executor(self) -> None:
-        enable_transport("tcp")
+        try:
+            enable_transport("tcp")
+        except RuntimeError:
+            pass
 
         host_mesh_str = os.environ.get("VLLM_MONARCH_HOST_MESH")
         if not host_mesh_str:
@@ -277,13 +263,19 @@ class AReaLMonarchExecutor(Executor):
             f"[AReaLMonarchExecutor] Captured CANN env keys: {list(cann_env.keys())}"
         )
 
+        gpu_ids_str = os.environ.get("VLLM_MONARCH_GPU_IDS")
+
+        from areal.infra.platforms import current_platform
+        resource_key = "npu" if current_platform.device_type == "npu" else "gpu"
+
         logger.info(
             f"[AReaLMonarchExecutor] Creating ProcMesh: "
-            f"{gpus_per_host} procs/host, world_size={world_size}"
+            f"{gpus_per_host} {resource_key}/host, world_size={world_size}, "
+            f"gpu_ids={gpu_ids_str}"
         )
         self.proc_mesh = self.host_mesh.spawn_procs(
-            per_host={"procs": gpus_per_host},
-            bootstrap=_make_worker_bootstrap(cann_env),
+            per_host={resource_key: gpus_per_host},
+            bootstrap=_make_worker_bootstrap(cann_env, gpu_ids_str),
             name="vllm_workers",
         )
         self.workers = self.proc_mesh.spawn(
@@ -294,7 +286,6 @@ class AReaLMonarchExecutor(Executor):
         master_port = _get_free_port()
         logger.info(f"[AReaLMonarchExecutor] Head node: {head_node_ip}:{master_port}")
 
-        gpu_ids_str = os.environ.get("VLLM_MONARCH_GPU_IDS")
         gpu_ids = gpu_ids_str.split(",") if gpu_ids_str else None
 
         all_envs, all_kwargs = _build_worker_configs(
@@ -315,12 +306,12 @@ class AReaLMonarchExecutor(Executor):
 
     def collective_rpc(
         self,
-        method: str | Callable,
-        timeout: float | None = None,
-        args: tuple = (),
-        kwargs: dict[str, Any] | None = None,
+        method: Union[str, Callable],
+        timeout: Optional[float] = None,
+        args: Tuple = (),
+        kwargs: Optional[Dict[str, Any]] = None,
         non_block: bool = False,
-    ) -> list[Any]:
+    ) -> List[Any]:
         future = self.workers.execute_method.call(method, *args, **(kwargs or {}))
         if non_block:
             return _FutureWrapper(future, timeout)

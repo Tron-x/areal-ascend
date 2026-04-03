@@ -111,10 +111,28 @@ async def run_training_pipeline(
             )
             train_step_counter += 1
 
-    rollout_task = asyncio.create_task(_rollout_loop())
-    train_task = asyncio.create_task(_training_loop())
+    rollout_task = asyncio.create_task(_rollout_loop(), name="rollout_task")
+    train_task = asyncio.create_task(_training_loop(), name="train_task")
 
-    await asyncio.gather(rollout_task, train_task)
+    done, pending = await asyncio.wait(
+        [rollout_task, train_task], return_when=asyncio.FIRST_EXCEPTION
+    )
+    
+    # Check for exceptions
+    for task in done:
+        if task.exception() is not None:
+            logger.error(f"Pipeline task '{task.get_name()}' failed: {task.exception()}")
+            # Cancel remaining
+            for p in pending:
+                p.cancel()
+            # Re-raise the exception to stop everything
+            raise task.exception()
+
+    if rollout_task.done() and train_task.done():
+         logger.info("Both rollout and training tasks completed.")
+    else:
+         # Wait for remaining if one finished early (unlikely unless error)
+         await asyncio.gather(rollout_task, train_task)
 
     buf_stats = await replay_buffer_actor.get_stats.call_one()
     logger.info(f"ReplayBuffer final stats: {buf_stats}")

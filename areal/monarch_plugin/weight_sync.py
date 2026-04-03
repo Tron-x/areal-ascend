@@ -46,7 +46,9 @@ def optional_flat_inference_xccl_from_env() -> int | None:
         return None
     v = int(raw)
     if v < 1:
-        raise ValueError(f"MONARCH_INFERENCE_XCCL_PARTICIPANTS must be >= 1, got {v!r}")
+        raise ValueError(
+            f"MONARCH_INFERENCE_XCCL_PARTICIPANTS must be >= 1, got {v!r}"
+        )
     return v
 
 
@@ -61,7 +63,10 @@ def monarch_xccl_weight_update_alloc_mode_flat(
         raise ValueError(f"train_world_size must be >= 1, got {train_world_size}")
     if inference_dp < 1:
         raise ValueError(f"inference_dp must be >= 1, got {inference_dp}")
-    s = f"{rollout_backend}:d{inference_dp}p1t1+d{train_world_size}p1t1"
+    s = (
+        f"{rollout_backend}:d{inference_dp}p1t1+"
+        f"d{train_world_size}p1t1"
+    )
     return AllocationMode.from_str(s)
 
 
@@ -104,9 +109,7 @@ def build_monarch_xccl_weight_update_alloc_mode_from_vllm_runtime(
 
 def _vllm_gen_parallel(config, alloc_mode) -> ParallelStrategy:
     """Extract vLLM **runtime** parallel strategy for XCCL inference half."""
-    from areal.api.cli_args import (
-        vLLMConfig,  # noqa: avoid circular / heavy import at top
-    )
+    from areal.api.cli_args import vLLMConfig  # noqa: avoid circular / heavy import at top
 
     args_dict = vLLMConfig.build_args(
         vllm_config=config.vllm,
