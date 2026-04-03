@@ -1,1 +1,1 @@
-"""Forge adapters — framework-specific backend implementations."""
+"""Backward-compat shim -- adapters have moved to forge.engines."""

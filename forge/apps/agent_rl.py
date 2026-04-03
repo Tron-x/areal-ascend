@@ -38,8 +38,8 @@ from forge.actors.replay_buffer import ReplayBuffer
 from forge.actors.reward import RewardActor
 from forge.actors.sandbox import SandboxActor
 from forge.actors.trainer import TrainerActor
-from forge.adapters.areal import AReaLConfigBridge, AReaLTrainBackend
 from forge.bootstraps import ensure_ascend_custom_opp_path
+from forge.engines import create_config_bridge, create_engine
 from forge.provisioner import init_provisioner, shutdown
 
 logger = logging.getLogger("AgentRLApp")
@@ -238,7 +238,7 @@ async def agent_rl_main(config=None, run_id: int = 0):
     """Agentic RL orchestration with optional async pipeline."""
     ensure_ascend_custom_opp_path()
 
-    bridge = AReaLConfigBridge()
+    bridge = create_config_bridge(backend="areal")
     forge_cfg, raw_cfg, alloc_mode = bridge.parse_and_build(run_id=run_id)
 
     bridge.setup_name_resolve(raw_cfg)
@@ -302,7 +302,8 @@ async def agent_rl_main(config=None, run_id: int = 0):
         raw_cfg, alloc_mode, train_world_size=forge_cfg.train_world_size
     )
 
-    backend = AReaLTrainBackend(
+    backend = create_engine(
+        backend=forge_cfg.backend_type,
         cli_args=forge_cfg.training_args,
         env_vars=forge_cfg.trainer_env,
         rank=-1,

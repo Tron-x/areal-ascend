@@ -498,7 +498,7 @@ class AReaLInferenceBridge(InferenceEngine):
         return agent_workflow
 
     def _inject_monarch_reward(self, workflow):
-        from forge.adapters.areal.reward_wrapper import MonarchRewardWrapper
+        from forge.engines.areal.reward_wrapper import MonarchRewardWrapper
 
         reward_fn = getattr(workflow, "reward_fn", None)
         if reward_fn is None:

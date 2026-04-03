@@ -4,10 +4,10 @@ All ``areal.*`` imports are confined to this package. Forge core and actors
 never import from ``areal`` directly.
 """
 
-from forge.adapters.areal.config_bridge import AReaLConfigBridge
-from forge.adapters.areal.data_provider import AReaLDataProvider
-from forge.adapters.areal.reward_backend import AReaLRewardBackend
-from forge.adapters.areal.train_backend import AReaLTrainBackend
+from forge.engines.areal.config_bridge import AReaLConfigBridge
+from forge.engines.areal.data_provider import AReaLDataProvider
+from forge.engines.areal.reward_backend import AReaLRewardBackend
+from forge.engines.areal.train_backend import AReaLTrainBackend
 
 __all__ = [
     "AReaLConfigBridge",

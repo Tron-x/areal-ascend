@@ -28,7 +28,7 @@ class RewardActor(ForgeActor):
 
     Deploy as a service for parallel reward evaluation::
 
-        from forge.adapters.areal import AReaLRewardBackend
+        from forge.engines.areal import AReaLRewardBackend
         reward = await RewardActor.options(
             num_replicas=2, procs=1
         ).as_actor(backend=AReaLRewardBackend())
@@ -43,7 +43,7 @@ class RewardActor(ForgeActor):
 
     def _ensure_backend(self) -> RewardBackend:
         if self._backend is None:
-            from forge.adapters.areal.reward_backend import AReaLRewardBackend
+            from forge.engines.areal.reward_backend import AReaLRewardBackend
 
             self._backend = AReaLRewardBackend()
         return self._backend

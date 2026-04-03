@@ -156,7 +156,7 @@ class AReaLTrainBackend:
                     trainer_self, rollout_config, is_eval, lora_path
                 )
 
-            from forge.adapters.areal.inference_bridge import AReaLInferenceBridge
+            from forge.engines.areal.inference_bridge import AReaLInferenceBridge
 
             engine = AReaLInferenceBridge(
                 rollout_config,
