@@ -220,6 +220,132 @@ class AgentActor(ForgeActor):
             "seq_len": len(all_token_ids),
         }
 
+    # ------------------------------------------------------------------
+    # ReTool-style episode (token-level loss_mask)
+    # ------------------------------------------------------------------
+
+    @endpoint
+    async def run_episode_retool(self, data: dict) -> dict:
+        """Run a multi-turn episode with proper tool-output loss masking.
+
+        This is the ReTool / TIR pattern (Slime/veRL/AReaL):
+        - LLM-generated tokens get ``loss_mask=1`` (participate in training)
+        - Tool-output tokens get ``loss_mask=0`` (excluded from gradient)
+        - Logprobs are padded with 0.0 for tool-output tokens
+
+        The ``agent_logic`` controls parsing (via ``process_response``)
+        and feedback formatting (via ``format_tool_observation``).
+
+        Args:
+            data: Dict with ``messages`` or ``prompt``, plus optional
+                  ``answer`` for reward computation.
+
+        Returns:
+            Dict with ``input_ids``, ``logprobs``, ``loss_mask``,
+            ``versions``, ``rewards``, ``seq_len``, ``tool_call_count``.
+        """
+        if self._proxy is None:
+            raise RuntimeError("AgentActor: no ModelProxy configured.")
+
+        self._episode_count += 1
+
+        messages = data.get("messages", [])
+        if not messages:
+            prompt = data.get("prompt", "")
+            messages = [{"role": "user", "content": prompt}]
+
+        all_token_ids: list[int] = []
+        all_logprobs: list[float] = []
+        all_loss_mask: list[int] = []
+        all_versions: list[int] = []
+        tool_call_count = 0
+        reward = 0.0
+
+        max_turns = getattr(self._logic, "max_turns", 8)
+
+        for turn in range(max_turns):
+            # [1] Generate via ModelProxy (token IDs + logprobs)
+            gen_result: GenerationResult = await self._proxy.generate(messages=messages)
+
+            # [2] LLM output → loss_mask=1 (participates in training)
+            all_token_ids.extend(gen_result.token_ids)
+            all_logprobs.extend(gen_result.logprobs)
+            all_loss_mask.extend([1] * len(gen_result.token_ids))
+            all_versions.extend([gen_result.version] * len(gen_result.token_ids))
+
+            # [3] Parse response for tool calls or final answer
+            action: AgentAction = self._logic.process_response(
+                gen_result.text, messages
+            )
+
+            # [4] If done (answer found), stop immediately
+            if action.done:
+                break
+
+            # [5] Execute tool calls
+            tool_results = await self._execute_tools(action.tool_calls)
+            if action.tool_calls:
+                tool_call_count += len(action.tool_calls)
+
+            # [6] Check termination
+            if not self._logic.should_continue(turn, reward):
+                break
+
+            # [7] Format tool output as observation text
+            if hasattr(self._logic, "format_tool_observation"):
+                obs_text = self._logic.format_tool_observation(tool_results)
+            else:
+                obs_text = self._logic.format_feedback(action, tool_results, reward)
+
+            # [8] Tokenize tool observation
+            obs_token_ids = self._tokenize_observation(obs_text)
+
+            # [9] Tool output → loss_mask=0 (NOT trained on)
+            all_token_ids.extend(obs_token_ids)
+            all_logprobs.extend([0.0] * len(obs_token_ids))
+            all_loss_mask.extend([0] * len(obs_token_ids))
+            all_versions.extend([-1] * len(obs_token_ids))
+
+            # [10] Append to message history for next turn
+            messages.append({"role": "assistant", "content": gen_result.text})
+            messages.append({"role": "user", "content": obs_text})
+
+        # Compute reward on the full response
+        full_response = ""
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                full_response += msg.get("content", "")
+        prompt_text = self._proxy._apply_template(
+            [m for m in messages if m.get("role") == "user"][:1]
+        )
+        reward = await self._call_reward(prompt_text, full_response, data)
+
+        return {
+            "input_ids": all_token_ids,
+            "logprobs": all_logprobs,
+            "loss_mask": all_loss_mask,
+            "versions": all_versions,
+            "rewards": reward,
+            "seq_len": len(all_token_ids),
+            "tool_call_count": tool_call_count,
+        }
+
+    def _tokenize_observation(self, text: str) -> list[int]:
+        """Tokenize observation text into token IDs.
+
+        Uses the ModelProxy's chat template tokenizer if available,
+        otherwise falls back to simple UTF-8 byte encoding.
+        """
+        if (
+            self._proxy
+            and self._proxy.chat_template
+            and hasattr(self._proxy.chat_template, "_tokenizer")
+        ):
+            tokenizer = self._proxy.chat_template._tokenizer
+            return tokenizer.encode(text, add_special_tokens=False)
+
+        return list(text.encode("utf-8"))
+
     @endpoint
     async def get_stats(self) -> dict:
         proxy_stats = self._proxy.get_stats() if self._proxy else {}
@@ -234,10 +360,43 @@ class AgentActor(ForgeActor):
     # ------------------------------------------------------------------
 
     async def _execute_tools(self, tool_calls: list[ToolCall]) -> list[ToolResult]:
-        """Execute a list of tool calls, returning results in order."""
+        """Execute tool calls via ToolRegistry or legacy sandbox."""
+        if hasattr(self, "_tool_registry") and self._tool_registry is not None:
+            return await self._execute_via_registry(tool_calls)
+        return await self._execute_via_sandbox(tool_calls)
+
+    async def _execute_via_registry(
+        self, tool_calls: list[ToolCall]
+    ) -> list[ToolResult]:
+        """Execute via forge.tools.ToolRegistry (new path)."""
+        from forge.tools.protocol import ToolCall as ToolsToolCall
+
         results = []
         for tc in tool_calls:
-            if tc.type == "code_execution":
+            registry_call = ToolsToolCall(
+                name=tc.type,
+                arguments={"code": tc.content}
+                if tc.type == "code_execution"
+                else {"code": tc.content},
+            )
+            result = await self._tool_registry.execute(registry_call)
+            results.append(
+                ToolResult(
+                    success=result.success,
+                    output=result.output,
+                    error=result.error,
+                    tool_call=tc,
+                )
+            )
+        return results
+
+    async def _execute_via_sandbox(
+        self, tool_calls: list[ToolCall]
+    ) -> list[ToolResult]:
+        """Execute via legacy SandboxActor (backward compat)."""
+        results = []
+        for tc in tool_calls:
+            if tc.type in ("code_execution", "code_interpreter"):
                 raw = await self._call_sandbox(tc.content)
                 results.append(
                     ToolResult(

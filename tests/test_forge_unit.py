@@ -1126,3 +1126,85 @@ class TestPythonSandbox:
         # When safety_check=False, execute() skips check_safety entirely
         # check_safety() itself always runs the patterns regardless
         assert sb.safety_check is False
+
+
+# ======================================================================
+# ReToolAgent
+# ======================================================================
+
+
+class TestReToolAgent:
+    def test_detects_answer(self):
+        from forge.agents.retool import ReToolAgent
+
+        agent = ReToolAgent()
+        action = agent.process_response("After calculation, Answer: \\boxed{42}", [])
+        assert action.done is True
+        assert len(action.tool_calls) == 0
+
+    def test_detects_code_block(self):
+        from forge.agents.retool import ReToolAgent
+
+        agent = ReToolAgent()
+        action = agent.process_response("Let me compute:\n<code>print(2+2)</code>", [])
+        assert action.done is False
+        assert len(action.tool_calls) == 1
+        assert action.tool_calls[0].type == "code_interpreter"
+
+    def test_detects_tool_call(self):
+        from forge.agents.retool import ReToolAgent
+
+        agent = ReToolAgent()
+        action = agent.process_response(
+            '<tool_call>{"name": "code_interpreter", "arguments": {"code": "x=1"}}</tool_call>',
+            [],
+        )
+        assert action.done is False
+        assert len(action.tool_calls) == 1
+
+    def test_no_tool_no_answer(self):
+        from forge.agents.retool import ReToolAgent
+
+        agent = ReToolAgent()
+        action = agent.process_response("Hmm, let me think...", [])
+        assert action.done is False
+        assert len(action.tool_calls) == 0
+
+    def test_format_tool_observation(self):
+        from forge.agents.retool import ReToolAgent
+        from forge.core.types import ToolResult
+
+        agent = ReToolAgent()
+        results = [ToolResult(success=True, output="4")]
+        obs = agent.format_tool_observation(results)
+        assert "<interpreter>" in obs
+        assert "4" in obs
+
+    def test_format_error_observation(self):
+        from forge.agents.retool import ReToolAgent
+        from forge.core.types import ToolResult
+
+        agent = ReToolAgent()
+        results = [ToolResult(success=False, error="NameError: x")]
+        obs = agent.format_tool_observation(results)
+        assert "Error" in obs
+
+    def test_should_continue(self):
+        from forge.agents.retool import ReToolAgent
+
+        agent = ReToolAgent(max_turns=3)
+        assert agent.should_continue(0, 0.0) is True
+        assert agent.should_continue(2, 0.0) is False
+
+    def test_compute_discount_always_1(self):
+        from forge.agents.retool import ReToolAgent
+
+        agent = ReToolAgent()
+        assert agent.compute_discount(5) == 1.0
+
+    def test_protocol_compliance(self):
+        from forge.agents.retool import ReToolAgent
+        from forge.core.protocols import AgentLogic
+
+        agent = ReToolAgent()
+        assert isinstance(agent, AgentLogic)
