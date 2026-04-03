@@ -560,7 +560,7 @@ class TestRLLossOps:
 
         from forge.rl.loss.ops import compute_ratio
 
-        logprobs = torch.tensor([[- 1.0, -2.0, -1.5]])
+        logprobs = torch.tensor([[-1.0, -2.0, -1.5]])
         gen_logprobs = torch.tensor([[-1.0, -2.0, -1.5]])
         mask = torch.ones(1, 3)
         ratio, log_ratio, metrics = compute_ratio(logprobs, gen_logprobs, mask)
@@ -643,7 +643,11 @@ class TestGRPOLoss:
 
         loss_fn = GRPOLoss(beta=0.1)
         output = loss_fn(
-            logits, target_ids, advantages, gen_logprobs, loss_mask,
+            logits,
+            target_ids,
+            advantages,
+            gen_logprobs,
+            loss_mask,
             ref_logprobs=ref_logprobs,
         )
         assert output.loss.shape == ()
@@ -739,7 +743,7 @@ class TestMetricAccumulators:
         assert abs(acc.get_value() - 2.0) < 0.1
 
     def test_mean_cross_rank_reduce(self):
-        from forge.observability.metrics import MeanAccumulator, Reduce
+        from forge.observability.metrics import MeanAccumulator
 
         states = [
             {"reduction_type": "mean", "sum": 10.0, "count": 5},
@@ -799,3 +803,149 @@ class TestTracer:
         with Tracer("ctx", log_to_metrics=False) as t:
             t.step("a")
         assert len(t._steps) == 1
+
+
+# ======================================================================
+# GroupBuffer
+# ======================================================================
+
+
+def _make_group_buffer(**kwargs):
+    """Create a GroupBuffer without Monarch scaffolding."""
+    from forge.actors.group_buffer import GroupBuffer
+
+    buf = object.__new__(GroupBuffer)
+    from collections import OrderedDict
+
+    defaults = {
+        "group_size": 4,
+        "max_groups": 100,
+        "max_staleness_steps": 2,
+        "group_filter": None,
+    }
+    defaults.update(kwargs)
+    buf._group_size = defaults["group_size"]
+    buf._max_groups = defaults["max_groups"]
+    buf._max_staleness_steps = defaults["max_staleness_steps"]
+    buf._filter = defaults["group_filter"]
+    buf._pending = OrderedDict()
+    buf._complete = OrderedDict()
+    buf._total_episodes = 0
+    buf._total_groups_completed = 0
+    buf._total_groups_expired = 0
+    buf._total_groups_filtered = 0
+    return buf
+
+
+class TestGroupBufferAdd:
+    def test_add_episodes_until_complete(self):
+        buf = _make_group_buffer(group_size=3)
+        for i in range(3):
+            result = buf.add_episode("prompt_0", {"resp": i}, version=0, step=0)
+        assert result["complete_groups"] == 1
+        assert result["pending_groups"] == 0
+
+    def test_incomplete_group_stays_pending(self):
+        buf = _make_group_buffer(group_size=4)
+        buf.add_episode("p1", {"r": 0}, version=0, step=0)
+        buf.add_episode("p1", {"r": 1}, version=0, step=0)
+        stats = buf.get_stats()
+        assert stats["pending_groups"] == 1
+        assert stats["complete_groups"] == 0
+
+    def test_multiple_groups(self):
+        buf = _make_group_buffer(group_size=2)
+        buf.add_episode("p0", {"r": 0}, version=0, step=0)
+        buf.add_episode("p1", {"r": 0}, version=0, step=0)
+        buf.add_episode("p0", {"r": 1}, version=0, step=0)
+        buf.add_episode("p1", {"r": 1}, version=0, step=0)
+        stats = buf.get_stats()
+        assert stats["complete_groups"] == 2
+        assert stats["pending_groups"] == 0
+
+    def test_add_group_sync(self):
+        buf = _make_group_buffer(group_size=4)
+        result = buf.add_group("p0", [{"r": i} for i in range(4)], version=0, step=0)
+        assert result["complete_groups"] == 1
+
+
+class TestGroupBufferSample:
+    def test_sample_empty_returns_none(self):
+        buf = _make_group_buffer()
+        assert buf.sample_group() is None
+
+    def test_sample_fifo_order(self):
+        buf = _make_group_buffer(group_size=2)
+        buf.add_episode("first", {"r": 0}, version=0, step=0)
+        buf.add_episode("first", {"r": 1}, version=0, step=0)
+        buf.add_episode("second", {"r": 0}, version=0, step=0)
+        buf.add_episode("second", {"r": 1}, version=0, step=0)
+
+        group = buf.sample_group()
+        assert group is not None
+        assert len(group) == 2
+        assert group[0]["r"] == 0
+
+        group2 = buf.sample_group()
+        assert group2 is not None
+        assert len(group2) == 2
+
+        assert buf.sample_group() is None
+
+    def test_sample_groups_batch(self):
+        buf = _make_group_buffer(group_size=2)
+        for pid in range(5):
+            buf.add_group(f"p{pid}", [{"r": i} for i in range(2)])
+        groups = buf.sample_groups(count=3)
+        assert groups is not None
+        assert len(groups) == 3
+        assert buf.get_stats()["complete_groups"] == 2
+
+
+class TestGroupBufferExpiry:
+    def test_stale_groups_expired(self):
+        buf = _make_group_buffer(group_size=4, max_staleness_steps=1)
+        buf.add_episode("old", {"r": 0}, version=0, step=0)
+        buf.add_episode("old", {"r": 1}, version=0, step=0)
+        buf.sample_group(current_step=5)
+        assert buf.get_stats()["pending_groups"] == 0
+        assert buf.get_stats()["total_groups_expired"] == 1
+
+    def test_fresh_groups_not_expired(self):
+        buf = _make_group_buffer(group_size=4, max_staleness_steps=3)
+        buf.add_episode("fresh", {"r": 0}, version=0, step=5)
+        buf.sample_group(current_step=6)
+        assert buf.get_stats()["pending_groups"] == 1
+
+
+class TestGroupBufferFilter:
+    def test_filter_drops_group(self):
+        def all_same_reward(gid, episodes):
+            rewards = [e.get("reward", 0) for e in episodes]
+            return len(set(rewards)) <= 1
+
+        buf = _make_group_buffer(group_size=2, group_filter=all_same_reward)
+        buf.add_episode("p0", {"reward": 1.0}, version=0, step=0)
+        buf.add_episode("p0", {"reward": 1.0}, version=0, step=0)
+        assert buf.get_stats()["complete_groups"] == 0
+        assert buf.get_stats()["total_groups_filtered"] == 1
+
+    def test_filter_keeps_diverse_group(self):
+        def all_same_reward(gid, episodes):
+            rewards = [e.get("reward", 0) for e in episodes]
+            return len(set(rewards)) <= 1
+
+        buf = _make_group_buffer(group_size=2, group_filter=all_same_reward)
+        buf.add_episode("p0", {"reward": 1.0}, version=0, step=0)
+        buf.add_episode("p0", {"reward": 0.0}, version=0, step=0)
+        assert buf.get_stats()["complete_groups"] == 1
+
+
+class TestGroupBufferMaxGroups:
+    def test_oldest_evicted_when_full(self):
+        buf = _make_group_buffer(group_size=10, max_groups=2)
+        buf.add_episode("p0", {"r": 0}, version=0, step=0)
+        buf.add_episode("p1", {"r": 0}, version=0, step=0)
+        buf.add_episode("p2", {"r": 0}, version=0, step=0)
+        assert buf.get_stats()["pending_groups"] == 2
+        assert buf.get_stats()["total_groups_expired"] == 1
