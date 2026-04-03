@@ -1,141 +1,235 @@
-"""Agentic RL training app for Forge.
+"""Agentic RL training entry point -- multi-turn agent with code execution.
 
-Extends the GRPO pipeline with multi-turn conversation, tool use
-(sandbox code execution), and per-turn reward computation.
-
-This app demonstrates Forge's unique agentic capabilities:
-- Multi-turn rollout with tool calls
-- Subprocess-isolated code execution
-- Session-sticky routing for KV cache locality
+Extends the GRPO pattern with AgentActor (multi-turn loops),
+SandboxActor (code execution), and session-based routing for
+KV cache locality.
 
 Usage::
 
     python -m forge.apps.agent_rl \\
         examples/math/gsm8k_rl.py \\
-        --config examples/math/gsm8k_grpo_npu.yaml \\
-        --reward-fn areal.reward.gsm8k.gsm8k_reward_fn
+        --config examples/math/gsm8k_agent.yaml \\
+        ++enable_thinking=true
 """
 
 from __future__ import annotations
 
-import logging
+import asyncio
+import os
+import sys
 
-from forge.api.types import Sample
-from forge.core.rollout import RolloutContext
+from forge.actors.agent import AgentActor
+from forge.actors.generator import Generator
+from forge.actors.replay_buffer import ReplayBuffer
+from forge.actors.reward import RewardActor
+from forge.actors.sandbox import SandboxActor
+from forge.actors.trainer import TrainerActor
+from forge.bootstraps import ensure_ascend_custom_opp_path
+from forge.provisioner import init_provisioner, shutdown
+from forge.weight_sync import resolve_xccl_alloc_mode
 
-logger = logging.getLogger("forge.apps.agent_rl")
+from areal.api import AllocationMode, AllocationType
+from areal.api.cli_args import (
+    ClusterSpecConfig,
+    InferenceEngineConfig,
+    RecoverConfig,
+    parse_cli_args,
+    to_structured_cfg,
+    vLLMConfig,
+)
+from areal.infra.utils.exp_metadata import save_experiment_metadata
+from areal.infra.utils.launcher import (
+    BASE_ENVIRONS,
+    get_scheduling_spec,
+    get_thread_env_vars,
+    validate_config_for_launcher,
+)
+from areal.utils import logging, name_resolve, names
+from areal.utils.network import find_free_ports, gethostip
+from areal.utils.recover import check_if_recover
+
+logger = logging.getLogger("AgentRLApp")
 
 
-async def default_agent_rollout(
-    sample: Sample,
-    ctx: RolloutContext,
-    *,
-    max_turns: int = 5,
-) -> Sample:
-    """Default multi-turn agentic rollout function.
+async def agent_rl_main(config, run_id: int = 0):
+    """Async agentic RL orchestration with multi-turn agent workflows.
 
-    This implements the standard agentic RL pattern:
-    1. Generate a response from the model.
-    2. If the response contains code, execute it in the sandbox.
-    3. Append the execution result as a tool observation.
-    4. Repeat until the model gives a final answer or max turns reached.
-    5. Compute reward.
+    Architecture::
 
-    Users can use this as-is or write their own rollout function
-    following the same pattern.
+        continuous_rollouts:
+            AgentActor.run_episode (session-affine routing)
+              -> Generator.generate (text generation)
+              -> SandboxActor.execute_code (code execution)
+              -> RewardActor.compute_reward (scoring)
+            -> ReplayBuffer.add
+
+        continuous_training:
+            ReplayBuffer.sample -> Trainer.train_on_batch
+            -> Generator.update_weights
     """
-    messages = [{"role": "user", "content": sample.prompt}]
-    full_response = ""
-    all_response_ids: list[int] = []
-    all_logprobs: list[float] = []
-    all_loss_mask: list[int] = []
+    ensure_ascend_custom_opp_path()
 
-    for turn in range(max_turns):
-        prompt_text = _format_messages(messages)
-        results = await ctx.engine.generate([prompt_text], ctx.default_params)
-        result = results[0]
+    config.recover = to_structured_cfg(config.recover, RecoverConfig)
+    config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
+    is_recover_run = check_if_recover(config.recover, run_id)
+    validate_config_for_launcher(config)
 
-        full_response += result.text
-        all_response_ids.extend(result.token_ids)
-        all_logprobs.extend(result.logprobs)
-        all_loss_mask.extend([1] * len(result.token_ids))
+    config.vllm = to_structured_cfg(config.vllm, vLLMConfig)
+    config.rollout = to_structured_cfg(config.rollout, InferenceEngineConfig)
 
-        code = _extract_code(result.text)
-        if code and "sandbox" in ctx.tools:
-            exec_result = await ctx.tools.sandbox.execute(code=code, timeout=10)
-            observation = _format_observation(exec_result)
-            messages.append({"role": "assistant", "content": result.text})
-            messages.append({"role": "tool", "content": observation})
-            full_response += observation
+    name_resolve.reconfigure(config.cluster.name_resolve)
+    name_resolve.clear_subtree(
+        names.trial_root(
+            experiment_name=config.experiment_name,
+            trial_name=config.trial_name,
+        )
+    )
+    alloc_mode = AllocationMode.from_str(config.allocation_mode)
 
-            if ctx.tokenizer is not None:
-                obs_ids = ctx.tokenizer(observation, add_special_tokens=False)[
-                    "input_ids"
-                ]
-                all_response_ids.extend(obs_ids)
-                all_logprobs.extend([0.0] * len(obs_ids))
-                all_loss_mask.extend([0] * len(obs_ids))
-        else:
-            break
-
-    reward = 0.0
-    if ctx.reward_fn is not None:
-        try:
-            reward = ctx.reward_fn(
-                sample.prompt,
-                full_response,
-                sample.prompt_ids,
-                all_response_ids,
-                **sample.task_data,
-            )
-        except Exception as e:
-            logger.error("Reward computation failed: %s", e)
-
-    return sample.with_response(
-        full_response,
-        float(reward),
-        response_ids=all_response_ids,
-        logprobs=all_logprobs,
-        loss_mask=all_loss_mask,
+    logger.info(
+        f"AgentRL: experiment={config.experiment_name}, "
+        f"trial={config.trial_name}, run_id={run_id}"
     )
 
+    if not is_recover_run:
+        save_experiment_metadata(
+            config.cluster.fileroot,
+            config.experiment_name,
+            config.trial_name,
+        )
 
-def _format_messages(messages: list[dict[str, str]]) -> str:
-    """Format a list of chat messages into a single prompt string."""
-    parts = []
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-        if role == "user":
-            parts.append(f"<|im_start|>user\n{content}<|im_end|>")
-        elif role == "assistant":
-            parts.append(f"<|im_start|>assistant\n{content}<|im_end|>")
-        elif role == "tool":
-            parts.append(content)
-    parts.append("<|im_start|>assistant\n")
-    return "\n".join(parts)
+    fileroot = config.cluster.fileroot
+    user = os.environ.get("USER", "root")
+    os.makedirs(
+        f"{fileroot}/logs/{user}/{config.experiment_name}/{config.trial_name}",
+        exist_ok=True,
+    )
+
+    master_addr = gethostip()
+    master_port = find_free_ports(1, (10000, 50000))[0]
+
+    train_ws = alloc_mode.train.world_size if alloc_mode.train else 0
+
+    await init_provisioner()
+
+    generator = await Generator.options(
+        procs=1, with_gpus=True, mesh_name="generator"
+    ).as_service(
+        engine_args=_build_vllm_engine_args(config, alloc_mode),
+    )
+
+    reward_fn_path = config.get("reward_fn") or "areal.reward.gsm8k.gsm8k_reward_fn"
+    reward = await RewardActor.options(
+        num_replicas=2, procs=1, mesh_name="reward"
+    ).as_service()
+    await reward.setup.fanout(reward_fn_path)
+
+    sandbox = await SandboxActor.options(
+        num_replicas=4, procs=1, mesh_name="sandbox"
+    ).as_service()
+
+    max_turns = config.get("max_turns", 3)
+    turn_discount = config.get("turn_discount", 0.9)
+
+    agent = await AgentActor.options(
+        num_replicas=2, procs=1, mesh_name="agent"
+    ).as_service(
+        generator=generator,
+        reward=reward,
+        sandbox=sandbox,
+        max_turns=max_turns,
+        turn_discount=turn_discount,
+    )
+
+    _replay_buffer = await ReplayBuffer.options(  # noqa: F841
+        procs=1, mesh_name="buffer"
+    ).as_actor(max_size=4096, eviction_policy="age", max_age_steps=2)
+
+    if alloc_mode.type_ == AllocationType.LLM_SERVER_ONLY:
+        logger.info("LLM_SERVER_ONLY mode -- serving only, no training")
+        return
+
+    actor_spec = get_scheduling_spec(config.actor)
+    thread_env = get_thread_env_vars(
+        cpus_per_task=actor_spec.cpu,
+        existing_env_vars=actor_spec.env_vars,
+    )
+    trainer_env = {
+        **BASE_ENVIRONS,
+        **thread_env,
+        **actor_spec.env_vars,
+        "AREAL_SPMD_MODE": "1",
+        "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", ""),
+        "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE", ""),
+        "VLLM_USE_MODELSCOPE": os.environ.get("VLLM_USE_MODELSCOPE", ""),
+        "HF_ENDPOINT": os.environ.get("HF_ENDPOINT", ""),
+    }
+
+    xccl_alloc = resolve_xccl_alloc_mode(config, alloc_mode, train_world_size=train_ws)
+
+    trainer = await TrainerActor.options(
+        procs=train_ws, with_gpus=True, mesh_name="trainer"
+    ).as_actor(
+        cli_args=sys.argv[1:],
+        env_vars=trainer_env,
+        rank=-1,
+        world_size=train_ws,
+        master_addr=master_addr,
+        master_port=master_port,
+        generator_actor=generator,
+        reward_actor=reward,
+        agent_actor=agent,
+        xccl_weight_update_alloc_mode=xccl_alloc,
+    )
+
+    info_mesh = await trainer.initialize.call()
+    _, info = next(iter(info_mesh.items()))
+    max_steps = info.get("max_steps", 0)
+    start_step = info.get("start_step", 0)
+    logger.info(f"Trainer ready: max_steps={max_steps}, start={start_step}")
+
+    step = start_step
+    shutdown_event = asyncio.Event()
+
+    async def continuous_training():
+        nonlocal step
+        while step < max_steps and not shutdown_event.is_set():
+            logger.info(f"[Train] Step {step}/{max_steps}")
+            result_mesh = await trainer.train_step.call(step)
+            _, result = next(iter(result_mesh.items()))
+            logger.info(f"[Train] Step {step} complete: {result}")
+            step += 1
+        shutdown_event.set()
+
+    try:
+        await continuous_training()
+    except Exception as e:
+        logger.error(f"Agent RL training failed: {e}")
+        raise
+    finally:
+        logger.info("Shutting down all actors...")
+        await shutdown()
+
+    logger.info(f"Agent RL training complete. Total steps: {step}")
 
 
-def _extract_code(text: str) -> str | None:
-    """Extract Python code from model output."""
-    import re
-
-    patterns = [
-        r"<code>(.*?)</code>",
-        r"```python\s*(.*?)\s*```",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-    return None
+def _build_vllm_engine_args(config, alloc_mode) -> dict:
+    vllm_args = vLLMConfig.build_args(
+        vllm_config=config.vllm,
+        tp_size=alloc_mode.gen.tp_size,
+        pp_size=alloc_mode.gen.pp_size,
+    )
+    return vllm_args
 
 
-def _format_observation(exec_result: dict) -> str:
-    """Format sandbox execution result as an observation string."""
-    if exec_result.get("success"):
-        output = exec_result.get("result", exec_result.get("stdout", ""))
-        return f"\n<observation>\n{output}\n</observation>\n"
-    else:
-        error = exec_result.get("stderr", "Unknown error")
-        return f"\n<observation>\nError: {error}\n</observation>\n"
+def main():
+    from monarch._src.actor.actor_mesh import context
+
+    context()
+
+    config, _ = parse_cli_args(sys.argv[1:])
+    asyncio.run(agent_rl_main(config, run_id=0))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,9 +1,44 @@
+import threading
+
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
 
 from areal.utils import logging
 
 logger = logging.getLogger("RewardUtils")
+
+
+def _patch_math_verify_for_threads():
+    """Make math_verify's signal-based timeout a no-op in non-main threads.
+
+    math_verify uses signal.alarm() in its timeout decorator (utils.timeout),
+    but signal.alarm() only works in the main thread.  Monarch actors run
+    in non-main threads, causing ValueError on every reward call.
+
+    We replace the timeout decorator itself so that in non-main threads it
+    returns a no-op wrapper.  This fixes both parser.parse() and grader.verify().
+    """
+    import math_verify.grader as _grader
+    import math_verify.metric as _metric
+    import math_verify.parser as _parser
+    import math_verify.utils as _utils
+
+    _original_timeout = _utils.timeout
+
+    def _thread_safe_timeout(timeout_seconds=10):
+        if threading.current_thread() is not threading.main_thread():
+            def no_timeout_decorator(func):
+                return func
+            return no_timeout_decorator
+        return _original_timeout(timeout_seconds)
+
+    _utils.timeout = _thread_safe_timeout
+    _parser.timeout = _thread_safe_timeout
+    _grader.timeout = _thread_safe_timeout
+    _metric.timeout = _thread_safe_timeout
+
+
+_patch_math_verify_for_threads()
 
 VALID_REWARD_FN = ["clevr_count_70k", "geometry3k"]
 

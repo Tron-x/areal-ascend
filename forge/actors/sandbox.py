@@ -1,7 +1,7 @@
-"""Framework-agnostic Sandbox for code execution.
+"""SandboxActor -- subprocess-isolated Python code execution.
 
-Pure Python subprocess-based execution -- no Monarch or Ray dependency.
-Extracted from ``areal/monarch_plugin/sandbox_actor.py``.
+Provides a secure execution environment for model-generated code.
+Each execution runs in a separate subprocess with a hard timeout.
 """
 
 from __future__ import annotations
@@ -12,9 +12,12 @@ import subprocess
 import sys
 import textwrap
 import time
-from typing import Any
 
-logger = logging.getLogger("forge.sandbox")
+from monarch.actor import endpoint
+
+from forge.actors.base import ForgeActor
+
+logger = logging.getLogger(__name__)
 
 _RUNNER_TEMPLATE = textwrap.dedent("""\
 import sys, json, io
@@ -47,48 +50,36 @@ print(json.dumps({{
 """)
 
 
-class Sandbox:
-    """Subprocess-isolated Python code execution.
+class SandboxActor(ForgeActor):
+    """Monarch Actor providing subprocess-isolated Python execution.
 
-    Each ``execute()`` call spawns a fresh Python subprocess with
-    a hard timeout, preventing resource leaks and infinite loops.
+    Deploy as a service for load-balanced code execution::
 
-    Satisfies the ``Tool`` protocol for use in ``ToolRegistry``.
+        sandbox = await SandboxActor.options(
+            num_replicas=4, procs=1
+        ).as_service()
+        result = await sandbox.execute_code.route(code_str)
     """
 
-    def __init__(self, default_timeout: float = 10.0) -> None:
-        self._default_timeout = default_timeout
+    procs = 1
+    with_gpus = False
+
+    def __init__(self):
         self._call_count = 0
         self._success_count = 0
         self._total_time = 0.0
 
-    @property
-    def name(self) -> str:
-        return "sandbox"
+    @endpoint
+    def execute_code(self, code: str, timeout: float = 10.0) -> dict:
+        """Execute Python code in an isolated subprocess.
 
-    @property
-    def description(self) -> str:
-        return "Execute Python code in an isolated subprocess with a timeout."
+        Args:
+            code: Python source code to execute.
+            timeout: Maximum execution time in seconds.
 
-    async def execute(self, **kwargs: Any) -> dict[str, Any]:
-        """Execute Python code.
-
-        Parameters (via kwargs)
-        -----------------------
-        code : str
-            Python source code to execute.
-        timeout : float, optional
-            Maximum execution time in seconds.
+        Returns:
+            Dict with keys: success, stdout, stderr, result.
         """
-        code = kwargs.get("code", "")
-        timeout = kwargs.get("timeout", self._default_timeout)
-        return self.execute_sync(code, timeout)
-
-    def execute_sync(self, code: str, timeout: float | None = None) -> dict[str, Any]:
-        """Synchronous code execution in a subprocess."""
-        if timeout is None:
-            timeout = self._default_timeout
-
         t0 = time.monotonic()
         self._call_count += 1
 
@@ -133,7 +124,8 @@ class Sandbox:
 
         return result
 
-    def stats(self) -> dict:
+    @endpoint
+    def get_stats(self) -> dict:
         avg = (self._total_time / self._call_count) if self._call_count > 0 else 0
         return {
             "call_count": self._call_count,
@@ -141,3 +133,11 @@ class Sandbox:
             "total_time": self._total_time,
             "avg_time": avg,
         }
+
+    @endpoint
+    def shutdown(self) -> None:
+        logger.info(
+            f"[SandboxActor] Shutting down. "
+            f"Executed {self._call_count} code blocks "
+            f"({self._success_count} succeeded)"
+        )

@@ -1,1 +1,1 @@
-"""Forge applications: ready-to-run training pipelines."""
+"""Forge pre-built training applications."""
