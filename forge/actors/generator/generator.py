@@ -242,7 +242,7 @@ class Generator(ForgeActor):
         logger.info(f"Weight update complete, now v{version}")
 
     @endpoint
-    def get_chat_template(self) -> dict:
+    async def get_chat_template(self) -> dict:
         """Return the model's chat template metadata.
 
         Useful for other actors (e.g. AgentActor) that need to discover
