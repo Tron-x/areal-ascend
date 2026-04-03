@@ -166,6 +166,32 @@ class ReplayBuffer(ForgeActor):
         Returns:
             List of data dicts, or None if buffer is empty / no valid entries.
         """
+        return self._do_sample(batch_size, current_step, min_version)
+
+    @endpoint
+    def wait_and_sample(
+        self,
+        batch_size: int = 1,
+        current_step: int = -1,
+        min_version: int = -1,
+    ) -> list[dict] | None:
+        """Sample from the buffer, returning None only if truly empty.
+
+        The caller should retry with a sleep if None is returned::
+
+            while batch is None:
+                batch = await buffer.wait_and_sample.call_one(...)
+                await asyncio.sleep(0.5)
+        """
+        return self._do_sample(batch_size, current_step, min_version)
+
+    def _do_sample(
+        self,
+        batch_size: int = 1,
+        current_step: int = -1,
+        min_version: int = -1,
+    ) -> list[dict] | None:
+        """Internal sampling logic shared by sample and wait_and_sample."""
         if not self._buffer:
             return None
 
@@ -194,31 +220,6 @@ class ReplayBuffer(ForgeActor):
 
         self._total_sampled += k
         return [entry.data for entry in selected]
-
-    @endpoint
-    def wait_and_sample(
-        self,
-        batch_size: int = 1,
-        current_step: int = -1,
-        min_version: int = -1,
-    ) -> list[dict] | None:
-        """Sample from the buffer, returning None only if truly empty.
-
-        Unlike ``sample``, this performs eviction and version filtering
-        but always returns whatever is available. The caller should
-        retry with a sleep if None is returned.
-
-        In the async pipeline, the orchestrator polls this endpoint::
-
-            while batch is None:
-                batch = await buffer.wait_and_sample.call_one(...)
-                await asyncio.sleep(0.5)
-        """
-        return self.sample(
-            batch_size=batch_size,
-            current_step=current_step,
-            min_version=min_version,
-        )
 
     @endpoint
     def buffer_size(self) -> int:

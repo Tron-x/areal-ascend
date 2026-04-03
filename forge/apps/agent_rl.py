@@ -77,6 +77,7 @@ async def continuous_rollouts(
                 episode = await _rollout_via_generator(generator, reward, rollout_count)
 
             if episode is not None:
+                episode = _ensure_training_keys(episode)
                 await replay_buffer.add.call_one(
                     episode, version=rollout_count, step=rollout_count
                 )
@@ -92,6 +93,32 @@ async def continuous_rollouts(
             await asyncio.sleep(1.0)
 
     logger.info(f"[Rollout] Finished after {rollout_count} episodes")
+
+
+def _ensure_training_keys(episode: dict) -> dict:
+    """Ensure the episode dict has all keys PPOTrainer expects."""
+    ids = episode.get("input_ids", [])
+    seq_len = len(ids) if isinstance(ids, list) else 0
+
+    if "attention_mask" not in episode:
+        episode["attention_mask"] = [1] * seq_len
+    if "loss_mask" not in episode:
+        episode["loss_mask"] = [1] * seq_len
+    if "logprobs" not in episode:
+        episode["logprobs"] = [0.0] * seq_len
+    if "versions" not in episode:
+        episode["versions"] = [-1] * seq_len
+
+    for key in ("input_ids", "logprobs", "loss_mask", "versions", "attention_mask"):
+        val = episode.get(key, [])
+        if isinstance(val, list) and (not val or not isinstance(val[0], list)):
+            episode[key] = [val]
+
+    reward = episode.get("rewards", 0.0)
+    if not isinstance(reward, list):
+        episode["rewards"] = [float(reward)]
+
+    return episode
 
 
 async def _rollout_via_agent(agent, step: int) -> dict | None:
@@ -125,10 +152,12 @@ async def _rollout_via_generator(generator, reward, step: int) -> dict | None:
 
     r = 0.0
     try:
-        reward_mesh = await reward.compute_reward.call(prompt=prompt, completion=text)
+        reward_mesh = await reward.compute_reward.call(
+            prompt=prompt, completion=text, task_data={}
+        )
         _, r = next(iter(reward_mesh.items()))
     except Exception as e:
-        logger.warning(f"[Rollout] Reward failed: {e}")
+        logger.warning(f"[Rollout] Reward computation failed: {e}, returning 0.0")
 
     return {
         "input_ids": token_ids,

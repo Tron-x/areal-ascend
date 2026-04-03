@@ -9,12 +9,9 @@ Monarch is mocked out so the tests can run in any Python environment.
 
 from __future__ import annotations
 
-import random
 import sys
 import types
 from unittest.mock import MagicMock
-
-import pytest
 
 # ---------------------------------------------------------------------------
 # Mock the entire monarch package tree so forge.actors can be imported
@@ -175,7 +172,7 @@ class TestReplayBufferEviction:
         buf = _make_buffer(max_size=3, eviction_policy="count")
         for i in range(5):
             buf.add({"i": i}, version=0, step=0)
-        assert buf.size() == 3
+        assert buf.buffer_size() == 3
         stats = buf.get_stats()
         assert stats["total_evicted"] == 2
 
@@ -194,13 +191,13 @@ class TestReplayBufferEviction:
         buf.add({"x": 1}, version=0, step=0)
         buf.sample(batch_size=1)
         buf.sample(batch_size=1)
-        assert buf.size() == 0
+        assert buf.buffer_size() == 0
 
     def test_no_eviction_policy(self):
         buf = _make_buffer(max_size=2, eviction_policy="none")
         for i in range(5):
             buf.add({"i": i}, version=0, step=0)
-        assert buf.size() == 5
+        assert buf.buffer_size() == 5
 
 
 class TestReplayBufferWaitAndSample:
