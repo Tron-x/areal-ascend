@@ -221,7 +221,7 @@ class ReplayBuffer(ForgeActor):
         )
 
     @endpoint
-    def size(self) -> int:
+    def buffer_size(self) -> int:
         return len(self._buffer)
 
     @endpoint

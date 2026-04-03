@@ -124,11 +124,17 @@ class AReaLDataProvider(ForgeActor):
     @staticmethod
     def _create_dataloader(config):
         """Create a standalone dataloader from AReaL config."""
-        from areal.dataset import build_dataset
+        from areal.dataset import get_custom_dataset
         from areal.utils.dataloader import create_dataloader
+        from areal.utils.hf_utils import load_hf_tokenizer
 
         dataset_config = config.train_dataset
-        train_dataset = build_dataset(dataset_config)
+        tokenizer = load_hf_tokenizer(config.tokenizer_path)
+        train_dataset = get_custom_dataset(
+            split="train",
+            dataset_config=dataset_config,
+            tokenizer=tokenizer,
+        )
 
         if train_dataset is None:
             from areal.trainer.rl_trainer import _EmptyDataLoader

@@ -42,11 +42,8 @@ from forge.actors.rollout_producer import RolloutProducer
 from forge.actors.sandbox import SandboxActor
 from forge.actors.trainer import TrainerActor
 from forge.adapters.areal import AReaLConfigBridge, AReaLTrainBackend
-from forge.agents.react import SimpleReActAgent
 from forge.bootstraps import ensure_ascend_custom_opp_path
 from forge.provisioner import init_provisioner, shutdown
-from forge.service.model_proxy import ModelProxy
-from forge.utils.chat_template import auto_chat_template
 
 logger = logging.getLogger("AgentRLApp")
 
@@ -173,7 +170,9 @@ async def agent_rl_main(config=None, run_id: int = 0):
 
     os.makedirs(forge_cfg.resolve_log_dir(), exist_ok=True)
 
-    async_pipeline = forge_cfg.async_pipeline
+    async_pipeline = (
+        forge_cfg.async_pipeline or os.environ.get("FORGE_ASYNC_PIPELINE", "") == "1"
+    )
     logger.info(
         f"AgentRL: experiment={forge_cfg.experiment_name}, "
         f"trial={forge_cfg.trial_name}, run_id={run_id}, "
@@ -183,40 +182,39 @@ async def agent_rl_main(config=None, run_id: int = 0):
     await init_provisioner()
 
     # -- Infrastructure actors -------------------------------------------------
+    # Deploy as plain actors (ActorMesh) rather than services (ServiceInterface)
+    # because Monarch's ActorMesh is picklable across process boundaries,
+    # while ServiceInterface contains asyncio.Future objects that cannot
+    # be serialized.
 
     generator = await Generator.options(
         procs=1, with_gpus=True, mesh_name="generator"
-    ).as_service(
+    ).as_actor(
         engine_args=forge_cfg.engine_args,
     )
 
-    reward = await RewardActor.options(
-        num_replicas=2, procs=1, mesh_name="reward"
-    ).as_service()
-    await reward.setup.fanout(forge_cfg.reward_fn_path)
+    reward = await RewardActor.options(procs=1, mesh_name="reward").as_actor()
+    await reward.setup.call(forge_cfg.reward_fn_path)
 
-    sandbox = await SandboxActor.options(
-        num_replicas=4, procs=1, mesh_name="sandbox"
-    ).as_service()
+    sandbox = await SandboxActor.options(procs=1, mesh_name="sandbox").as_actor()
 
     # -- Agent Framework layer -------------------------------------------------
-
-    chat_template = auto_chat_template(model_path=forge_cfg.model_path)
-    model_proxy = ModelProxy(generator, chat_template=chat_template)
+    # NOTE: AgentActor is deployed as a single actor (not a multi-replica
+    # service) because Monarch ServiceInterface objects contain asyncio
+    # Futures that cannot be pickled across process boundaries. The
+    # RolloutProducer handles parallelism instead.
 
     max_turns = raw_cfg.get("max_turns", 3) if hasattr(raw_cfg, "get") else 3
     turn_discount = (
         raw_cfg.get("turn_discount", 0.9) if hasattr(raw_cfg, "get") else 0.9
     )
-    agent_logic = SimpleReActAgent(max_turns=max_turns, turn_discount=turn_discount)
 
-    agent = await AgentActor.options(
-        num_replicas=2, procs=1, mesh_name="agent"
-    ).as_service(
-        agent_logic=agent_logic,
-        model_proxy=model_proxy,
+    agent = await AgentActor.options(procs=1, mesh_name="agent").as_actor(
+        generator=generator,
         reward=reward,
         sandbox=sandbox,
+        max_turns=max_turns,
+        turn_discount=turn_discount,
     )
 
     # -- ReplayBuffer ----------------------------------------------------------

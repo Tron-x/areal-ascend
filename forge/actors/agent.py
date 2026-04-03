@@ -221,7 +221,7 @@ class AgentActor(ForgeActor):
         }
 
     @endpoint
-    def get_stats(self) -> dict:
+    async def get_stats(self) -> dict:
         proxy_stats = self._proxy.get_stats() if self._proxy else {}
         return {
             "episode_count": self._episode_count,

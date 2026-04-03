@@ -135,8 +135,10 @@ class RolloutProducer(ForgeActor):
         """Route through AgentActor for multi-turn episodes."""
         ep = self._agent.run_episode
         if hasattr(ep, "route"):
-            return await ep.route(data)
-        return await ep.call_one(data)
+            raw = await ep.route(data)
+        else:
+            raw = await ep.call_one(data)
+        return self._normalize_result(raw)
 
     async def _generate_via_generator(self, data: dict) -> dict | None:
         """Direct single-turn generation + reward computation."""
@@ -173,16 +175,16 @@ class RolloutProducer(ForgeActor):
         if self._reward is not None:
             reward = await self._compute_reward(prompt, text, data)
 
-        return {
-            "packed_input_ids": token_ids,
-            "logprobs": logprobs,
-            "loss_mask": [1] * len(token_ids),
-            "versions": [version] * len(token_ids),
-            "rewards": reward,
-            "seq_len": len(token_ids),
-            "prompt": prompt,
-            "completion": text,
-        }
+        return self._normalize_result(
+            {
+                "input_ids": token_ids,
+                "logprobs": logprobs,
+                "loss_mask": [1] * len(token_ids),
+                "versions": [version] * len(token_ids),
+                "rewards": reward,
+                "seq_len": len(token_ids),
+            }
+        )
 
     async def _compute_reward(self, prompt: str, completion: str, data: dict) -> float:
         ep = self._reward.compute_reward
@@ -200,6 +202,50 @@ class RolloutProducer(ForgeActor):
         except Exception as e:
             logger.warning(f"Reward computation failed: {e}")
             return 0.0
+
+    @staticmethod
+    def _normalize_result(raw: dict) -> dict:
+        """Normalize a rollout result to the format expected by PPOTrainer.
+
+        Ensures keys match RLVRWorkflow output (input_ids, logprobs,
+        loss_mask, versions, attention_mask, rewards) and values are
+        lists with a leading batch dimension [1, seq_len].
+        """
+        ids = raw.get("input_ids", raw.get("packed_input_ids", []))
+        if not isinstance(ids, list):
+            ids = list(ids)
+        seq_len = len(ids)
+
+        logprobs = raw.get("logprobs", [0.0] * seq_len)
+        if not isinstance(logprobs, list):
+            logprobs = list(logprobs)
+        if len(logprobs) != seq_len:
+            logprobs = logprobs[:seq_len] + [0.0] * max(0, seq_len - len(logprobs))
+
+        loss_mask = raw.get("loss_mask", [1] * seq_len)
+        if not isinstance(loss_mask, list):
+            loss_mask = list(loss_mask)
+
+        versions = raw.get("versions", [-1] * seq_len)
+        if not isinstance(versions, list):
+            versions = list(versions)
+
+        attention_mask = raw.get("attention_mask", [1] * seq_len)
+        if not isinstance(attention_mask, list):
+            attention_mask = list(attention_mask)
+
+        reward = raw.get("rewards", 0.0)
+        if isinstance(reward, list):
+            reward = reward[0] if reward else 0.0
+
+        return {
+            "input_ids": [ids],
+            "logprobs": [logprobs],
+            "loss_mask": [loss_mask],
+            "versions": [versions],
+            "attention_mask": [attention_mask],
+            "rewards": [float(reward)],
+        }
 
     async def _push_to_buffer(
         self, results: list[dict], version: int, step: int
