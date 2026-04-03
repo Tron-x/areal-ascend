@@ -1,7 +1,7 @@
-"""Shared conftest for AReaL monarch_plugin tests.
+"""Shared conftest for AReaL / Forge tests.
 
-Mocks heavy dependencies so monarch_plugin test modules can import
-without triggering the full dependency chain.
+Provides helpers for mocking heavy dependencies so test modules can
+import without triggering the full dependency chain.
 """
 
 import sys

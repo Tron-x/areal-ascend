@@ -1,4 +1,4 @@
-"""Unit tests for areal.monarch_plugin.weight_sync (XCCL alloc_mode for Monarch).
+"""Unit tests for forge weight_sync (XCCL alloc_mode for Monarch).
 
 Run (needs full AReaL deps, e.g. Ascend conda env):
 
@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from areal.api.alloc_mode import AllocationMode, ParallelStrategy
-from areal.monarch_plugin.weight_sync import (
+from forge.adapters.areal.weight_sync import (
     build_monarch_xccl_weight_update_alloc_mode_from_vllm_runtime,
     monarch_xccl_weight_update_alloc_mode_flat,
     optional_flat_inference_xccl_from_env,
@@ -120,7 +120,7 @@ class TestResolveXcclAllocMode(unittest.TestCase):
         return config
 
     @patch(
-        "areal.monarch_plugin.weight_sync._vllm_gen_parallel",
+        "forge.adapters.areal.weight_sync._vllm_gen_parallel",
         return_value=ParallelStrategy(1, 1, 1),
     )
     def test_default_dp1_no_env(self, mock_gen_ps):
@@ -134,7 +134,7 @@ class TestResolveXcclAllocMode(unittest.TestCase):
 
     @patch.dict(os.environ, {"MONARCH_INFERENCE_XCCL_PARTICIPANTS": "2"})
     @patch(
-        "areal.monarch_plugin.weight_sync._vllm_gen_parallel",
+        "forge.adapters.areal.weight_sync._vllm_gen_parallel",
         return_value=ParallelStrategy(4, 1, 1),
     )
     def test_env_override_ignores_vllm_runtime(self, mock_gen_ps):
@@ -147,7 +147,7 @@ class TestResolveXcclAllocMode(unittest.TestCase):
         self.assertEqual(result.train.world_size, 4)
 
     @patch(
-        "areal.monarch_plugin.weight_sync._vllm_gen_parallel",
+        "forge.adapters.areal.weight_sync._vllm_gen_parallel",
         return_value=ParallelStrategy(2, 2, 1),
     )
     def test_preserves_tp_from_runtime(self, mock_gen_ps):

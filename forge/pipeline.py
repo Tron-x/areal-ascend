@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from areal.utils import logging
+import logging
 
 logger = logging.getLogger("MonarchPipeline")
 
