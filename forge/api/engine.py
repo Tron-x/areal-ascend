@@ -1,26 +1,34 @@
 """Engine protocols: the central decoupling point for Forge.
 
-Any inference or training backend that satisfies these protocols can be used
-with Forge's rollout functions, apps, and pipeline orchestration.
+Two levels of abstraction:
 
-TorchForge has a ``Trainer`` protocol but no ``GenerateEngine``.
-Slime has neither -- it uses raw HTTP + Ray remotes.
-Forge provides both for clean framework-agnostic composition.
+**Low-level** (user-facing, used inside ``@rollout_fn``):
+- ``GenerateEngine``: per-prompt text generation.
+
+**High-level** (pipeline-facing, used by ``run_pipeline``):
+- ``RolloutStage``: produces a training batch per step.
+- ``TrainStage``: consumes a training batch and drives weight sync.
+
+Adapters implement these protocols so the pipeline layer has zero
+framework coupling.
 """
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from forge.api.types import GenerateResult, Metrics, SamplingParams, TrainBatch
+from forge.api.types import GenerateResult, SamplingParams
+
+# ---------------------------------------------------------------------------
+# Low-level protocol: used by @rollout_fn authors
+# ---------------------------------------------------------------------------
 
 
 @runtime_checkable
 class GenerateEngine(Protocol):
-    """Protocol for text generation backends.
+    """Per-prompt text generation — what users call inside ``@rollout_fn``.
 
-    Implementations may wrap vLLM (in-process or Monarch-based),
-    SGLang (HTTP), or any other inference server.
+    Implementations: Monarch vLLM, SGLang HTTP, mock engine, etc.
     """
 
     async def generate(
@@ -28,90 +36,49 @@ class GenerateEngine(Protocol):
         prompts: list[str],
         params: SamplingParams,
     ) -> list[GenerateResult]:
-        """Generate completions for a batch of prompts.
-
-        Parameters
-        ----------
-        prompts
-            Input text prompts.
-        params
-            Sampling parameters controlling generation.
-
-        Returns
-        -------
-        list[GenerateResult]
-            One result per prompt, in the same order.
-        """
+        """Generate completions for a batch of prompts."""
         ...
 
     async def update_weights(self, version: int) -> None:
-        """Load updated model weights (e.g. after a training step).
-
-        Parameters
-        ----------
-        version
-            Monotonically increasing weight version identifier.
-        """
+        """Hot-reload model weights after a training step."""
         ...
 
     async def shutdown(self) -> None:
-        """Release resources held by the engine."""
+        """Release resources."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# High-level protocols: used by run_pipeline()
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class RolloutStage(Protocol):
+    """Produce one training batch per step.
+
+    Default adapter implementation runs ``GenerateEngine`` + ``RewardFn``
+    (or the full AReaL rollout workflow) and returns a dict batch ready
+    for training.
+    """
+
+    async def produce_batch(self, step: int) -> dict[str, Any]:
+        """Run rollout for *step* and return a training-ready batch dict."""
         ...
 
 
 @runtime_checkable
-class TrainEngine(Protocol):
-    """Protocol for training backends.
+class TrainStage(Protocol):
+    """Consume a training batch, update the model, and sync weights.
 
-    Implementations may wrap AReaL's PPOTrainer + FSDPEngine,
-    Slime's MegatronTrainRayActor, TorchForge's TitanTrainer, etc.
+    A single ``consume_batch`` call covers the full cycle:
+    advantage computation → PPO update → weight sync → logging.
     """
 
-    async def train_step(self, batch: TrainBatch) -> Metrics:
-        """Run one training step on the given batch.
-
-        Parameters
-        ----------
-        batch
-            A :class:`TrainBatch` with tensors already on the correct device.
-
-        Returns
-        -------
-        Metrics
-            Training metrics for this step (loss, grad_norm, etc.).
-        """
+    async def consume_batch(self, batch: dict[str, Any], step: int) -> dict[str, Any]:
+        """Train on *batch* for *step*. Returns metrics dict."""
         ...
 
-    async def push_weights(self) -> int:
-        """Push updated weights to the weight store and return the new version.
-
-        Returns
-        -------
-        int
-            The new weight version number.
-        """
-        ...
-
-    async def save_checkpoint(self, path: str) -> None:
-        """Save a training checkpoint to disk.
-
-        Parameters
-        ----------
-        path
-            Directory where the checkpoint should be written.
-        """
-        ...
-
-    async def load_checkpoint(self, path: str) -> None:
-        """Load a training checkpoint from disk.
-
-        Parameters
-        ----------
-        path
-            Directory containing the checkpoint.
-        """
-        ...
-
-    async def shutdown(self) -> None:
-        """Release resources held by the training engine."""
+    async def get_info(self) -> dict[str, Any]:
+        """Return pipeline metadata (max_steps, start_step, etc.)."""
         ...

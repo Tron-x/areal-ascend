@@ -2,10 +2,10 @@
 
 Provides:
 - ``RolloutContext``: the context object passed to user rollout functions.
-- ``ForgeApp``: the simple user-facing entry point with ``@rollout_fn``.
-- ``rollout_batch()``: helper to run rollout functions over a batch of samples.
+- ``ForgeApp``: the single user-facing entry point.
+- ``rollout_batch()``: run a rollout function over a batch of samples.
 
-Inspired by Slime's ``--rollout-function-path`` pattern -- the user writes
+Inspired by Slime's ``--rollout-function-path`` pattern — the user writes
 a single ``async def`` and Forge handles everything else.
 """
 
@@ -51,21 +51,8 @@ async def rollout_batch(
     samples: list[Sample],
     concurrency: int = 64,
 ) -> list[Sample]:
-    """Run a rollout function over a batch of samples with bounded concurrency.
-
-    Parameters
-    ----------
-    fn
-        The user-defined ``async def rollout(sample, ctx) -> Sample`` function.
-    ctx
-        The ``RolloutContext`` with engine, tools, etc.
-    samples
-        Input samples to process.
-    concurrency
-        Maximum number of concurrent rollout coroutines.
-    """
+    """Run a rollout function over a batch of samples with bounded concurrency."""
     semaphore = asyncio.Semaphore(concurrency)
-    results: list[Sample] = []
     errors: list[Exception] = []
 
     async def _run_one(sample: Sample) -> Sample:
@@ -89,10 +76,7 @@ async def rollout_batch(
 def load_rollout_fn(import_path: str) -> RolloutFnType:
     """Load a rollout function from a dotted import path.
 
-    Parameters
-    ----------
-    import_path
-        e.g. ``"my_project.rollout.gsm8k_rollout"``
+    Example: ``"my_project.rollout.gsm8k_rollout"``
     """
     parts = import_path.rsplit(".", 1)
     if len(parts) != 2:
@@ -109,7 +93,7 @@ def load_rollout_fn(import_path: str) -> RolloutFnType:
 
 
 class ForgeApp:
-    """Simple user-facing entry point for Forge training.
+    """Single user-facing entry point for Forge training.
 
     Usage::
 
@@ -117,14 +101,14 @@ class ForgeApp:
 
         @app.rollout_fn
         async def my_rollout(sample: Sample, ctx: RolloutContext) -> Sample:
-            result = await ctx.engine.generate(sample.prompt, ctx.default_params)
-            reward = compute_reward(sample.label, result.text)
-            return sample.with_response(result.text, reward)
+            result = await ctx.engine.generate([sample.prompt], ctx.default_params)
+            reward = compute_reward(sample.label, result[0].text)
+            return sample.with_response(result[0].text, reward)
 
         app.run(AppConfig(model="Qwen/Qwen2.5-1.5B", train_gpus=4, infer_gpus=4))
 
-    Internally, the ``@rollout_fn`` is wrapped into a RolloutActor and
-    the training loop is orchestrated by ``forge.apps.grpo``.
+    Internally delegates to the Monarch adapter for actor creation
+    and ``forge.apps.grpo.run_pipeline()`` for the training loop.
     """
 
     def __init__(self) -> None:
@@ -143,57 +127,25 @@ class ForgeApp:
     def run(self, config: AppConfig) -> None:
         """Launch the full training pipeline.
 
-        This is the main entry point. It:
-        1. Creates the backend (Monarch, Ray, etc.) from config.
-        2. Spawns generator, trainer, and supporting actors.
-        3. Runs the training loop.
+        1. Resolve the rollout function (decorator or config path).
+        2. Set up Monarch actors via the adapter layer.
+        3. Run the generic pipeline loop.
         """
         if self._rollout_fn is None and config.rollout_fn_path is not None:
             self._rollout_fn = load_rollout_fn(config.rollout_fn_path)
 
-        if self._rollout_fn is None:
-            raise ValueError(
-                "No rollout function registered. Use @app.rollout_fn or set "
-                "config.rollout_fn_path."
-            )
-
         asyncio.run(self._run_async(config))
 
     async def _run_async(self, config: AppConfig) -> None:
-        """Internal async entry point -- delegates to the appropriate app."""
-        backend = _get_backend(config.backend)
-        await backend.run_pipeline(config, self._rollout_fn, self._tools)
+        from forge.adapters.monarch.setup import setup_grpo
+        from forge.apps.grpo import run_pipeline
 
+        ctx = await setup_grpo(config, run_id=0)
 
-class Backend:
-    """Abstract backend interface for ForgeApp.
-
-    Adapters register themselves here so ``ForgeApp.run()`` can dispatch
-    to the correct backend.
-    """
-
-    async def run_pipeline(
-        self,
-        config: AppConfig,
-        rollout_fn: RolloutFnType,
-        tools: ToolRegistry,
-    ) -> None:
-        raise NotImplementedError
-
-
-_BACKEND_REGISTRY: dict[str, Backend] = {}
-
-
-def register_backend(name: str, backend: Backend) -> None:
-    """Register a backend adapter for use with ``ForgeApp``."""
-    _BACKEND_REGISTRY[name] = backend
-
-
-def _get_backend(name: str) -> Backend:
-    if name not in _BACKEND_REGISTRY:
-        available = list(_BACKEND_REGISTRY) or ["(none registered)"]
-        raise ValueError(
-            f"Backend '{name}' not found. Available: {available}. "
-            f"Import the adapter module first (e.g. 'import forge.adapters.monarch')."
+        await run_pipeline(
+            rollout=ctx["rollout"],
+            train=ctx["train"],
+            buffer=ctx["buffer"],
+            max_steps=ctx["max_steps"],
+            start_step=ctx["start_step"],
         )
-    return _BACKEND_REGISTRY[name]

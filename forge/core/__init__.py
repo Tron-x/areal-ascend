@@ -1,6 +1,6 @@
 """Forge core: framework-agnostic implementations.
 
-This package has ZERO framework dependencies (no Monarch, Ray, vLLM, etc.).
+This package has ZERO framework dependencies (no Monarch, vLLM, etc.).
 Only Python stdlib, torch, and ``forge.api`` protocols are used.
 """
 
