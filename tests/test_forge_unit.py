@@ -822,18 +822,22 @@ def _make_group_buffer(**kwargs):
         "max_groups": 100,
         "max_staleness_steps": 2,
         "group_filter": None,
+        "window_size": 1.0,
     }
     defaults.update(kwargs)
     buf._group_size = defaults["group_size"]
     buf._max_groups = defaults["max_groups"]
     buf._max_staleness_steps = defaults["max_staleness_steps"]
     buf._filter = defaults["group_filter"]
+    buf._window_size = defaults["window_size"]
     buf._pending = OrderedDict()
     buf._complete = OrderedDict()
+    buf._generation_head = 0
     buf._total_episodes = 0
     buf._total_groups_completed = 0
     buf._total_groups_expired = 0
     buf._total_groups_filtered = 0
+    buf._total_window_blocked = 0
     return buf
 
 
@@ -949,6 +953,58 @@ class TestGroupBufferMaxGroups:
         buf.add_episode("p2", {"r": 0}, version=0, step=0)
         assert buf.get_stats()["pending_groups"] == 2
         assert buf.get_stats()["total_groups_expired"] == 1
+
+
+class TestWindowedFIFO:
+    """Windowed FIFO scheduling (MiniMax Forge).
+
+    With window_size < 1.0, the training scheduler can only see
+    groups within the first window_size fraction of complete groups.
+    """
+
+    def test_window_1_allows_all(self):
+        """window_size=1.0 (default) = no blocking, same as plain FIFO."""
+        buf = _make_group_buffer(group_size=2, window_size=1.0)
+        buf.add_group("early", [{"r": 0}, {"r": 1}], step=0)
+        buf.add_group("late", [{"r": 0}, {"r": 1}], step=100)
+        group = buf.sample_group()
+        assert group is not None
+
+    def test_window_blocks_late_groups(self):
+        """With small window, late-arriving fast groups are blocked."""
+        buf = _make_group_buffer(group_size=2, window_size=0.3)
+        # Add 10 groups at different steps (simulating async completion)
+        for i in range(10):
+            buf.add_group(f"p{i}", [{"r": 0}, {"r": 1}], step=i * 10)
+
+        # First sample should get the earliest group (step=0)
+        group = buf.sample_group()
+        assert group is not None
+        # Head advances
+
+        stats = buf.get_stats()
+        assert stats["generation_head"] >= 1
+
+    def test_window_forces_ordering(self):
+        """Even if step=100 group is complete, must wait for earlier ones."""
+        buf = _make_group_buffer(group_size=1, window_size=0.5)
+
+        # Add groups out of order: step 100 first, then step 0
+        buf.add_group("fast_easy", [{"r": 1}], step=100)
+        buf.add_group("slow_hard", [{"r": 0}], step=0)
+
+        # With window=0.5, should get the earlier one first
+        group = buf.sample_group()
+        assert group is not None
+        assert group[0]["r"] == 0  # slow_hard (step=0) comes first
+
+    def test_window_stats_tracked(self):
+        buf = _make_group_buffer(group_size=1, window_size=1.0)
+        buf.add_group("p0", [{"r": 0}], step=0)
+        stats = buf.get_stats()
+        assert "window_size" in stats
+        assert "generation_head" in stats
+        assert "total_window_blocked" in stats
 
 
 # ======================================================================

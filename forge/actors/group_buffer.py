@@ -1,28 +1,29 @@
-"""GroupBuffer -- GRPO-style group rollout management for async pipelines.
+"""GroupBuffer -- GRPO-style group rollout management with Windowed FIFO.
 
 Collects individual episodes into groups (same prompt, multiple responses)
-and only releases complete groups for training.  Inspired by ROLL's
-``GroupQueue`` with staleness-based expiry.
+and only releases complete groups for training.
 
-Design:
-- Each episode is tagged with a ``group_id`` (typically the prompt hash/index)
-- Episodes accumulate until ``group_size`` responses arrive for a group
-- Complete groups are dequeued in FIFO order
-- Stale incomplete groups are expired after ``max_staleness_steps``
-- Optional ``GroupFilter`` callable to drop untrainable groups
+Key features:
+- Episode grouping: accumulate until ``group_size`` responses arrive
+- FIFO ordering: complete groups dequeued oldest-first
+- Staleness expiry: incomplete groups too old are dropped
+- GroupFilter: optionally drop untrainable groups (all same reward)
+- **Windowed FIFO** (MiniMax Forge): training scheduler can only see
+  groups within a sliding window of the generation head, preventing
+  data distribution shift toward fast/easy samples.
+
+Windowed FIFO (from MiniMax Forge blog):
+    The training scheduler is restricted to a visibility window of
+    size ``window_size``. Only complete groups whose ``create_step``
+    is within ``[head, head + window_size)`` can be sampled.
+    Groups outside the window are blocked even if complete.
+    This prevents fast tasks from dominating the training distribution.
 
 Usage::
 
     buf = await GroupBuffer.options(procs=1).as_actor(
-        group_size=4, max_staleness_steps=2,
+        group_size=4, max_staleness_steps=2, window_size=0.3,
     )
-    # Rollout producer adds individual episodes
-    await buf.add_episode.call_one("prompt_0", episode_data, version=0, step=0)
-    # Training consumer gets complete groups
-    group = await buf.sample_group.call_one(current_step=1)
-    if group is not None:
-        # group = [episode_0, episode_1, episode_2, episode_3]
-        advantages = compute_advantages_grpo(group)
 """
 
 from __future__ import annotations
@@ -81,19 +82,23 @@ class GroupBuffer(ForgeActor):
         max_groups: int = 1024,
         max_staleness_steps: int = 2,
         group_filter: Callable[[str, list[dict]], bool] | None = None,
+        window_size: float = 1.0,
     ):
         self._group_size = group_size
         self._max_groups = max_groups
         self._max_staleness_steps = max_staleness_steps
         self._filter = group_filter
+        self._window_size = window_size
 
         self._pending: OrderedDict[str, GroupEntry] = OrderedDict()
         self._complete: OrderedDict[str, GroupEntry] = OrderedDict()
 
+        self._generation_head: int = 0
         self._total_episodes = 0
         self._total_groups_completed = 0
         self._total_groups_expired = 0
         self._total_groups_filtered = 0
+        self._total_window_blocked = 0
 
     @endpoint
     def add_episode(
@@ -188,13 +193,14 @@ class GroupBuffer(ForgeActor):
         self,
         current_step: int = -1,
     ) -> list[dict[str, Any]] | None:
-        """Dequeue the oldest complete group (FIFO).
+        """Dequeue the oldest complete group within the visibility window.
 
-        Also expires stale incomplete groups based on ``max_staleness_steps``.
+        Windowed FIFO: only groups whose ``create_step`` falls within
+        ``[head, head + window)`` are visible to the trainer.  This
+        prevents fast/easy samples from dominating the training batch.
 
         Returns:
-            List of episode dicts (length = group_size), or None if no
-            complete group is available.
+            List of episode dicts (length = group_size), or None.
         """
         if current_step >= 0:
             self._expire_stale(current_step)
@@ -202,9 +208,17 @@ class GroupBuffer(ForgeActor):
         if not self._complete:
             return None
 
-        group_id = next(iter(self._complete))
-        entry = self._complete.pop(group_id)
-        return entry.episodes
+        window = self._compute_window()
+
+        for group_id in list(self._complete):
+            entry = self._complete[group_id]
+            if entry.create_step <= window:
+                self._complete.pop(group_id)
+                self._advance_head(entry.create_step)
+                return entry.episodes
+            self._total_window_blocked += 1
+
+        return None
 
     @endpoint
     def sample_groups(
@@ -212,11 +226,10 @@ class GroupBuffer(ForgeActor):
         count: int = 1,
         current_step: int = -1,
     ) -> list[list[dict[str, Any]]] | None:
-        """Dequeue multiple complete groups at once.
+        """Dequeue multiple complete groups within the visibility window.
 
         Returns:
-            List of groups, each group being a list of episode dicts.
-            None if no complete groups available.
+            List of groups, or None if none available in the window.
         """
         if current_step >= 0:
             self._expire_stale(current_step)
@@ -226,9 +239,18 @@ class GroupBuffer(ForgeActor):
 
         result = []
         for _ in range(min(count, len(self._complete))):
-            group_id = next(iter(self._complete))
-            entry = self._complete.pop(group_id)
-            result.append(entry.episodes)
+            window = self._compute_window()
+            found = False
+            for group_id in list(self._complete):
+                entry = self._complete[group_id]
+                if entry.create_step <= window:
+                    self._complete.pop(group_id)
+                    self._advance_head(entry.create_step)
+                    result.append(entry.episodes)
+                    found = True
+                    break
+            if not found:
+                break
 
         return result if result else None
 
@@ -238,16 +260,37 @@ class GroupBuffer(ForgeActor):
             "pending_groups": len(self._pending),
             "complete_groups": len(self._complete),
             "group_size": self._group_size,
+            "window_size": self._window_size,
+            "generation_head": self._generation_head,
             "total_episodes": self._total_episodes,
             "total_groups_completed": self._total_groups_completed,
             "total_groups_expired": self._total_groups_expired,
             "total_groups_filtered": self._total_groups_filtered,
+            "total_window_blocked": self._total_window_blocked,
         }
 
     @endpoint
     def clear(self) -> None:
         self._pending.clear()
         self._complete.clear()
+
+    def _compute_window(self) -> int:
+        """Compute the upper bound of the visibility window.
+
+        Window = head + int(total_complete * window_size).
+        When ``window_size=1.0``, all complete groups are visible (no blocking).
+        When ``window_size=0.3``, only the first 30% of groups are visible.
+        """
+        total = len(self._complete)
+        if total == 0:
+            return self._generation_head
+        w = max(1, int(total * self._window_size))
+        steps = sorted(e.create_step for e in self._complete.values())
+        return steps[min(w - 1, len(steps) - 1)]
+
+    def _advance_head(self, consumed_step: int) -> None:
+        """Advance the generation head after consuming a group."""
+        self._generation_head = max(self._generation_head, consumed_step + 1)
 
     def _expire_stale(self, current_step: int) -> None:
         """Remove incomplete groups that are too old."""
