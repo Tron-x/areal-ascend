@@ -37,12 +37,15 @@ AREAL_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 TRAIN_STEPS=2
 MODEL_PATH="Qwen/Qwen2.5-1.5B-Instruct"
 CANN_HOME="${CANN_HOME:-/root/hzz/cann-9.0.0-beta.1}"
+ENTRY_MODE="legacy"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --steps)   TRAIN_STEPS="$2"; shift 2 ;;
         --model)   MODEL_PATH="$2";  shift 2 ;;
         --cann)    CANN_HOME="$2";   shift 2 ;;
+        --new)     ENTRY_MODE="new"; shift ;;
+        --forge)   ENTRY_MODE="forge"; shift ;;
         *)         echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
@@ -66,14 +69,30 @@ export TRANSFORMERS_OFFLINE=0
 # --------------- run ---------------
 cd "$AREAL_ROOT"
 
+case "$ENTRY_MODE" in
+    forge)
+        ENTRY_MODULE="forge.apps.grpo"
+        ENTRY_LABEL="forge.apps.grpo (forge)"
+        ;;
+    new)
+        ENTRY_MODULE="areal.monarch_plugin.apps.grpo.main"
+        ENTRY_LABEL="apps.grpo.main (new)"
+        ;;
+    *)
+        ENTRY_MODULE="areal.monarch_plugin.launcher"
+        ENTRY_LABEL="launcher (legacy)"
+        ;;
+esac
+
 echo "============================================="
 echo " Monarch AReaL: 4+4 (4 inf + 4 train)"
 echo " Model:       $MODEL_PATH"
 echo " Train steps: $TRAIN_STEPS"
 echo " CANN:        $CANN_HOME"
+echo " Entry:       $ENTRY_LABEL"
 echo "============================================="
 
-python -m areal.monarch_plugin.launcher \
+python -m "$ENTRY_MODULE" \
     examples/math/gsm8k_rl.py \
     --config examples/math/gsm8k_grpo_npu.yaml \
     "actor.path=$MODEL_PATH" \
