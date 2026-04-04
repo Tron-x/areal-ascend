@@ -38,6 +38,10 @@ set +eu
 [[ -f "$CANN_HOME/nnal/atb/set_env.sh" ]] && source "$CANN_HOME/nnal/atb/set_env.sh"
 set -eu
 
+# Deactivate any virtualenv that might override conda
+export VIRTUAL_ENV=""
+export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '.venv' | tr '\n' ':')
+
 if [[ "${CONDA_DEFAULT_ENV:-}" != "monarch_ascend" ]]; then
     eval "$(conda shell.bash hook)"
     conda activate monarch_ascend
