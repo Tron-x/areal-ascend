@@ -1,7 +1,14 @@
 """Global resource provisioner for Monarch ProcMesh lifecycle management.
 
+Supports three deployment modes:
+
+- **Local**: All actors on the current machine (default).
+- **Slurm**: Allocate machines via Monarch SlurmJob.
+- **Preallocated**: Machines already allocated by K8s or external
+  scheduler, discovered via torchrun-style environment variables
+  (MASTER_ADDR, NNODES, NODE_RANK).
+
 Ported from TorchForge's provisioner with Ascend NPU support via DeviceProxy.
-Manages GPU allocation, ProcMesh creation, environment setup, and shutdown.
 """
 
 from __future__ import annotations
@@ -177,8 +184,191 @@ class GpuManager:
             self.available_gpus.add(int(gpu_id))
 
 
+# ======================================================================
+# Launchers -- discover or allocate machines
+# ======================================================================
+
+
+class BaseLauncher:
+    """Abstract launcher interface."""
+
+    async def initialize(self):
+        """Allocate or discover machines. Returns (job, job_state) or None."""
+        return None, None
+
+    async def get_host_mesh(self, name: str):
+        """Get a named HostMesh from the allocation."""
+        raise NotImplementedError
+
+    async def remote_setup(self, proc_mesh: ProcMesh):
+        """Any launcher-specific setup on remote procs (e.g. mount storage)."""
+        pass
+
+    async def shutdown(self):
+        """Release allocated resources."""
+        pass
+
+
+class PreallocatedLauncher(BaseLauncher):
+    """Launcher for pre-allocated clusters (K8s, manual, etc.).
+
+    Assumes machines are already available. Discovers them via
+    torchrun-style environment variables:
+
+    - ``MASTER_ADDR``: address of node 0
+    - ``MASTER_PORT``: port for rendezvous
+    - ``NNODES``: total number of nodes
+    - ``NODE_RANK``: rank of this node
+
+    Alternatively, reads from ``LauncherConfig`` fields.
+
+    Usage::
+
+        # K8s already gave you 4 machines with 8 NPU each
+        launcher = PreallocatedLauncher(LauncherConfig(
+            launcher=Launcher.PREALLOCATED,
+            nnodes=4,
+            gpus_per_node=8,
+        ))
+        await launcher.initialize()
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.master_addr = cfg.master_addr or os.environ.get("MASTER_ADDR", "")
+        self.master_port = cfg.master_port or int(
+            os.environ.get("MASTER_PORT", "29500")
+        )
+        self.nnodes = cfg.nnodes or int(os.environ.get("NNODES", "1"))
+        self.node_rank = cfg.node_rank or int(os.environ.get("NODE_RANK", "0"))
+        self.gpus_per_node = cfg.gpus_per_node
+        self._host_meshes: dict[str, object] = {}
+
+    async def initialize(self):
+        logger.info(
+            f"PreallocatedLauncher: {self.nnodes} nodes, "
+            f"{self.gpus_per_node} GPUs/node, "
+            f"master={self.master_addr}:{self.master_port}, "
+            f"node_rank={self.node_rank}"
+        )
+        return None, None
+
+    async def get_host_mesh(self, name: str):
+        """For preallocated mode, return local host.
+
+        In a full implementation, this would connect to remote nodes
+        via Monarch's transport layer. For now, falls back to local.
+        """
+        if name in self._host_meshes:
+            return self._host_meshes[name]
+        host = this_host()
+        self._host_meshes[name] = host
+        return host
+
+    def get_cluster_info(self) -> dict:
+        """Return cluster topology information."""
+        return {
+            "master_addr": self.master_addr,
+            "master_port": self.master_port,
+            "nnodes": self.nnodes,
+            "node_rank": self.node_rank,
+            "gpus_per_node": self.gpus_per_node,
+            "total_gpus": self.nnodes * self.gpus_per_node,
+        }
+
+
+class SlurmLauncher(BaseLauncher):
+    """Launcher that allocates machines via Monarch SlurmJob.
+
+    Pre-allocates all meshes defined in LauncherConfig in one Slurm job.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._job = None
+        self._job_state = None
+
+    async def initialize(self):
+        try:
+            from monarch.job import SlurmJob
+        except ImportError:
+            raise RuntimeError(
+                "SlurmLauncher requires Monarch's SlurmJob. "
+                "Make sure monarch is built with Slurm support."
+            )
+
+        meshes = {}
+        for svc_name, svc_cfg in self.cfg.services.items():
+            if svc_cfg.hosts and svc_cfg.hosts > 0:
+                base = svc_cfg.mesh_name or svc_name
+                for i in range(svc_cfg.num_replicas):
+                    meshes[f"{base}_{i}"] = svc_cfg.hosts
+        for act_name, act_cfg in self.cfg.actors.items():
+            if act_cfg.hosts and act_cfg.hosts > 0:
+                meshes[act_cfg.mesh_name or act_name] = act_cfg.hosts
+
+        if not meshes:
+            logger.info("SlurmLauncher: no remote meshes requested")
+            return None, None
+
+        logger.info(f"SlurmLauncher: requesting meshes {meshes}")
+        job = SlurmJob(
+            meshes=meshes,
+            job_name=self.cfg.job_name or "forge_job",
+            gpus_per_node=self.cfg.gpus_per_node,
+        )
+        job.apply()
+        self._job = job
+        self._job_state = job.state()
+
+        import atexit
+
+        atexit.register(job.kill)
+        return self._job, self._job_state
+
+    async def get_host_mesh(self, name: str):
+        if self._job_state is None:
+            raise RuntimeError("SlurmLauncher not initialized")
+        return getattr(self._job_state, name)
+
+    async def shutdown(self):
+        if self._job is not None:
+            self._job.kill()
+
+
+def get_launcher(cfg) -> BaseLauncher | None:
+    """Factory for launchers based on config."""
+    if cfg is None:
+        return None
+
+    from forge.types import Launcher
+
+    if isinstance(cfg.launcher, str):
+        launcher_type = Launcher(cfg.launcher)
+    else:
+        launcher_type = cfg.launcher
+
+    if launcher_type == Launcher.LOCAL:
+        return None
+    if launcher_type == Launcher.PREALLOCATED:
+        return PreallocatedLauncher(cfg)
+    if launcher_type == Launcher.SLURM:
+        return SlurmLauncher(cfg)
+
+    return None
+
+
+# ======================================================================
+# Provisioner -- manages ProcMesh lifecycle and GPU allocation
+# ======================================================================
+
+
 class Provisioner:
-    """Global resource provisioner managing ProcMesh lifecycle and GPU allocation."""
+    """Global resource provisioner managing ProcMesh lifecycle and GPU allocation.
+
+    Supports local, Slurm, and preallocated (K8s) deployment modes via
+    pluggable launchers.
+    """
 
     def __init__(self, cfg: ProvisionerConfig | None = None):
         self._lock = asyncio.Lock()
@@ -197,9 +387,21 @@ class Provisioner:
         self._registered_services: list = []
         self._cfg = cfg
 
+        launcher_cfg = cfg.launcher_config if cfg else None
+        self.launcher: BaseLauncher | None = get_launcher(launcher_cfg)
+        if self.launcher:
+            logger.info(f"Provisioner using launcher: {type(self.launcher).__name__}")
+        else:
+            logger.info("Provisioner using local mode (no launcher)")
+
     async def initialize(self):
-        """Post-construction async initialization."""
-        pass
+        """Post-construction async initialization.
+
+        If a launcher is configured, initializes it to discover or
+        allocate machines.
+        """
+        if self.launcher is not None:
+            await self.launcher.initialize()
 
     async def get_proc_mesh(
         self,
@@ -233,15 +435,24 @@ class Provisioner:
         is_remote = num_hosts is not None and num_hosts > 0
 
         async with self._lock:
-            if is_remote and host_mesh is not None:
-                host_id = getattr(host_mesh, "_host_id", uuid.uuid1())
-                if host_id not in self._host_gpu_map:
-                    remote_gpu_count = await get_host_gpus(host_mesh)
-                    self._host_gpu_map[host_id] = GpuManager(
-                        max_device_count=remote_gpu_count
+            if is_remote:
+                if host_mesh is None and self.launcher is not None:
+                    host_mesh = await self.launcher.get_host_mesh(
+                        name=mesh_name or "default"
                     )
-                    host_mesh._host_id = host_id
-                gpu_manager = self._host_gpu_map[host_id]
+                if host_mesh is not None:
+                    host_id = getattr(host_mesh, "_host_id", uuid.uuid1())
+                    if host_id not in self._host_gpu_map:
+                        remote_gpu_count = await get_host_gpus(host_mesh)
+                        self._host_gpu_map[host_id] = GpuManager(
+                            max_device_count=remote_gpu_count
+                        )
+                        host_mesh._host_id = host_id
+                    gpu_manager = self._host_gpu_map[host_id]
+                else:
+                    host_mesh = this_host()
+                    gpu_manager = self._host_gpu_map[self._this_host_id]
+                    host_mesh._host_id = self._this_host_id
             else:
                 host_mesh = this_host()
                 gpu_manager = self._host_gpu_map[self._this_host_id]
@@ -353,12 +564,23 @@ class Provisioner:
     async def shutdown(self):
         """Tear down all remaining allocations."""
         await self.shutdown_all_allocations()
+        if self.launcher is not None:
+            try:
+                await self.launcher.shutdown()
+            except Exception as e:
+                logger.warning(f"Failed to shutdown launcher: {e}")
         try:
             from monarch.actor import shutdown_context
 
             await shutdown_context()
         except Exception as e:
             logger.warning(f"Failed to shutdown Monarch context: {e}")
+
+    def get_cluster_info(self) -> dict | None:
+        """Return cluster topology info if a launcher is configured."""
+        if self.launcher and hasattr(self.launcher, "get_cluster_info"):
+            return self.launcher.get_cluster_info()
+        return None
 
 
 def _propagate_ascend_env(env_vars: dict[str, str]) -> None:

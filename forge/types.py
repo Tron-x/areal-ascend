@@ -64,17 +64,30 @@ class ServiceConfig:
 class Launcher(Enum):
     LOCAL = "local"
     SLURM = "slurm"
+    PREALLOCATED = "preallocated"
 
 
 @dataclass
 class LauncherConfig:
-    """Cluster launcher configuration."""
+    """Cluster launcher configuration.
+
+    Modes:
+        - ``local``: All actors on the current machine (default).
+        - ``slurm``: Allocate machines via Slurm sbatch.
+        - ``preallocated``: Machines already allocated by K8s / external
+          scheduler.  Discovered via MASTER_ADDR + NNODES environment
+          variables (torchrun-style).
+    """
 
     launcher: Launcher = Launcher.LOCAL
     job_name: str = ""
     services: dict[str, ServiceConfig] = field(default_factory=dict)
     actors: dict[str, ProcessConfig] = field(default_factory=dict)
     gpus_per_node: int = 8
+    master_addr: str = ""
+    master_port: int = 0
+    nnodes: int = 1
+    node_rank: int = 0
 
     def __post_init__(self):
         if isinstance(self.launcher, str):
