@@ -57,22 +57,35 @@ async def continuous_rollouts(
     agent=None,
     shutdown_event: asyncio.Event | None = None,
     n_samples: int = 1,
+    data_source: list[dict] | None = None,
+    use_retool: bool = False,
 ):
     """Produce rollout episodes and push them to the ReplayBuffer.
 
     Runs in the orchestrator process. All GPU work is offloaded to
     Generator / RewardActor / AgentActor via Monarch RPC.
 
-    Follows TorchForge's ``continuous_rollouts`` pattern:
-    ``generator.generate`` -> reward -> ``replay_buffer.add``.
+    Args:
+        data_source: List of dicts with ``prompt``, ``answer``, ``messages``.
+            If provided, cycles through real data. If None, uses dummy prompts.
+        use_retool: If True, uses ``run_episode_retool`` (with loss_mask)
+            instead of ``run_episode``.
     """
     rollout_count = 0
+    data_idx = 0
     shutdown = shutdown_event or asyncio.Event()
 
     while not shutdown.is_set():
         try:
+            data = None
+            if data_source:
+                data = data_source[data_idx % len(data_source)]
+                data_idx += 1
+
             if agent is not None:
-                episode = await _rollout_via_agent(agent, rollout_count)
+                episode = await _rollout_via_agent(
+                    agent, rollout_count, data=data, use_retool=use_retool
+                )
             else:
                 episode = await _rollout_via_generator(generator, reward, rollout_count)
 
@@ -121,10 +134,24 @@ def _ensure_training_keys(episode: dict) -> dict:
     return episode
 
 
-async def _rollout_via_agent(agent, step: int) -> dict | None:
-    """Run a multi-turn episode through AgentActor."""
-    data = {"prompt": f"step_{step}", "step": step}
-    result_mesh = await agent.run_episode.call(data)
+async def _rollout_via_agent(
+    agent, step: int, data: dict | None = None, use_retool: bool = False
+) -> dict | None:
+    """Run a multi-turn episode through AgentActor.
+
+    Args:
+        data: Real data dict with prompt/answer/messages. If None, uses dummy.
+        use_retool: If True, uses run_episode_retool (with loss_mask for tool output).
+    """
+    if data is None:
+        data = {"prompt": f"step_{step}", "step": step}
+
+    if use_retool:
+        ep = agent.run_episode_retool
+    else:
+        ep = agent.run_episode
+
+    result_mesh = await ep.call(data)
     _, result = next(iter(result_mesh.items()))
     return result
 
@@ -337,6 +364,18 @@ async def agent_rl_main(config=None, run_id: int = 0):
                 f"Starting async pipeline (max_steps={max_steps}, start={start_step})"
             )
 
+            # Load real data if available
+            data_source = None
+            try:
+                from forge.examples.retool_gsm8k.data import load_gsm8k_prompts
+
+                data_source = load_gsm8k_prompts(
+                    split="train", max_samples=256, shuffle=True
+                )
+                logger.info(f"Loaded {len(data_source)} real prompts for rollout")
+            except Exception as e:
+                logger.warning(f"Could not load GSM8K data: {e}. Using dummy prompts.")
+
             num_rollout_threads = forge_cfg.rollout_threads
             logger.info(
                 f"Launching {num_rollout_threads} rollout thread(s) + 1 training thread"
@@ -350,6 +389,8 @@ async def agent_rl_main(config=None, run_id: int = 0):
                         replay_buffer=replay_buffer,
                         agent=agent,
                         shutdown_event=shutdown_event,
+                        data_source=data_source,
+                        use_retool=data_source is not None,
                     )
                 )
                 for _ in range(num_rollout_threads)
