@@ -41,6 +41,27 @@ def create_engine(backend: str = "areal", **kwargs: Any):
     )
 
 
+def create_batch_adapter(backend: str = "areal", **kwargs):
+    """Factory function to create a batch adapter by name.
+
+    Args:
+        backend: Engine backend name.
+        **kwargs: Backend-specific options (e.g. ``pad_token_id``).
+
+    Returns:
+        An object implementing ``BatchAdapter``.
+    """
+    if backend == "areal":
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        return AReaLBatchAdapter(**kwargs)
+    raise ValueError(
+        f"Unknown batch adapter: {backend!r}. "
+        f"Available: 'areal'. "
+        f"Contribute new adapters in forge/engines/<name>/batch_adapter.py."
+    )
+
+
 def create_config_bridge(backend: str = "areal"):
     """Factory function to create a config bridge by name.
 

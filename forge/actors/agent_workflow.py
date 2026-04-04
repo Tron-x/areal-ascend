@@ -47,21 +47,37 @@ class MonarchAgentWorkflow:
             self._setup_done = True
 
     async def arun_episode(self, engine, data: dict[str, Any]):
-        """Delegate to AgentActor and convert result to tensor dict."""
+        """Delegate to AgentActor and convert Episode to AReaL tensor dict."""
         import torch
+
+        from forge.core.types import Episode
 
         ep = self._agent.run_episode
         if hasattr(ep, "route"):
-            res = await ep.route(data)
+            result = await ep.route(data)
         else:
-            res = await ep.call_one(data)
+            result = await ep.call_one(data)
+
+        if isinstance(result, Episode):
+            raw = {
+                "input_ids": result.token_ids,
+                "logprobs": result.generator_logprobs,
+                "loss_mask": result.loss_mask,
+                "versions": result.versions,
+                "rewards": result.reward,
+                "attention_mask": [1] * result.seq_len(),
+            }
+        elif isinstance(result, dict):
+            raw = result
+        else:
+            return result
 
         tensor_res = {}
-        for k, v in res.items():
+        for k, v in raw.items():
             if isinstance(v, list):
                 if k in ("logprobs", "rewards"):
                     tensor_res[k] = torch.tensor(v, dtype=torch.float32)
-                elif k in ("loss_mask", "versions"):
+                elif k in ("loss_mask", "versions", "attention_mask"):
                     tensor_res[k] = torch.tensor(v, dtype=torch.int32)
                 elif k == "input_ids":
                     tensor_res[k] = torch.tensor(v, dtype=torch.int32)

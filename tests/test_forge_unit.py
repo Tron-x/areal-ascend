@@ -473,6 +473,188 @@ class TestCoreDataClasses:
         assert tr.tool_call is None
 
 
+class TestEpisode:
+    def test_defaults(self):
+        from forge.core.types import Episode
+
+        ep = Episode()
+        assert ep.episode_id == ""
+        assert ep.token_ids == []
+        assert ep.loss_mask == []
+        assert ep.versions == []
+        assert ep.reward == 0.0
+        assert ep.seq_len() == 0
+
+    def test_seq_len(self):
+        from forge.core.types import Episode
+
+        ep = Episode(token_ids=[10, 20, 30])
+        assert ep.seq_len() == 3
+
+    def test_to_dict_roundtrip(self):
+        from forge.core.types import Episode
+
+        ep = Episode(
+            episode_id="ep_1",
+            prompt="What is 2+2?",
+            response="4",
+            target="4",
+            reward=1.0,
+            policy_version=5,
+            token_ids=[100, 200, 300],
+            generator_logprobs=[-0.1, -0.2, -0.3],
+            loss_mask=[1, 1, 0],
+            versions=[5, 5, 5],
+            metadata={"turns_used": 2},
+        )
+        d = ep.to_dict()
+        assert d["episode_id"] == "ep_1"
+        assert d["token_ids"] == [100, 200, 300]
+        assert d["reward"] == 1.0
+        assert d["metadata"]["turns_used"] == 2
+
+        ep2 = Episode.from_dict(d)
+        assert ep2.episode_id == ep.episode_id
+        assert ep2.token_ids == ep.token_ids
+        assert ep2.generator_logprobs == ep.generator_logprobs
+        assert ep2.loss_mask == ep.loss_mask
+        assert ep2.versions == ep.versions
+        assert ep2.reward == ep.reward
+        assert ep2.target == ep.target
+
+    def test_to_dict_omits_none_fields(self):
+        from forge.core.types import Episode
+
+        ep = Episode(episode_id="ep_2")
+        d = ep.to_dict()
+        assert "target" not in d
+        assert "ref_logprobs" not in d
+        assert "advantage" not in d
+
+    def test_from_dict_missing_fields(self):
+        from forge.core.types import Episode
+
+        ep = Episode.from_dict({"reward": 0.5})
+        assert ep.reward == 0.5
+        assert ep.token_ids == []
+        assert ep.episode_id == ""
+
+
+# ======================================================================
+# AReaL Batch Adapter
+# ======================================================================
+
+
+class TestAReaLBatchAdapter:
+    def test_adapt_episodes(self):
+        from forge.core.types import Episode
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        adapter = AReaLBatchAdapter()
+        episodes = [
+            Episode(
+                token_ids=[1, 2, 3],
+                generator_logprobs=[-0.1, -0.2, -0.3],
+                loss_mask=[1, 1, 0],
+                versions=[1, 1, 1],
+                reward=0.8,
+            ),
+            Episode(
+                token_ids=[4, 5],
+                generator_logprobs=[-0.4, -0.5],
+                loss_mask=[1, 1],
+                versions=[2, 2],
+                reward=0.5,
+            ),
+        ]
+        batch = adapter.adapt(episodes)
+
+        assert len(batch["input_ids"]) == 2
+        assert len(batch["input_ids"][0]) == 3
+        assert len(batch["input_ids"][1]) == 3
+        assert batch["input_ids"][1] == [4, 5, 0]
+        assert batch["attention_mask"][1] == [1, 1, 0]
+        assert batch["loss_mask"][1] == [1, 1, 0]
+        assert batch["logprobs"][1] == [-0.4, -0.5, 0.0]
+        assert batch["rewards"] == [0.8, 0.5]
+
+    def test_adapt_single_episode(self):
+        from forge.core.types import Episode
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        adapter = AReaLBatchAdapter()
+        batch = adapter.adapt([Episode(token_ids=[10, 20], reward=1.0)])
+        assert len(batch["input_ids"]) == 1
+        assert batch["input_ids"][0] == [10, 20]
+        assert batch["attention_mask"][0] == [1, 1]
+        assert batch["rewards"] == [1.0]
+
+    def test_adapt_empty_returns_empty(self):
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        adapter = AReaLBatchAdapter()
+        assert adapter.adapt([]) == {}
+
+    def test_adapt_with_max_seq_len(self):
+        from forge.core.types import Episode
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        adapter = AReaLBatchAdapter(max_seq_len=2)
+        batch = adapter.adapt(
+            [
+                Episode(
+                    token_ids=[1, 2, 3, 4],
+                    generator_logprobs=[-0.1, -0.2, -0.3, -0.4],
+                    loss_mask=[1, 1, 0, 0],
+                    versions=[1, 1, 1, 1],
+                    reward=0.5,
+                )
+            ]
+        )
+        assert len(batch["input_ids"][0]) == 2
+
+    def test_adapt_legacy_dict(self):
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        adapter = AReaLBatchAdapter()
+        legacy = {
+            "input_ids": [10, 20, 30],
+            "logprobs": [-0.1, -0.2, -0.3],
+            "loss_mask": [1, 1, 1],
+            "versions": [0, 0, 0],
+            "rewards": 0.7,
+        }
+        batch = adapter.adapt([legacy])
+        assert batch["input_ids"][0] == [10, 20, 30]
+        assert batch["rewards"] == [0.7]
+
+    def test_adapt_fills_missing_fields(self):
+        from forge.core.types import Episode
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        adapter = AReaLBatchAdapter()
+        ep = Episode(token_ids=[1, 2], reward=0.5)
+        batch = adapter.adapt([ep])
+        assert batch["logprobs"][0] == [0.0, 0.0]
+        assert batch["loss_mask"][0] == [1, 1]
+        assert batch["versions"][0] == [-1, -1]
+
+    def test_required_fields(self):
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        adapter = AReaLBatchAdapter()
+        fields = adapter.required_fields()
+        assert "token_ids" in fields
+        assert "reward" in fields
+
+    def test_protocol_compliance(self):
+        from forge.core.protocols import BatchAdapter
+        from forge.engines.areal.batch_adapter import AReaLBatchAdapter
+
+        adapter = AReaLBatchAdapter()
+        assert isinstance(adapter, BatchAdapter)
+
+
 # ======================================================================
 # DataProvider protocol
 # ======================================================================

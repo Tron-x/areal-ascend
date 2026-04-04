@@ -28,7 +28,13 @@ from typing import TYPE_CHECKING
 from monarch.actor import endpoint
 
 from forge.actors.base import ForgeActor
-from forge.core.types import AgentAction, GenerationResult, ToolCall, ToolResult
+from forge.core.types import (
+    AgentAction,
+    Episode,
+    GenerationResult,
+    ToolCall,
+    ToolResult,
+)
 
 if TYPE_CHECKING:
     from forge.core.protocols import AgentLogic
@@ -143,15 +149,15 @@ class AgentActor(ForgeActor):
     # ------------------------------------------------------------------
 
     @endpoint
-    async def run_episode(self, data: dict) -> dict:
+    async def run_episode(self, data: dict) -> Episode:
         """Run a multi-turn agent episode.
 
         Args:
             data: Dict with keys like ``messages``, ``answer``, etc.
 
         Returns:
-            Dict with ``input_ids``, ``logprobs``, ``loss_mask``,
-            ``versions``, ``rewards``, ``seq_len``.
+            A framework-agnostic ``Episode`` with token IDs, logprobs,
+            loss_mask, versions, reward, and text fields populated.
         """
         if self._proxy is None:
             raise RuntimeError(
@@ -172,38 +178,33 @@ class AgentActor(ForgeActor):
         all_versions: list[int] = []
         reward = 0.0
         turns_used = 0
+        full_response = ""
 
         max_turns = getattr(self._logic, "max_turns", 3)
 
         for turn in range(max_turns):
             turns_used += 1
 
-            # 1. Generate via ModelProxy
             gen_result: GenerationResult = await self._proxy.generate(messages=messages)
 
-            # 2. Collect training metadata
             all_token_ids.extend(gen_result.token_ids)
             all_logprobs.extend(gen_result.logprobs)
             all_loss_mask.extend([1] * len(gen_result.token_ids))
             all_versions.extend([gen_result.version] * len(gen_result.token_ids))
+            full_response += gen_result.text
 
-            # 3. Let agent logic process the response
             action: AgentAction = self._logic.process_response(
                 gen_result.text, messages
             )
 
-            # 4. Execute tool calls
             tool_results = await self._execute_tools(action.tool_calls)
 
-            # 5. Compute reward
             prompt_text = self._proxy._apply_template(messages)
             reward = await self._call_reward(prompt_text, gen_result.text, data)
 
-            # 6. Check termination
             if action.done or not self._logic.should_continue(turn, reward):
                 break
 
-            # 7. Build feedback and continue
             feedback = self._logic.format_feedback(action, tool_results, reward)
             messages.append({"role": "assistant", "content": gen_result.text})
             messages.append({"role": "user", "content": feedback})
@@ -211,21 +212,30 @@ class AgentActor(ForgeActor):
         discount = getattr(self._logic, "compute_discount", lambda t: 1.0)(turns_used)
         reward = float(reward * discount)
 
-        return {
-            "input_ids": all_token_ids,
-            "logprobs": all_logprobs,
-            "loss_mask": all_loss_mask,
-            "versions": all_versions,
-            "rewards": reward,
-            "seq_len": len(all_token_ids),
-        }
+        prompt_str = data.get("prompt", "")
+        if not prompt_str and messages:
+            prompt_str = messages[0].get("content", "")
+
+        return Episode(
+            episode_id=f"ep_{self._episode_count}",
+            prompt=prompt_str,
+            response=full_response,
+            target=data.get("answer"),
+            reward=reward,
+            policy_version=all_versions[0] if all_versions else -1,
+            token_ids=all_token_ids,
+            generator_logprobs=all_logprobs,
+            loss_mask=all_loss_mask,
+            versions=all_versions,
+            metadata={"turns_used": turns_used},
+        )
 
     # ------------------------------------------------------------------
     # ReTool-style episode (token-level loss_mask)
     # ------------------------------------------------------------------
 
     @endpoint
-    async def run_episode_retool(self, data: dict) -> dict:
+    async def run_episode_retool(self, data: dict) -> Episode:
         """Run a multi-turn episode with proper tool-output loss masking.
 
         This is the ReTool / TIR pattern (Slime/veRL/AReaL):
@@ -233,16 +243,12 @@ class AgentActor(ForgeActor):
         - Tool-output tokens get ``loss_mask=0`` (excluded from gradient)
         - Logprobs are padded with 0.0 for tool-output tokens
 
-        The ``agent_logic`` controls parsing (via ``process_response``)
-        and feedback formatting (via ``format_tool_observation``).
-
         Args:
             data: Dict with ``messages`` or ``prompt``, plus optional
                   ``answer`` for reward computation.
 
         Returns:
-            Dict with ``input_ids``, ``logprobs``, ``loss_mask``,
-            ``versions``, ``rewards``, ``seq_len``, ``tool_call_count``.
+            A framework-agnostic ``Episode`` with proper loss masking.
         """
         if self._proxy is None:
             raise RuntimeError("AgentActor: no ModelProxy configured.")
@@ -264,53 +270,42 @@ class AgentActor(ForgeActor):
         max_turns = getattr(self._logic, "max_turns", 8)
 
         for turn in range(max_turns):
-            # [1] Generate via ModelProxy (token IDs + logprobs)
             gen_result: GenerationResult = await self._proxy.generate(messages=messages)
 
-            # [2] LLM output → loss_mask=1 (participates in training)
             all_token_ids.extend(gen_result.token_ids)
             all_logprobs.extend(gen_result.logprobs)
             all_loss_mask.extend([1] * len(gen_result.token_ids))
             all_versions.extend([gen_result.version] * len(gen_result.token_ids))
 
-            # [3] Parse response for tool calls or final answer
             action: AgentAction = self._logic.process_response(
                 gen_result.text, messages
             )
 
-            # [4] If done (answer found), stop immediately
             if action.done:
                 break
 
-            # [5] Execute tool calls
             tool_results = await self._execute_tools(action.tool_calls)
             if action.tool_calls:
                 tool_call_count += len(action.tool_calls)
 
-            # [6] Check termination
             if not self._logic.should_continue(turn, reward):
                 break
 
-            # [7] Format tool output as observation text
             if hasattr(self._logic, "format_tool_observation"):
                 obs_text = self._logic.format_tool_observation(tool_results)
             else:
                 obs_text = self._logic.format_feedback(action, tool_results, reward)
 
-            # [8] Tokenize tool observation
             obs_token_ids = self._tokenize_observation(obs_text)
 
-            # [9] Tool output → loss_mask=0 (NOT trained on)
             all_token_ids.extend(obs_token_ids)
             all_logprobs.extend([0.0] * len(obs_token_ids))
             all_loss_mask.extend([0] * len(obs_token_ids))
             all_versions.extend([-1] * len(obs_token_ids))
 
-            # [10] Append to message history for next turn
             messages.append({"role": "assistant", "content": gen_result.text})
             messages.append({"role": "user", "content": obs_text})
 
-        # Compute reward on the full response
         full_response = ""
         for msg in messages:
             if msg.get("role") == "assistant":
@@ -320,15 +315,25 @@ class AgentActor(ForgeActor):
         )
         reward = await self._call_reward(prompt_text, full_response, data)
 
-        return {
-            "input_ids": all_token_ids,
-            "logprobs": all_logprobs,
-            "loss_mask": all_loss_mask,
-            "versions": all_versions,
-            "rewards": reward,
-            "seq_len": len(all_token_ids),
-            "tool_call_count": tool_call_count,
-        }
+        prompt_str = data.get("prompt", "")
+        if not prompt_str and messages:
+            prompt_str = messages[0].get("content", "")
+
+        return Episode(
+            episode_id=f"ep_{self._episode_count}",
+            prompt=prompt_str,
+            response=full_response,
+            target=data.get("answer"),
+            reward=reward,
+            policy_version=all_versions[0] if all_versions else -1,
+            token_ids=all_token_ids,
+            generator_logprobs=all_logprobs,
+            loss_mask=all_loss_mask,
+            versions=all_versions,
+            metadata={
+                "tool_call_count": tool_call_count,
+            },
+        )
 
     def _tokenize_observation(self, text: str) -> list[int]:
         """Tokenize observation text into token IDs.

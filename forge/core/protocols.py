@@ -87,6 +87,40 @@ class RewardFn(Protocol):
 
 
 @runtime_checkable
+class BatchAdapter(Protocol):
+    """Convert framework-agnostic ``Episode`` objects to engine-specific batches.
+
+    Each training engine (AReaL, TorchTitan, Slime, ...) expects a different
+    tensor layout.  A ``BatchAdapter`` bridges the gap so that actors
+    produce only ``Episode`` objects and the orchestrator converts them
+    at the last moment before sending to the ``TrainerActor``.
+
+    Implementations live in ``forge/engines/<backend>/batch_adapter.py``.
+    """
+
+    def adapt(self, episodes: list) -> dict:
+        """Convert a list of Episodes to the engine's expected batch dict.
+
+        Args:
+            episodes: Framework-agnostic ``Episode`` objects from the
+                rollout pipeline.
+
+        Returns:
+            A dict of lists/tensors that the training engine can consume
+            directly (e.g. ``input_ids``, ``attention_mask``, etc.).
+        """
+        ...
+
+    def required_fields(self) -> list[str]:
+        """Return the list of Episode fields this adapter needs.
+
+        Used for validation: the orchestrator can warn early if an
+        Episode is missing a required field.
+        """
+        ...
+
+
+@runtime_checkable
 class AgentLogic(Protocol):
     """Pluggable agent strategy -- pure logic, no infrastructure awareness.
 

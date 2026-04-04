@@ -33,18 +33,10 @@ def collate_episodes(groups: list[Group], pad_id: int = 0) -> list[TrainBatch]:
         ref_logprobs_list = []
         has_ref = all(e.ref_logprobs is not None for e in group)
 
-        max_len = max(
-            len(e.completion.prompt_ids) + len(e.completion.token_ids)
-            if e.completion
-            else len(e.generator_logprobs)
-            for e in group
-        )
+        max_len = max(ep.seq_len() or len(ep.generator_logprobs) for ep in group)
 
         for ep in group:
-            if ep.completion:
-                ids = ep.completion.prompt_ids + ep.completion.token_ids
-            else:
-                ids = []
+            ids = ep.token_ids if ep.token_ids else []
             pad_len = max_len - len(ids)
             input_ids_list.append(ids + [pad_id] * pad_len)
 

@@ -9,12 +9,14 @@ alternate on each step via ``trainer.train_step``.
 connected through a ReplayBuffer, following TorchForge's pattern:
 
 - ``continuous_rollouts``: orchestrator calls Generator/AgentActor
-  directly, computes reward, pushes Episode to ReplayBuffer
-- ``continuous_training``: polls ReplayBuffer, trains, syncs weights
+  directly, computes reward, pushes ``Episode`` to ReplayBuffer
+- ``continuous_training``: polls ReplayBuffer, uses ``BatchAdapter`` to
+  convert Episodes to engine-specific format, trains, syncs weights
 
-No intermediate DataProvider or RolloutProducer actors needed -- the
-orchestrator drives everything, while Generator/Reward/Sandbox actors
-handle the heavy GPU work.
+The ``BatchAdapter`` is the data alignment layer: actors always produce
+framework-agnostic ``Episode`` objects, and the adapter converts them
+to whatever the training engine expects.  Switching to a new engine
+only requires writing a new ``BatchAdapter`` -- no actor changes.
 
 Usage::
 
@@ -39,7 +41,8 @@ from forge.actors.reward import RewardActor
 from forge.actors.sandbox import SandboxActor
 from forge.actors.trainer import TrainerActor
 from forge.bootstraps import ensure_ascend_custom_opp_path
-from forge.engines import create_config_bridge, create_engine
+from forge.core.types import Episode
+from forge.engines import create_batch_adapter, create_config_bridge, create_engine
 from forge.provisioner import init_provisioner, shutdown
 
 logger = logging.getLogger("AgentRLApp")
@@ -60,16 +63,12 @@ async def continuous_rollouts(
     data_source: list[dict] | None = None,
     use_retool: bool = False,
 ):
-    """Produce rollout episodes and push them to the ReplayBuffer.
+    """Produce rollout ``Episode`` objects and push them to the ReplayBuffer.
 
-    Runs in the orchestrator process. All GPU work is offloaded to
-    Generator / RewardActor / AgentActor via Monarch RPC.
-
-    Args:
-        data_source: List of dicts with ``prompt``, ``answer``, ``messages``.
-            If provided, cycles through real data. If None, uses dummy prompts.
-        use_retool: If True, uses ``run_episode_retool`` (with loss_mask)
-            instead of ``run_episode``.
+    All GPU work is offloaded to Generator / RewardActor / AgentActor via
+    Monarch RPC.  Episodes are framework-agnostic -- conversion to
+    engine-specific format happens in ``continuous_training`` via the
+    ``BatchAdapter``.
     """
     rollout_count = 0
     data_idx = 0
@@ -90,9 +89,8 @@ async def continuous_rollouts(
                 episode = await _rollout_via_generator(generator, reward, rollout_count)
 
             if episode is not None:
-                episode = _ensure_training_keys(episode)
                 await replay_buffer.add.call_one(
-                    episode, version=rollout_count, step=rollout_count
+                    episode.to_dict(), version=rollout_count, step=rollout_count
                 )
                 rollout_count += 1
                 if rollout_count % 10 == 0:
@@ -108,40 +106,13 @@ async def continuous_rollouts(
     logger.info(f"[Rollout] Finished after {rollout_count} episodes")
 
 
-def _ensure_training_keys(episode: dict) -> dict:
-    """Ensure the episode dict has all keys PPOTrainer expects."""
-    ids = episode.get("input_ids", [])
-    seq_len = len(ids) if isinstance(ids, list) else 0
-
-    if "attention_mask" not in episode:
-        episode["attention_mask"] = [1] * seq_len
-    if "loss_mask" not in episode:
-        episode["loss_mask"] = [1] * seq_len
-    if "logprobs" not in episode:
-        episode["logprobs"] = [0.0] * seq_len
-    if "versions" not in episode:
-        episode["versions"] = [-1] * seq_len
-
-    for key in ("input_ids", "logprobs", "loss_mask", "versions", "attention_mask"):
-        val = episode.get(key, [])
-        if isinstance(val, list) and (not val or not isinstance(val[0], list)):
-            episode[key] = [val]
-
-    reward = episode.get("rewards", 0.0)
-    if not isinstance(reward, list):
-        episode["rewards"] = [float(reward)]
-
-    return episode
-
-
 async def _rollout_via_agent(
     agent, step: int, data: dict | None = None, use_retool: bool = False
-) -> dict | None:
+) -> Episode | None:
     """Run a multi-turn episode through AgentActor.
 
-    Args:
-        data: Real data dict with prompt/answer/messages. If None, uses dummy.
-        use_retool: If True, uses run_episode_retool (with loss_mask for tool output).
+    Returns:
+        An ``Episode`` object (framework-agnostic).
     """
     if data is None:
         data = {"prompt": f"step_{step}", "step": step}
@@ -153,10 +124,15 @@ async def _rollout_via_agent(
 
     result_mesh = await ep.call(data)
     _, result = next(iter(result_mesh.items()))
+
+    if isinstance(result, Episode):
+        return result
+    if isinstance(result, dict):
+        return Episode.from_dict(result)
     return result
 
 
-async def _rollout_via_generator(generator, reward, step: int) -> dict | None:
+async def _rollout_via_generator(generator, reward, step: int) -> Episode | None:
     """Single-turn generation + reward (no AgentActor)."""
     prompt = f"step_{step}"
     gen_mesh = await generator.generate.call(prompt)
@@ -186,14 +162,17 @@ async def _rollout_via_generator(generator, reward, step: int) -> dict | None:
     except Exception as e:
         logger.warning(f"[Rollout] Reward computation failed: {e}, returning 0.0")
 
-    return {
-        "input_ids": token_ids,
-        "logprobs": logprobs,
-        "loss_mask": [1] * len(token_ids),
-        "versions": [version] * len(token_ids),
-        "attention_mask": [1] * len(token_ids),
-        "rewards": float(r),
-    }
+    return Episode(
+        episode_id=f"gen_ep_{step}",
+        prompt=prompt,
+        response=text,
+        reward=float(r),
+        policy_version=version,
+        token_ids=token_ids,
+        generator_logprobs=logprobs,
+        loss_mask=[1] * len(token_ids),
+        versions=[version] * len(token_ids),
+    )
 
 
 async def continuous_training(
@@ -204,12 +183,13 @@ async def continuous_training(
     start_step: int = 0,
     shutdown_event: asyncio.Event | None = None,
     poll_interval: float = 0.5,
+    batch_adapter=None,
 ):
-    """Consume from ReplayBuffer, train, sync weights.
+    """Consume from ReplayBuffer, adapt via BatchAdapter, train, sync weights.
 
-    Follows TorchForge's ``continuous_training`` pattern:
-    ``replay_buffer.sample`` -> ``trainer.train_step`` ->
-    ``trainer.push_weights`` -> ``generator.update_weights``.
+    The ``batch_adapter`` converts framework-agnostic ``Episode`` dicts
+    from the ReplayBuffer into the engine-specific tensor layout.
+    If no adapter is provided, raw dicts are passed through (legacy path).
     """
     step = start_step
     shutdown = shutdown_event or asyncio.Event()
@@ -218,16 +198,24 @@ async def continuous_training(
         batch_mesh = await replay_buffer.wait_and_sample.call(
             batch_size=1, current_step=step
         )
-        _, batch = next(iter(batch_mesh.items()))
+        _, sampled = next(iter(batch_mesh.items()))
 
-        if batch is None:
+        if sampled is None:
             await asyncio.sleep(poll_interval)
             continue
 
         logger.info(f"[Train] Step {step}/{max_steps} — training on buffered batch")
 
+        if batch_adapter is not None:
+            episodes = [
+                Episode.from_dict(d) if isinstance(d, dict) else d for d in sampled
+            ]
+            batch = batch_adapter.adapt(episodes)
+        else:
+            batch = sampled[0]
+
         result_mesh = await trainer.train_on_buffered_batch.call(
-            batch[0], step, skip_weight_sync=False
+            batch, step, skip_weight_sync=False
         )
         _, result = next(iter(result_mesh.items()))
 
@@ -357,6 +345,9 @@ async def agent_rl_main(config=None, run_id: int = 0):
 
     # -- Run -------------------------------------------------------------------
 
+    batch_adapter = create_batch_adapter(backend=forge_cfg.backend_type)
+    logger.info(f"Created batch adapter for backend={forge_cfg.backend_type!r}")
+
     try:
         if async_pipeline:
             shutdown_event = asyncio.Event()
@@ -364,7 +355,6 @@ async def agent_rl_main(config=None, run_id: int = 0):
                 f"Starting async pipeline (max_steps={max_steps}, start={start_step})"
             )
 
-            # Load real data if available
             data_source = None
             try:
                 from forge.examples.retool_gsm8k.data import load_gsm8k_prompts
@@ -403,6 +393,7 @@ async def agent_rl_main(config=None, run_id: int = 0):
                     max_steps=max_steps,
                     start_step=start_step,
                     shutdown_event=shutdown_event,
+                    batch_adapter=batch_adapter,
                 )
             )
 

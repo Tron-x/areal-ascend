@@ -18,6 +18,7 @@ from forge.core.chat_template import (
 )
 from forge.core.protocols import (
     AgentLogic,
+    BatchAdapter,
     DataProvider,
     InferenceBridge,
     InferenceEngine,
@@ -40,6 +41,7 @@ from forge.core.types import (
 __all__ = [
     "AgentAction",
     "AgentLogic",
+    "BatchAdapter",
     "CHATML",
     "ChatTemplate",
     "Completion",

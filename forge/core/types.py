@@ -45,7 +45,11 @@ class Episode:
 
     This is the universal unit of data flowing through the pipeline::
 
-        Generator -> Episode -> ReplayBuffer -> Trainer
+        Generator -> Episode -> ReplayBuffer -> BatchAdapter -> Trainer
+
+    ``Episode`` is framework-agnostic: actors produce it, the ``ReplayBuffer``
+    stores it, and a per-engine ``BatchAdapter`` converts it to the format
+    that the training engine expects.
 
     Attributes:
         episode_id: Unique identifier.
@@ -57,9 +61,12 @@ class Episode:
         reward_breakdown: Per-component reward scores.
         advantage: Computed advantage (GRPO/GAE).
         policy_version: Which policy version generated this.
+        prompt_token_ids: Encoded prompt token IDs.
+        token_ids: All token IDs (prompt + completion concatenated).
         generator_logprobs: Per-token logprobs from the generator.
         ref_logprobs: Per-token logprobs from the reference model.
         loss_mask: Binary mask indicating which tokens to train on.
+        versions: Per-token policy version tags.
         metadata: Arbitrary extra data.
     """
 
@@ -72,10 +79,64 @@ class Episode:
     reward_breakdown: dict[str, float] = field(default_factory=dict)
     advantage: float | None = None
     policy_version: int = -1
+    prompt_token_ids: list[int] = field(default_factory=list)
+    token_ids: list[int] = field(default_factory=list)
     generator_logprobs: list[float] = field(default_factory=list)
     ref_logprobs: list[float] | None = None
     loss_mask: list[int] = field(default_factory=list)
+    versions: list[int] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def seq_len(self) -> int:
+        """Total sequence length (prompt + completion tokens)."""
+        return len(self.token_ids)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a plain dict (for Monarch RPC / ReplayBuffer)."""
+        d: dict[str, Any] = {
+            "episode_id": self.episode_id,
+            "prompt": self.prompt,
+            "response": self.response,
+            "reward": self.reward,
+            "policy_version": self.policy_version,
+            "prompt_token_ids": self.prompt_token_ids,
+            "token_ids": self.token_ids,
+            "generator_logprobs": self.generator_logprobs,
+            "loss_mask": self.loss_mask,
+            "versions": self.versions,
+        }
+        if self.target is not None:
+            d["target"] = self.target
+        if self.ref_logprobs is not None:
+            d["ref_logprobs"] = self.ref_logprobs
+        if self.advantage is not None:
+            d["advantage"] = self.advantage
+        if self.reward_breakdown:
+            d["reward_breakdown"] = self.reward_breakdown
+        if self.metadata:
+            d["metadata"] = self.metadata
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Episode:
+        """Reconstruct an Episode from a plain dict."""
+        return cls(
+            episode_id=d.get("episode_id", ""),
+            prompt=d.get("prompt", ""),
+            response=d.get("response", ""),
+            target=d.get("target"),
+            reward=d.get("reward", 0.0),
+            policy_version=d.get("policy_version", -1),
+            prompt_token_ids=d.get("prompt_token_ids", []),
+            token_ids=d.get("token_ids", []),
+            generator_logprobs=d.get("generator_logprobs", []),
+            ref_logprobs=d.get("ref_logprobs"),
+            loss_mask=d.get("loss_mask", []),
+            versions=d.get("versions", []),
+            advantage=d.get("advantage"),
+            reward_breakdown=d.get("reward_breakdown", {}),
+            metadata=d.get("metadata", {}),
+        )
 
 
 @dataclass
