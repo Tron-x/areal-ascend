@@ -431,7 +431,7 @@ class AReaLInferenceBridge(InferenceEngine):
         return resolved
 
     def _wrap_with_agent_workflow(self, workflow):
-        from forge.actors.agent import MonarchAgentWorkflow
+        from forge.actors.agent_workflow import MonarchAgentWorkflow
 
         reward_fn = getattr(workflow, "reward_fn", None)
         if reward_fn is None:
