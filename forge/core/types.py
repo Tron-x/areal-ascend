@@ -10,6 +10,7 @@ Inspired by TorchForge's ``Episode``, ``Completion``, and ``TrainBatch``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 
@@ -176,3 +177,81 @@ class AgentAction:
     tool_calls: list[ToolCall] = field(default_factory=list)
     done: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# ======================================================================
+# Infrastructure types (merged from forge/types.py)
+# ======================================================================
+
+
+@dataclass
+class ProcessConfig:
+    """Configuration for allocating a Monarch ProcMesh."""
+
+    procs: int = 1
+    with_gpus: bool = False
+    hosts: int | None = None
+    mesh_name: str | None = None
+
+
+@dataclass
+class ServiceConfig:
+    """Configuration for a replicated Forge service."""
+
+    procs: int = 1
+    num_replicas: int = 1
+    with_gpus: bool = False
+    hosts: int | None = None
+    health_poll_rate: float = 0.2
+    replica_max_concurrent_requests: int = 10
+    return_first_rank_result: bool = True
+    mesh_name: str | None = None
+
+    def to_process_config(self) -> ProcessConfig:
+        return ProcessConfig(
+            procs=self.procs,
+            with_gpus=self.with_gpus,
+            hosts=self.hosts,
+            mesh_name=self.mesh_name,
+        )
+
+
+class Launcher(Enum):
+    LOCAL = "local"
+    SLURM = "slurm"
+    PREALLOCATED = "preallocated"
+
+
+@dataclass
+class LauncherConfig:
+    """Cluster launcher configuration.
+
+    Modes:
+        - ``local``: All actors on the current machine (default).
+        - ``slurm``: Allocate machines via Slurm.
+        - ``preallocated``: K8s / external scheduler pre-allocated machines.
+    """
+
+    launcher: Launcher = Launcher.LOCAL
+    job_name: str = ""
+    services: dict[str, Any] = field(default_factory=dict)
+    actors: dict[str, Any] = field(default_factory=dict)
+    gpus_per_node: int = 8
+    master_addr: str = ""
+    master_port: int = 0
+    nnodes: int = 1
+    node_rank: int = 0
+
+    def __post_init__(self):
+        if isinstance(self.launcher, str):
+            self.launcher = Launcher(self.launcher)
+
+
+@dataclass
+class ProvisionerConfig:
+    """Configuration for the global resource provisioner."""
+
+    launcher_config: LauncherConfig | None = None
+
+
+Scalar = int | float

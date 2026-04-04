@@ -3,24 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import torch
+
+from forge.observability.metrics import Metric
 
 AggType = Literal["token_mean", "fixed_horizon", "sequence_mean"]
 RatioType = Literal["token", "sequence"]
 KLType = Literal["k1", "k2", "k3"]
 
 CROSS_ENTROPY_IGNORE_IDX = -100
-
-
-@dataclass
-class Metric:
-    """A single metric observation for logging."""
-
-    key: str
-    value: float | torch.Tensor
-    reduction: str = "mean"
 
 
 @dataclass

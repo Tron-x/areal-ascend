@@ -128,7 +128,7 @@ class AReaLConfigBridge:
     @staticmethod
     def resolve_xccl_alloc_mode(config, alloc_mode, train_world_size: int):
         """Resolve XCCL weight-update allocation mode."""
-        from forge.weight_sync import resolve_xccl_alloc_mode
+        from forge.engines.areal.weight_sync import resolve_xccl_alloc_mode
 
         return resolve_xccl_alloc_mode(
             config, alloc_mode, train_world_size=train_world_size
