@@ -13,18 +13,20 @@ connected through a ReplayBuffer, following TorchForge's pattern:
 - ``continuous_training``: polls ReplayBuffer, uses ``BatchAdapter`` to
   convert Episodes to engine-specific format, trains, syncs weights
 
-The ``BatchAdapter`` is the data alignment layer: actors always produce
-framework-agnostic ``Episode`` objects, and the adapter converts them
-to whatever the training engine expects.  Switching to a new engine
-only requires writing a new ``BatchAdapter`` -- no actor changes.
+Two backend paths:
+
+- **TrainEngine** (new): framework-agnostic. Weight sync is handled
+  externally via ``WeightSyncStrategy`` (NCCL/checkpoint/HIXL).
+- **TrainBackend** (legacy/AReaL): weight sync is built into the backend.
 
 Usage::
 
-    # Sync mode (default)
+    # Sync mode with AReaL backend (default)
     python -m forge.apps.agent_rl examples/math/gsm8k_rl.py ...
 
-    # Async pipeline mode
-    FORGE_ASYNC_PIPELINE=1 python -m forge.apps.agent_rl examples/math/gsm8k_rl.py ...
+    # Async pipeline with FSDP backend
+    FORGE_ASYNC_PIPELINE=1 python -m forge.apps.agent_rl examples/math/gsm8k_rl.py \\
+        --backend_type fsdp --model_path Qwen/Qwen2.5-1.5B
 """
 
 from __future__ import annotations
@@ -184,12 +186,21 @@ async def continuous_training(
     shutdown_event: asyncio.Event | None = None,
     poll_interval: float = 0.5,
     batch_adapter=None,
+    weight_sync=None,
+    use_engine: bool = False,
 ):
     """Consume from ReplayBuffer, adapt via BatchAdapter, train, sync weights.
 
     The ``batch_adapter`` converts framework-agnostic ``Episode`` dicts
     from the ReplayBuffer into the engine-specific tensor layout.
     If no adapter is provided, raw dicts are passed through (legacy path).
+
+    Two paths:
+
+    - **TrainEngine** (``use_engine=True``): trains via ``train_on_engine_batch``,
+      weight sync via ``weight_sync.push(version)``.
+    - **TrainBackend** (legacy, ``use_engine=False``): trains via
+      ``train_on_buffered_batch`` with built-in weight sync.
     """
     step = start_step
     shutdown = shutdown_event or asyncio.Event()
@@ -214,10 +225,16 @@ async def continuous_training(
         else:
             batch = sampled[0]
 
-        result_mesh = await trainer.train_on_buffered_batch.call(
-            batch, step, skip_weight_sync=False
-        )
-        _, result = next(iter(result_mesh.items()))
+        if use_engine:
+            result_mesh = await trainer.train_on_engine_batch.call(batch, step)
+            _, result = next(iter(result_mesh.items()))
+            if weight_sync is not None:
+                await weight_sync.push(step + 1)
+        else:
+            result_mesh = await trainer.train_on_buffered_batch.call(
+                batch, step, skip_weight_sync=False
+            )
+            _, result = next(iter(result_mesh.items()))
 
         logger.info(f"[Train] Step {step} complete: {result}")
         step += 1
@@ -242,6 +259,43 @@ async def sync_training_loop(trainer, max_steps: int, start_step: int):
         logger.info(f"[Train] Step {step} complete: {result}")
         step += 1
     return step
+
+
+# ======================================================================
+# Weight sync helper
+# ======================================================================
+
+
+async def _create_weight_sync(forge_cfg, trainer, generator):
+    """Create and initialize a WeightSyncStrategy for TrainEngine backends.
+
+    Reads ``FORGE_WEIGHT_SYNC`` env var (default ``"nccl"``) to select
+    the sync method.  Returns an initialized strategy, or None on failure.
+    """
+    from forge.core.weight_sync import WeightSyncConfig, WeightSyncMethod
+    from forge.engines.weight_sync import create_weight_sync
+
+    method_str = os.environ.get("FORGE_WEIGHT_SYNC", "nccl")
+    method = WeightSyncMethod(method_str)
+
+    config = WeightSyncConfig(
+        method=method,
+        checkpoint_dir=os.path.join(forge_cfg.fileroot, "weight_sync"),
+        master_addr=forge_cfg.master_addr,
+        master_port=forge_cfg.master_port + 100,
+        world_size=forge_cfg.train_world_size + forge_cfg.gen_world_size,
+        rank_offset=forge_cfg.train_world_size,
+        backend="hccl" if os.environ.get("ASCEND_VISIBLE_DEVICES") else "nccl",
+    )
+
+    strategy = create_weight_sync(method_str)
+    try:
+        await strategy.initialize(trainer, generator, config)
+        logger.info(f"Weight sync initialized: method={method_str}")
+    except Exception as e:
+        logger.warning(f"Weight sync initialization failed: {e}. Continuing without sync.")
+        return None
+    return strategy
 
 
 # ======================================================================
@@ -283,8 +337,26 @@ async def agent_rl_main(config=None, run_id: int = 0):
         engine_args=forge_cfg.engine_args,
     )
 
-    reward = await RewardActor.options(procs=1, mesh_name="reward").as_actor()
-    await reward.setup.call(forge_cfg.reward_fn_path)
+    use_rm_gpu = forge_cfg.reward_mode in ("model", "hybrid")
+    reward = await RewardActor.options(
+        procs=1, with_gpus=use_rm_gpu, mesh_name="reward"
+    ).as_actor()
+    if forge_cfg.reward_fn_path:
+        await reward.setup.call(forge_cfg.reward_fn_path)
+    if forge_cfg.reward_model_path:
+        await reward.setup_model.call(
+            model_path=forge_cfg.reward_model_path,
+            device=forge_cfg.reward_model_device,
+            dtype=forge_cfg.reward_model_dtype,
+            max_batch_size=forge_cfg.reward_model_max_batch_size,
+            max_length=forge_cfg.reward_model_max_length,
+        )
+    if forge_cfg.reward_mode != "rule":
+        await reward.set_mode.call(
+            mode=forge_cfg.reward_mode,
+            rule_weight=forge_cfg.reward_rule_weight,
+            model_weight=forge_cfg.reward_model_weight,
+        )
 
     sandbox = await SandboxActor.options(procs=1, mesh_name="sandbox").as_actor()
 
@@ -313,29 +385,40 @@ async def agent_rl_main(config=None, run_id: int = 0):
         logger.info("LLM_SERVER_ONLY mode -- serving only, no training")
         return
 
-    xccl_alloc = bridge.resolve_xccl_alloc_mode(
-        raw_cfg, alloc_mode, train_world_size=forge_cfg.train_world_size
-    )
+    use_engine = forge_cfg.backend_type != "areal"
+    weight_sync = None
 
-    backend = create_engine(
-        backend=forge_cfg.backend_type,
-        cli_args=forge_cfg.training_args,
-        env_vars=forge_cfg.trainer_env,
-        rank=-1,
-        world_size=forge_cfg.train_world_size,
-        master_addr=forge_cfg.master_addr,
-        master_port=forge_cfg.master_port,
-        generator_actor=generator,
-        reward_actor=reward,
-        agent_actor=agent,
-        xccl_weight_update_alloc_mode=xccl_alloc,
-    )
+    if use_engine:
+        engine = create_engine(backend=forge_cfg.backend_type, config={
+            "model_path": forge_cfg.model_path,
+            "max_steps": forge_cfg.backend_config.get("max_steps", 100),
+            **forge_cfg.backend_config,
+        })
+        trainer = await TrainerActor.options(
+            procs=forge_cfg.train_world_size, with_gpus=True, mesh_name="trainer"
+        ).as_actor(engine=engine)
 
-    trainer = await TrainerActor.options(
-        procs=forge_cfg.train_world_size, with_gpus=True, mesh_name="trainer"
-    ).as_actor(
-        backend=backend,
-    )
+        weight_sync = await _create_weight_sync(forge_cfg, trainer, generator)
+    else:
+        xccl_alloc = bridge.resolve_xccl_alloc_mode(
+            raw_cfg, alloc_mode, train_world_size=forge_cfg.train_world_size
+        )
+        backend = create_engine(
+            backend=forge_cfg.backend_type,
+            cli_args=forge_cfg.training_args,
+            env_vars=forge_cfg.trainer_env,
+            rank=-1,
+            world_size=forge_cfg.train_world_size,
+            master_addr=forge_cfg.master_addr,
+            master_port=forge_cfg.master_port,
+            generator_actor=generator,
+            reward_actor=reward,
+            agent_actor=agent,
+            xccl_weight_update_alloc_mode=xccl_alloc,
+        )
+        trainer = await TrainerActor.options(
+            procs=forge_cfg.train_world_size, with_gpus=True, mesh_name="trainer"
+        ).as_actor(backend=backend)
 
     info_mesh = await trainer.initialize.call()
     _, info = next(iter(info_mesh.items()))
@@ -394,6 +477,8 @@ async def agent_rl_main(config=None, run_id: int = 0):
                     start_step=start_step,
                     shutdown_event=shutdown_event,
                     batch_adapter=batch_adapter,
+                    weight_sync=weight_sync,
+                    use_engine=use_engine,
                 )
             )
 

@@ -3,9 +3,10 @@
 This package has ZERO external framework dependencies (no areal, no torch, etc.).
 Only stdlib + typing are allowed here.
 
-Four files:
+Five files:
     - ``types.py``          -- data classes (Episode, TrainBatch, Completion, AgentAction, ...)
     - ``protocols.py``      -- engine + agent protocols (TrainEngine, AgentLogic, ...)
+    - ``weight_sync.py``    -- WeightSyncStrategy protocol + data types
     - ``chat_template.py``  -- ChatTemplate protocol + presets
     - ``config.py``         -- ForgeConfig
 """
@@ -24,6 +25,7 @@ from forge.core.protocols import (
     InferenceEngine,
     RewardBackend,
     RewardFn,
+    RewardModelEngine,
     TrainBackend,
     TrainEngine,
 )
@@ -36,6 +38,12 @@ from forge.core.types import (
     ToolCall,
     ToolResult,
     TrainBatch,
+)
+from forge.core.weight_sync import (
+    WeightSyncConfig,
+    WeightSyncMethod,
+    WeightSyncStrategy,
+    WeightsSpec,
 )
 
 __all__ = [
@@ -54,10 +62,15 @@ __all__ = [
     "LLAMA_STYLE",
     "RewardBackend",
     "RewardFn",
+    "RewardModelEngine",
     "SimpleChatTemplate",
     "ToolCall",
     "ToolResult",
     "TrainBackend",
     "TrainBatch",
     "TrainEngine",
+    "WeightSyncConfig",
+    "WeightSyncMethod",
+    "WeightSyncStrategy",
+    "WeightsSpec",
 ]

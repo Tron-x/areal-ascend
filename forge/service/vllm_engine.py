@@ -82,10 +82,8 @@ class MonarchVLLMEngine:
                     with self._lock:
                         q = self._output_queues.get(output.request_id)
                     if q is not None and self._loop is not None:
-                        asyncio.run_coroutine_threadsafe(
-                            q.put(output), self._loop
-                        )
-            except Exception as e:
+                        asyncio.run_coroutine_threadsafe(q.put(output), self._loop)
+            except Exception:
                 logger.exception("[MonarchVLLMEngine] Error in step loop")
                 time.sleep(0.1)
 
@@ -140,8 +138,10 @@ class MonarchVLLMEngine:
         self._shutdown_flag = True
         if self._step_thread is not None:
             self._step_thread.join(timeout=10)
-        try:
-            self._engine.shutdown()
-        except Exception:
-            logger.exception("[MonarchVLLMEngine] Error during engine shutdown")
+        if hasattr(self._engine, "shutdown"):
+            try:
+                self._engine.shutdown()
+            except Exception:
+                logger.exception("[MonarchVLLMEngine] Error during engine shutdown")
+        del self._engine
         logger.info("[MonarchVLLMEngine] Shutdown complete")

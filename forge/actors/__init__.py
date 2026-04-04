@@ -14,8 +14,8 @@ def __getattr__(name: str):
     _lazy_map = {
         "ForgeActor": "forge.actors.base",
         "AgentActor": "forge.actors.agent",
-        "ComputeAdvantages": "forge.actors.advantages",
         "Generator": "forge.actors.generator",
+        "GroupBuffer": "forge.actors.group_buffer",
         "ReplayBuffer": "forge.actors.replay_buffer",
         "RewardActor": "forge.actors.reward",
         "SandboxActor": "forge.actors.sandbox",
@@ -32,8 +32,8 @@ def __getattr__(name: str):
 __all__ = [
     "ForgeActor",
     "AgentActor",
-    "ComputeAdvantages",
     "Generator",
+    "GroupBuffer",
     "ReplayBuffer",
     "RewardActor",
     "SandboxActor",

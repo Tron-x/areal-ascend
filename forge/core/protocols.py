@@ -16,7 +16,10 @@ All protocols use ``typing.Protocol`` with ``@runtime_checkable``.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from forge.core.weight_sync import WeightsSpec
 
 # ======================================================================
 # New clean protocols (framework-agnostic)
@@ -25,28 +28,84 @@ from typing import Any, Protocol, runtime_checkable
 
 @runtime_checkable
 class TrainEngine(Protocol):
-    """Pluggable training engine for policy optimization.
+    """Framework-agnostic training engine for policy optimization.
 
-    Implementations wrap a concrete training framework (TorchTitan,
-    AReaL/FSDPEngine, Megatron, etc.) and expose a uniform interface.
+    Implementations wrap a concrete training framework (FSDP2, Megatron,
+    AReaL PPOTrainer, etc.) and expose a uniform interface that the
+    orchestration layer (``TrainerActor``, ``apps/``) can drive without
+    knowledge of the underlying framework.
 
-    Used by ``TrainerActor`` and the orchestration layer in ``apps/``.
+    Key design decisions:
+
+    - ``train_step(batch, step)`` receives an **externally-provided** batch,
+      decoupling data production from training.
+    - ``get_weights_spec()`` + ``state_dict_for_sync()`` separate weight
+      *description* from weight *data*, letting ``WeightSyncStrategy``
+      decide how to transfer weights.
+    - Weight pushing and rollout are **not** part of this protocol --
+      they belong to the orchestration layer.
+
+    Lifecycle::
+
+        engine = FSDPTrainEngine(config)
+        meta = engine.initialize()        # load model, optimizer, scheduler
+        for step in range(meta["max_steps"]):
+            result = engine.train_step(batch, step)
+            # Orchestrator handles weight sync separately
+        engine.shutdown()
     """
 
     def initialize(self) -> dict:
-        """Initialize the engine. Returns metadata (max_steps, start_step, ...)."""
+        """Load model, optimizer, and scheduler.
+
+        Returns:
+            Metadata dict with at least:
+            ``{"max_steps": int, "start_step": int, "model_path": str}``.
+        """
         ...
 
-    def train_step(self, batch: Any, step: int) -> dict:
-        """Run one training step on the given batch. Returns result dict."""
+    def train_step(self, batch: dict, step: int) -> dict:
+        """Run one optimization step on an externally-provided batch.
+
+        Args:
+            batch: Engine-specific tensor dict produced by a ``BatchAdapter``.
+            step: Global training step number.
+
+        Returns:
+            Result dict with at least ``{"loss": float}``.
+            May also include ``"grad_norm"``, ``"lr"``, etc.
+        """
         ...
 
-    def push_weights(self, version: int) -> None:
-        """Make updated weights available for inference engines to pull."""
+    def get_weights_spec(self) -> WeightsSpec:
+        """Describe the current model parameters for weight sync.
+
+        Returns a ``WeightsSpec`` containing parameter names, shapes,
+        dtypes, and optional sharding metadata -- everything a
+        ``WeightSyncStrategy`` needs to set up a transfer channel.
+        """
+        ...
+
+    def state_dict_for_sync(self) -> dict:
+        """Return a state dict (or shard) for weight sync to inference.
+
+        The returned dict maps parameter names to tensors. For sharded
+        models (FSDP, Megatron), this may return only the local shard;
+        the ``WeightSyncStrategy`` handles reassembly.
+        """
+        ...
+
+    def get_metadata(self) -> dict:
+        """Return engine metadata.
+
+        Returns:
+            Dict with ``"max_steps"``, ``"current_step"``,
+            ``"model_path"``, and any engine-specific info.
+        """
         ...
 
     def shutdown(self) -> None:
-        """Release resources."""
+        """Release resources (model, optimizer, CUDA memory)."""
         ...
 
 
@@ -83,6 +142,45 @@ class RewardFn(Protocol):
         self, prompt: str, response: str, target: Any = None, **kwargs: Any
     ) -> float:
         """Compute scalar reward for a prompt-response pair."""
+        ...
+
+
+@runtime_checkable
+class RewardModelEngine(Protocol):
+    """Pluggable neural reward model for scoring (prompt, response) pairs.
+
+    Unlike ``RewardFn`` (a stateless callable), a ``RewardModelEngine``
+    manages a loaded model with GPU memory, batched inference, and
+    optional weight updates.
+
+    Lifecycle::
+
+        engine = HFRewardModelEngine(model_path="...")
+        engine.load()                          # load checkpoint to GPU
+        scores = engine.score_batch([...])     # batched inference
+        engine.shutdown()                      # free GPU memory
+
+    Implementations live in ``forge/engines/<backend>/reward_model.py``.
+    """
+
+    def load(self) -> dict:
+        """Load model checkpoint and move to device. Returns metadata."""
+        ...
+
+    def score(self, prompt: str, response: str) -> float:
+        """Score a single (prompt, response) pair. Returns scalar reward."""
+        ...
+
+    def score_batch(self, items: list[dict[str, str]]) -> list[float]:
+        """Score a batch of (prompt, response) pairs.
+
+        Each item dict must contain ``"prompt"`` and ``"response"`` keys.
+        Returns list of scalar rewards.
+        """
+        ...
+
+    def shutdown(self) -> None:
+        """Free model and GPU memory."""
         ...
 
 

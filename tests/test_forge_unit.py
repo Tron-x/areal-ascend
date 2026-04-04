@@ -1540,3 +1540,550 @@ class TestCompositeReward:
             weights={"correctness": 2.0, "speed": 0.5},
         )
         assert abs(r - 2.25) < 1e-6
+
+
+# ======================================================================
+# RL advantage computation
+# ======================================================================
+
+
+class TestAdvantageComputation:
+    def test_grpo_basic(self):
+        from forge.core.types import Episode
+        from forge.rl.advantage import compute_advantages_grpo
+
+        group = [Episode(reward=1.0), Episode(reward=3.0), Episode(reward=2.0)]
+        advs = compute_advantages_grpo(group)
+        assert len(advs) == 3
+        assert abs(advs[0] - (-1.0)) < 1e-6
+        assert abs(advs[1] - 1.0) < 1e-6
+        assert abs(advs[2] - 0.0) < 1e-6
+
+    def test_grpo_single_episode(self):
+        from forge.core.types import Episode
+        from forge.rl.advantage import compute_advantages_grpo
+
+        advs = compute_advantages_grpo([Episode(reward=5.0)])
+        assert advs == [0.0]
+
+    def test_grpo_empty(self):
+        from forge.rl.advantage import compute_advantages_grpo
+
+        assert compute_advantages_grpo([]) == []
+
+    def test_grpo_normalized_basic(self):
+        from forge.core.types import Episode
+        from forge.rl.advantage import compute_advantages_grpo_normalized
+
+        group = [Episode(reward=1.0), Episode(reward=3.0)]
+        advs = compute_advantages_grpo_normalized(group)
+        assert len(advs) == 2
+        assert advs[0] < 0
+        assert advs[1] > 0
+        assert abs(advs[0] + advs[1]) < 1e-4
+
+    def test_grpo_normalized_identical_rewards(self):
+        from forge.core.types import Episode
+        from forge.rl.advantage import compute_advantages_grpo_normalized
+
+        group = [Episode(reward=2.0)] * 3
+        advs = compute_advantages_grpo_normalized(group)
+        for a in advs:
+            assert abs(a) < 1e-2
+
+    def test_grpo_normalized_empty(self):
+        from forge.rl.advantage import compute_advantages_grpo_normalized
+
+        assert compute_advantages_grpo_normalized([]) == []
+
+
+# ======================================================================
+# RL collation
+# ======================================================================
+
+
+class TestCollateEpisodes:
+    def test_single_group(self):
+        from forge.core.types import Episode
+        from forge.rl.collate import collate_episodes
+
+        episodes = [
+            Episode(
+                token_ids=[1, 2, 3],
+                generator_logprobs=[-0.1, -0.2, -0.3],
+                loss_mask=[1, 1, 0],
+                reward=1.0,
+            ),
+            Episode(
+                token_ids=[4, 5],
+                generator_logprobs=[-0.4, -0.5],
+                loss_mask=[1, 1],
+                reward=0.5,
+            ),
+        ]
+        batches = collate_episodes([episodes])
+        assert len(batches) == 1
+        batch = batches[0]
+        assert batch.model_inputs["input_ids"][0] == [1, 2, 3]
+        assert batch.model_inputs["input_ids"][1] == [4, 5, 0]
+        assert batch.loss_inputs["loss_mask"][1] == [1, 1, 0]
+
+    def test_multiple_groups(self):
+        from forge.core.types import Episode
+        from forge.rl.collate import collate_episodes
+
+        g1 = [Episode(token_ids=[1, 2], generator_logprobs=[-0.1, -0.2], reward=1.0)]
+        g2 = [Episode(token_ids=[3], generator_logprobs=[-0.3], reward=0.5)]
+        batches = collate_episodes([g1, g2])
+        assert len(batches) == 2
+
+    def test_empty_groups_skipped(self):
+        from forge.core.types import Episode
+        from forge.rl.collate import collate_episodes
+
+        g = [Episode(token_ids=[1], generator_logprobs=[-0.1], reward=1.0)]
+        batches = collate_episodes([[], g, []])
+        assert len(batches) == 1
+
+    def test_ref_logprobs_included_when_present(self):
+        from forge.core.types import Episode
+        from forge.rl.collate import collate_episodes
+
+        episodes = [
+            Episode(
+                token_ids=[1, 2],
+                generator_logprobs=[-0.1, -0.2],
+                ref_logprobs=[-0.3, -0.4],
+                reward=1.0,
+            ),
+        ]
+        batches = collate_episodes([episodes])
+        assert "ref_logprobs" in batches[0].loss_inputs
+
+    def test_ref_logprobs_omitted_when_partial(self):
+        from forge.core.types import Episode
+        from forge.rl.collate import collate_episodes
+
+        episodes = [
+            Episode(
+                token_ids=[1, 2],
+                generator_logprobs=[-0.1, -0.2],
+                ref_logprobs=[-0.3, -0.4],
+                reward=1.0,
+            ),
+            Episode(
+                token_ids=[3, 4],
+                generator_logprobs=[-0.5, -0.6],
+                reward=0.5,
+            ),
+        ]
+        batches = collate_episodes([episodes])
+        assert "ref_logprobs" not in batches[0].loss_inputs
+
+    def test_advantage_broadcast(self):
+        from forge.core.types import Episode
+        from forge.rl.collate import collate_episodes
+
+        ep = Episode(
+            token_ids=[1, 2, 3],
+            generator_logprobs=[-0.1, -0.2, -0.3],
+            advantage=0.5,
+            reward=1.0,
+        )
+        batches = collate_episodes([[ep]])
+        assert batches[0].loss_inputs["advantages"][0] == [0.5, 0.5, 0.5]
+
+
+# ======================================================================
+# Config utilities
+# ======================================================================
+
+
+class TestConfigUtils:
+    def test_apply_overrides_basic(self):
+        from forge.utils.config import apply_overrides
+
+        cfg = {"a": 1, "b": "hello"}
+        result = apply_overrides(cfg, ["a=10", "b=world"])
+        assert result["a"] == 10
+        assert result["b"] == "world"
+
+    def test_apply_overrides_nested(self):
+        from forge.utils.config import apply_overrides
+
+        cfg = {"model": {"name": "gpt2"}}
+        result = apply_overrides(cfg, ["model.name=llama", "model.size=7b"])
+        assert result["model"]["name"] == "llama"
+        assert result["model"]["size"] == "7b"
+
+    def test_apply_overrides_delete(self):
+        from forge.utils.config import apply_overrides
+
+        cfg = {"keep": 1, "drop": 2}
+        result = apply_overrides(cfg, ["~drop"])
+        assert "drop" not in result
+        assert result["keep"] == 1
+
+    def test_coerce_types(self):
+        from forge.utils.config import _coerce_value
+
+        assert _coerce_value("42") == 42
+        assert _coerce_value("3.14") == 3.14
+        assert _coerce_value("true") is True
+        assert _coerce_value("false") is False
+        assert _coerce_value("null") is None
+        assert _coerce_value("none") is None
+        assert _coerce_value("hello") == "hello"
+        assert _coerce_value("[1,2,3]") == [1, 2, 3]
+        assert _coerce_value('{"a": 1}') == {"a": 1}
+
+    def test_dict_to_dataclass(self):
+        from dataclasses import dataclass
+
+        from forge.utils.config import dict_to_dataclass
+
+        @dataclass
+        class Cfg:
+            x: int = 0
+            y: str = ""
+
+        obj = dict_to_dataclass({"x": 5, "y": "hi", "extra": True}, Cfg)
+        assert obj.x == 5
+        assert obj.y == "hi"
+        assert not hasattr(obj, "extra")
+
+    def test_load_config_empty(self):
+        from forge.utils.config import load_config
+
+        cfg = load_config()
+        assert cfg == {}
+
+    def test_load_config_with_overrides_only(self):
+        from forge.utils.config import load_config
+
+        cfg = load_config(overrides=["lr=0.001", "batch_size=32"])
+        assert cfg["lr"] == 0.001
+        assert cfg["batch_size"] == 32
+
+
+# ======================================================================
+# RewardModelEngine protocol
+# ======================================================================
+
+
+class TestRewardModelEngineProtocol:
+    def test_protocol_structural(self):
+        from forge.core.protocols import RewardModelEngine
+
+        class MockRM:
+            def load(self):
+                return {"status": "ready"}
+
+            def score(self, prompt, response):
+                return 0.5
+
+            def score_batch(self, items):
+                return [0.5] * len(items)
+
+            def shutdown(self):
+                pass
+
+        rm = MockRM()
+        assert isinstance(rm, RewardModelEngine)
+
+    def test_protocol_missing_method(self):
+        from forge.core.protocols import RewardModelEngine
+
+        class Incomplete:
+            def score(self, prompt, response):
+                return 0.0
+
+        assert not isinstance(Incomplete(), RewardModelEngine)
+
+
+# ======================================================================
+# HFRewardModelEngine (mock-based, no real model needed)
+# ======================================================================
+
+
+class TestHFRewardModelEngine:
+    def test_init_defaults(self):
+        from forge.engines.reward_model import HFRewardModelEngine
+
+        engine = HFRewardModelEngine(model_path="test/model")
+        assert engine.model_path == "test/model"
+        assert engine.device == "auto"
+        assert engine.max_batch_size == 16
+        assert engine.max_length == 2048
+        assert engine._model is None
+
+    def test_score_batch_not_loaded_raises(self):
+        from forge.engines.reward_model import HFRewardModelEngine
+
+        engine = HFRewardModelEngine(model_path="test/model")
+        try:
+            engine.score_batch([{"prompt": "hi", "response": "hello"}])
+            assert False, "Should have raised RuntimeError"
+        except RuntimeError as e:
+            assert "not loaded" in str(e).lower()
+
+    def test_score_batch_empty(self):
+        from forge.engines.reward_model import HFRewardModelEngine
+
+        engine = HFRewardModelEngine(model_path="test/model")
+        engine._model = True  # bypass load check
+        assert engine.score_batch([]) == []
+        engine._model = None
+
+    def test_format_input_simple(self):
+        from forge.engines.reward_model import HFRewardModelEngine
+
+        engine = HFRewardModelEngine(model_path="test/model")
+        engine._tokenizer = None
+        result = engine._format_input("What is 2+2?", "4")
+        assert "What is 2+2?" in result
+        assert "4" in result
+
+    def test_format_input_custom_template(self):
+        from forge.engines.reward_model import HFRewardModelEngine
+
+        engine = HFRewardModelEngine(
+            model_path="test/model",
+            chat_template="Q: {prompt}\nA: {response}",
+        )
+        result = engine._format_input("hello", "world")
+        assert result == "Q: hello\nA: world"
+
+    def test_shutdown_safe_without_load(self):
+        from forge.engines.reward_model import HFRewardModelEngine
+
+        engine = HFRewardModelEngine(model_path="test/model")
+        engine.shutdown()
+        assert engine._model is None
+        assert engine._tokenizer is None
+
+    def test_get_stats_empty(self):
+        from forge.engines.reward_model import HFRewardModelEngine
+
+        engine = HFRewardModelEngine(model_path="test/model")
+        stats = engine.get_stats()
+        assert stats["call_count"] == 0
+        assert stats["model_path"] == "test/model"
+
+
+# ======================================================================
+# RewardActor (mock-based, no Monarch RPC needed)
+# ======================================================================
+
+
+def _make_reward_actor(**kwargs):
+    """Create a RewardActor without Monarch scaffolding."""
+    from forge.actors.reward import RewardActor
+
+    actor = object.__new__(RewardActor)
+    actor._backend = kwargs.get("backend")
+    actor._model_engine = kwargs.get("model_engine")
+    actor._mode = kwargs.get("mode", "rule")
+    actor._rule_weight = kwargs.get("rule_weight", 1.0)
+    actor._model_weight = kwargs.get("model_weight", 0.0)
+    return actor
+
+
+class _MockRuleBackend:
+    """Mock RewardBackend for tests."""
+
+    def __init__(self, fixed_score=0.5):
+        self._score = fixed_score
+        self._setup_called = False
+
+    def setup(self, reward_fn_path=""):
+        self._setup_called = True
+        return {"status": "ready", "reward_fn": reward_fn_path}
+
+    def compute_reward(self, prompt="", completion="", **kwargs):
+        return self._score
+
+    def compute_rewards_batch(self, items):
+        return [self._score] * len(items)
+
+    def get_stats(self):
+        return {"call_count": 0, "reward_fn": "mock"}
+
+
+class _MockModelEngine:
+    """Mock RewardModelEngine for tests."""
+
+    def __init__(self, fixed_score=0.8):
+        self._score = fixed_score
+
+    def load(self):
+        return {"status": "ready"}
+
+    def score(self, prompt, response):
+        return self._score
+
+    def score_batch(self, items):
+        return [self._score] * len(items)
+
+    def get_stats(self):
+        return {"call_count": 0, "model_path": "mock"}
+
+    def shutdown(self):
+        pass
+
+
+class TestRewardActorModes:
+    def test_rule_mode_default(self):
+        backend = _MockRuleBackend(fixed_score=1.0)
+        actor = _make_reward_actor(backend=backend)
+        score = actor.compute_reward(prompt="hi", completion="hello")
+        assert score == 1.0
+
+    def test_model_mode(self):
+        engine = _MockModelEngine(fixed_score=0.9)
+        actor = _make_reward_actor(model_engine=engine, mode="model", model_weight=1.0)
+        score = actor.compute_reward(prompt="hi", completion="hello")
+        assert abs(score - 0.9) < 1e-6
+
+    def test_hybrid_mode(self):
+        backend = _MockRuleBackend(fixed_score=1.0)
+        engine = _MockModelEngine(fixed_score=0.0)
+        actor = _make_reward_actor(
+            backend=backend,
+            model_engine=engine,
+            mode="hybrid",
+            rule_weight=0.6,
+            model_weight=0.4,
+        )
+        score = actor.compute_reward(prompt="hi", completion="hello")
+        expected = 0.6 * 1.0 + 0.4 * 0.0
+        assert abs(score - expected) < 1e-6
+
+    def test_batch_rule_mode(self):
+        backend = _MockRuleBackend(fixed_score=0.5)
+        actor = _make_reward_actor(backend=backend)
+        items = [{"prompt": "a", "completion": "b"}] * 3
+        scores = actor.compute_rewards_batch(items)
+        assert len(scores) == 3
+        assert all(abs(s - 0.5) < 1e-6 for s in scores)
+
+    def test_batch_model_mode(self):
+        engine = _MockModelEngine(fixed_score=0.7)
+        actor = _make_reward_actor(model_engine=engine, mode="model")
+        items = [{"prompt": "a", "completion": "b"}] * 4
+        scores = actor.compute_rewards_batch(items)
+        assert len(scores) == 4
+        assert all(abs(s - 0.7) < 1e-6 for s in scores)
+
+    def test_batch_hybrid_mode(self):
+        backend = _MockRuleBackend(fixed_score=1.0)
+        engine = _MockModelEngine(fixed_score=0.5)
+        actor = _make_reward_actor(
+            backend=backend,
+            model_engine=engine,
+            mode="hybrid",
+            rule_weight=0.3,
+            model_weight=0.7,
+        )
+        items = [{"prompt": "a", "completion": "b"}] * 2
+        scores = actor.compute_rewards_batch(items)
+        expected = 0.3 * 1.0 + 0.7 * 0.5
+        assert all(abs(s - expected) < 1e-6 for s in scores)
+
+    def test_set_mode_validates(self):
+        actor = _make_reward_actor()
+        try:
+            actor.set_mode(mode="invalid")
+            assert False, "Should raise ValueError"
+        except ValueError:
+            pass
+
+    def test_set_mode_requires_model(self):
+        actor = _make_reward_actor()
+        try:
+            actor.set_mode(mode="model")
+            assert False, "Should raise RuntimeError"
+        except RuntimeError:
+            pass
+
+    def test_get_mode(self):
+        actor = _make_reward_actor(mode="hybrid", rule_weight=0.4, model_weight=0.6)
+        info = actor.get_mode()
+        assert info["mode"] == "hybrid"
+        assert info["rule_weight"] == 0.4
+        assert info["model_weight"] == 0.6
+
+    def test_get_stats_combined(self):
+        backend = _MockRuleBackend()
+        engine = _MockModelEngine()
+        actor = _make_reward_actor(backend=backend, model_engine=engine, mode="hybrid")
+        stats = actor.get_stats()
+        assert stats["mode"] == "hybrid"
+        assert "rule" in stats
+        assert "model" in stats
+
+    def test_shutdown_model(self):
+        engine = _MockModelEngine()
+        actor = _make_reward_actor(model_engine=engine, mode="model", model_weight=1.0)
+        actor.shutdown_model()
+        assert actor._model_engine is None
+        assert actor._mode == "rule"
+
+    def test_score_model_direct(self):
+        engine = _MockModelEngine(fixed_score=0.99)
+        actor = _make_reward_actor(model_engine=engine, mode="rule")
+        score = actor.score_model(prompt="hi", response="hello")
+        assert abs(score - 0.99) < 1e-6
+
+    def test_score_model_batch_direct(self):
+        engine = _MockModelEngine(fixed_score=0.88)
+        actor = _make_reward_actor(model_engine=engine)
+        scores = actor.score_model_batch([{"prompt": "a", "response": "b"}] * 3)
+        assert len(scores) == 3
+        assert all(abs(s - 0.88) < 1e-6 for s in scores)
+
+
+# ======================================================================
+# ForgeConfig reward fields
+# ======================================================================
+
+
+class TestForgeConfigReward:
+    def test_default_reward_config(self):
+        from forge.core.config import ForgeConfig
+
+        cfg = ForgeConfig()
+        assert cfg.reward_mode == "rule"
+        assert cfg.reward_model_path == ""
+        assert cfg.reward_rule_weight == 1.0
+        assert cfg.reward_model_weight == 0.0
+
+    def test_hybrid_reward_config(self):
+        from forge.core.config import ForgeConfig
+
+        cfg = ForgeConfig(
+            reward_fn_path="my.reward.fn",
+            reward_model_path="Skywork/Skywork-Reward-8B",
+            reward_mode="hybrid",
+            reward_rule_weight=0.4,
+            reward_model_weight=0.6,
+        )
+        assert cfg.reward_mode == "hybrid"
+        assert cfg.reward_model_path == "Skywork/Skywork-Reward-8B"
+        assert cfg.reward_rule_weight == 0.4
+        assert cfg.reward_model_weight == 0.6
+
+    def test_model_only_config(self):
+        from forge.core.config import ForgeConfig
+
+        cfg = ForgeConfig(
+            reward_model_path="OpenAssistant/reward-model-deberta",
+            reward_mode="model",
+            reward_model_device="cuda:0",
+            reward_model_dtype="float16",
+            reward_model_max_batch_size=32,
+        )
+        assert cfg.reward_mode == "model"
+        assert cfg.reward_model_device == "cuda:0"
+        assert cfg.reward_model_dtype == "float16"
+        assert cfg.reward_model_max_batch_size == 32

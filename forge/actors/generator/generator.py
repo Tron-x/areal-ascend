@@ -267,29 +267,86 @@ class Generator(ForgeActor):
         return {"model": model_path, "chat_template": template_str}
 
     @endpoint
+    async def update_weights_sync(
+        self, version: int, method: str = "nccl", payload: dict | None = None
+    ) -> dict:
+        """Unified weight update endpoint called by WeightSyncStrategy.
+
+        Dispatches to the appropriate internal method based on ``method``.
+
+        Args:
+            version: Policy version after this update.
+            method: One of ``"nccl"``, ``"checkpoint"``, ``"hixl"``.
+            payload: Extra parameters (e.g. ``model_path`` for checkpoint).
+
+        Returns:
+            Status dict with ``success`` and ``message``.
+        """
+        payload = payload or {}
+
+        if method == "nccl":
+            result = await self._update_weights_xccl()
+        elif method == "checkpoint":
+            if "model_path" not in payload:
+                return {"success": False, "message": "model_path required for checkpoint sync"}
+            result = await self._update_weights_disk(payload)
+        elif method == "hixl":
+            result = await self._update_weights_hixl(payload)
+        else:
+            return {"success": False, "message": f"Unknown sync method: {method}"}
+
+        if result.get("success"):
+            self.generator_version = version
+        return {**result, "version": version}
+
+    async def _update_weights_hixl(self, payload: dict) -> dict:
+        """HIXL one-sided weight update (stub for future implementation)."""
+        self._inproc_engine.pause_generation()
+        try:
+            result = await self._collective_rpc("update_weight_hixl", payload)
+        except Exception as e:
+            self._inproc_engine.resume_generation()
+            return {"success": False, "message": f"HIXL update failed: {e}"}
+        self._inproc_engine.resume_generation()
+        return result
+
+    @endpoint
     async def handle_request(self, ep: str, payload: dict) -> dict:
         """Dispatch a request based on the endpoint path.
 
         Compatible with MonarchVLLMEngine's RPC interface.
+        Supports both new ``/forge/*`` routes and legacy ``/areal_*`` aliases.
         """
-        if ep in ("/v1/completions", "/v1/chat/completions"):
-            return await self._generate_completion(payload)
-        if ep == "/areal_pause_generation":
-            return await self._pause_generation()
-        if ep == "/areal_continue_generation":
-            return await self._continue_generation()
-        if ep == "/areal_init_weights_update_group":
-            return await self._init_weights_update_group(payload)
-        if ep == "/areal_set_update_weight_meta":
-            return await self._set_weight_meta(payload)
-        if ep == "/areal_set_update_weight_meta_lora":
-            return await self._set_weight_meta_lora(payload)
-        if ep == "/areal_update_weights_xccl":
-            return await self._update_weights_xccl()
-        if ep == "/areal_update_weights_lora_xccl":
-            return await self._update_weights_lora_xccl()
-        if ep == "/areal_update_weights":
-            return await self._update_weights_disk(payload)
+        _route_map = {
+            "/v1/completions": self._generate_completion,
+            "/v1/chat/completions": self._generate_completion,
+            "/forge/generation/pause": self._pause_generation,
+            "/forge/generation/resume": self._continue_generation,
+            "/forge/weights/init_group": self._init_weights_update_group,
+            "/forge/weights/set_meta": self._set_weight_meta,
+            "/forge/weights/set_meta_lora": self._set_weight_meta_lora,
+            "/forge/weights/update_nccl": self._update_weights_xccl,
+            "/forge/weights/update_nccl_lora": self._update_weights_lora_xccl,
+            "/forge/weights/update_checkpoint": self._update_weights_disk,
+            # Legacy aliases (backward compat)
+            "/areal_pause_generation": self._pause_generation,
+            "/areal_continue_generation": self._continue_generation,
+            "/areal_init_weights_update_group": self._init_weights_update_group,
+            "/areal_set_update_weight_meta": self._set_weight_meta,
+            "/areal_set_update_weight_meta_lora": self._set_weight_meta_lora,
+            "/areal_update_weights_xccl": self._update_weights_xccl,
+            "/areal_update_weights_lora_xccl": self._update_weights_lora_xccl,
+            "/areal_update_weights": self._update_weights_disk,
+        }
+
+        handler = _route_map.get(ep)
+        if handler is not None:
+            if ep in ("/forge/weights/update_nccl", "/areal_update_weights_xccl",
+                       "/forge/weights/update_nccl_lora", "/areal_update_weights_lora_xccl",
+                       "/forge/generation/pause", "/areal_pause_generation",
+                       "/forge/generation/resume", "/areal_continue_generation"):
+                return await handler()
+            return await handler(payload)
         if ep == "/health":
             return {"status": "ok"}
         raise ValueError(f"Unknown endpoint: {ep}")

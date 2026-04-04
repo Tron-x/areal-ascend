@@ -29,7 +29,9 @@ def find_free_port(low: int = 10000, high: int = 50000) -> int:
     raise RuntimeError(f"Could not find a free port in range [{low}, {high}]")
 
 
-def find_free_ports(count: int, port_range: tuple[int, int] = (10000, 50000)) -> list[int]:
+def find_free_ports(
+    count: int, port_range: tuple[int, int] = (10000, 50000)
+) -> list[int]:
     """Find ``count`` free TCP ports."""
     ports = []
     for _ in range(count):

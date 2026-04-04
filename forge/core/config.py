@@ -28,7 +28,16 @@ class ForgeConfig:
         master_addr: Distributed master address.
         master_port: Distributed master port.
 
-        reward_fn_path: Dotted import path for the reward function.
+        reward_fn_path: Dotted import path for the rule-based reward function.
+        reward_model_path: HuggingFace model ID or path for neural reward model.
+        reward_mode: ``"rule"`` (default), ``"model"``, or ``"hybrid"``.
+        reward_model_device: Device for the RM (``"auto"``, ``"cuda:0"``, ...).
+        reward_model_dtype: RM dtype (``"bfloat16"``, ``"float16"``).
+        reward_model_max_batch_size: Max items per RM forward pass.
+        reward_model_max_length: Max token length for RM input.
+        reward_rule_weight: Weight for rule-based score in hybrid mode.
+        reward_model_weight: Weight for model-based score in hybrid mode.
+
         training_script: Path to the training script to execute.
         training_args: CLI args for the training script.
 
@@ -62,6 +71,15 @@ class ForgeConfig:
     master_port: int = 0
 
     reward_fn_path: str = ""
+    reward_model_path: str = ""
+    reward_mode: str = "rule"
+    reward_model_device: str = "auto"
+    reward_model_dtype: str = "bfloat16"
+    reward_model_max_batch_size: int = 16
+    reward_model_max_length: int = 2048
+    reward_rule_weight: float = 1.0
+    reward_model_weight: float = 0.0
+
     training_script: str = ""
     training_args: list[str] = field(default_factory=list)
 

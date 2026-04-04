@@ -11,13 +11,14 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-from areal.api.alloc_mode import AllocationMode, ParallelStrategy
 from forge.adapters.areal.weight_sync import (
     build_monarch_xccl_weight_update_alloc_mode_from_vllm_runtime,
     monarch_xccl_weight_update_alloc_mode_flat,
     optional_flat_inference_xccl_from_env,
     resolve_xccl_alloc_mode,
 )
+
+from areal.api.alloc_mode import AllocationMode, ParallelStrategy
 
 
 class TestMonarchWeightSync(unittest.TestCase):

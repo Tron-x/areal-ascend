@@ -5,9 +5,10 @@ Each sub-package implements the ``TrainEngine`` / ``InferenceEngine`` /
 training framework.
 
 Available engines:
-    - ``areal``: AReaL (PPOTrainer + FSDPEngine + vLLM)
+    - ``areal``: AReaL (PPOTrainer + FSDPEngine + vLLM) — legacy ``TrainBackend``
+    - ``fsdp``: Native PyTorch FSDP2 — new ``TrainEngine`` protocol
+    - (future) ``megatron``: Megatron-LM
     - (future) ``slime``: Slime (Megatron + SGLang)
-    - (future) ``torchtitan``: TorchTitan + vLLM
 
 Use ``create_engine()`` to instantiate an engine by name.
 """
@@ -21,11 +22,11 @@ def create_engine(backend: str = "areal", **kwargs: Any):
     """Factory function to create a training engine by name.
 
     Args:
-        backend: Engine backend name (``"areal"``, ``"slime"``, etc.).
+        backend: Engine backend name (``"areal"``, ``"fsdp"``, etc.).
         **kwargs: Backend-specific configuration.
 
     Returns:
-        An object implementing ``TrainBackend`` (or ``TrainEngine``).
+        ``TrainBackend`` for ``"areal"`` (legacy), ``TrainEngine`` for others.
 
     Raises:
         ValueError: If the backend is not recognized.
@@ -34,9 +35,13 @@ def create_engine(backend: str = "areal", **kwargs: Any):
         from forge.engines.areal import AReaLTrainBackend
 
         return AReaLTrainBackend(**kwargs)
+    if backend == "fsdp":
+        from forge.engines.fsdp.train_engine import FSDPTrainEngine
+
+        return FSDPTrainEngine(**kwargs)
     raise ValueError(
         f"Unknown engine backend: {backend!r}. "
-        f"Available: 'areal'. "
+        f"Available: 'areal', 'fsdp'. "
         f"Contribute new engines in forge/engines/<name>/."
     )
 
@@ -55,9 +60,13 @@ def create_batch_adapter(backend: str = "areal", **kwargs):
         from forge.engines.areal.batch_adapter import AReaLBatchAdapter
 
         return AReaLBatchAdapter(**kwargs)
+    if backend == "fsdp":
+        from forge.engines.fsdp.batch_adapter import FSDPBatchAdapter
+
+        return FSDPBatchAdapter(**kwargs)
     raise ValueError(
         f"Unknown batch adapter: {backend!r}. "
-        f"Available: 'areal'. "
+        f"Available: 'areal', 'fsdp'. "
         f"Contribute new adapters in forge/engines/<name>/batch_adapter.py."
     )
 

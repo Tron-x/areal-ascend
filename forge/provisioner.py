@@ -552,11 +552,14 @@ class Provisioner:
 
         for actor in reversed(self._registered_actors):
             try:
-                actor_cls = getattr(actor, "_class", None) or actor.__class__
-                if hasattr(actor_cls, "shutdown"):
-                    await actor_cls.shutdown(actor)
+                if hasattr(actor, "shutdown") and hasattr(actor.shutdown, "call"):
+                    await actor.shutdown.call()
+                elif hasattr(actor, "stop"):
+                    await actor.stop()
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
-                logger.warning(f"Failed to shut down actor: {e}")
+                logger.debug(f"Actor shutdown (non-fatal): {e}")
 
         self._registered_actors.clear()
         self._registered_services.clear()

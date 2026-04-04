@@ -27,8 +27,10 @@ def _patch_math_verify_for_threads():
 
     def _thread_safe_timeout(timeout_seconds=10):
         if threading.current_thread() is not threading.main_thread():
+
             def no_timeout_decorator(func):
                 return func
+
             return no_timeout_decorator
         return _original_timeout(timeout_seconds)
 
