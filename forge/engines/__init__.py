@@ -39,6 +39,10 @@ def create_engine(backend: str = "areal", **kwargs: Any):
         from forge.engines.fsdp.train_engine import FSDPTrainEngine
 
         return FSDPTrainEngine(**kwargs)
+    if backend == "titan":
+        from forge.engines.titan.adapter import TitanTrainEngine
+
+        return TitanTrainEngine(**kwargs)
     raise ValueError(
         f"Unknown engine backend: {backend!r}. "
         f"Available: 'areal', 'fsdp'. "
@@ -84,4 +88,8 @@ def create_config_bridge(backend: str = "areal"):
         from forge.engines.areal import AReaLConfigBridge
 
         return AReaLConfigBridge()
+    if backend in ("fsdp", "titan"):
+        from forge.engines.fsdp.config_bridge import FSDPConfigBridge
+
+        return FSDPConfigBridge()
     raise ValueError(f"Unknown config bridge: {backend!r}")

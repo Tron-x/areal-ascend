@@ -5,7 +5,13 @@ plugged into ``AgentActor`` for different agentic RL strategies.
 """
 
 from forge.agents.external import ExternalAgentRunner
+from forge.agents.harbor import HarborAgentLogic
 from forge.agents.react import SimpleReActAgent
 from forge.agents.retool import ReToolAgent
 
-__all__ = ["ExternalAgentRunner", "ReToolAgent", "SimpleReActAgent"]
+__all__ = [
+    "ExternalAgentRunner",
+    "HarborAgentLogic",
+    "ReToolAgent",
+    "SimpleReActAgent",
+]

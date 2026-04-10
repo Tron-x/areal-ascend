@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Forge — 4-card inference + 4-card training (GSM8K GRPO on NPU)
+# Forge + Harbor -- Agentic RL with Harbor workflows on NPU
 #
-# Uses NPU 0-3 for vLLM inference (DP=4), NPU 4-7 for FSDP training (DP=4).
-# Total: 8 NPUs.
+# Bridges Harbor's rllm agent layer (Workflow/Agent/Environment) with
+# Forge's training infrastructure (AReaL engine, vLLM inference, GRPO).
+#
+# POC: runs GSM8K math tasks with the HarborAgentLogic adapter,
+# using rllm's math reward function and Forge's training pipeline.
 #
 # Usage:
-#   bash forge/scripts/run_4x4.sh
-#   bash forge/scripts/run_4x4.sh --steps 5
-#   bash forge/scripts/run_4x4.sh --model /path/to/local/model
+#   bash forge/examples/harbor/run.sh
+#   bash forge/examples/harbor/run.sh --steps 5
+#   bash forge/examples/harbor/run.sh --model /path/to/local/model
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AREAL_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+AREAL_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # --------------- defaults (override via CLI flags) ---------------
 TRAIN_STEPS=2
@@ -46,17 +49,27 @@ export HF_ENDPOINT=https://hf-mirror.com
 export HF_HUB_OFFLINE=0
 export TRANSFORMERS_OFFLINE=0
 
+# Ensure Harbor's rllm package is importable
+HARBOR_ROOT="${HARBOR_ROOT:-/root/harbor/harbor-verl-train}"
+if [[ -d "$HARBOR_ROOT/rllm" ]]; then
+    export PYTHONPATH="${HARBOR_ROOT}:${PYTHONPATH:-}"
+fi
+
+# Ensure required directories exist
+mkdir -p /tmp/areal/experiments /tmp/areal/name_resolve
+
 # --------------- run ---------------
 cd "$AREAL_ROOT"
 
 echo "============================================="
-echo " Forge: 4+4 (4 inf + 4 train)"
+echo " Forge + Harbor Adapter POC"
 echo " Model:       $MODEL_PATH"
 echo " Train steps: $TRAIN_STEPS"
 echo " CANN:        $CANN_HOME"
+echo " Harbor:      $HARBOR_ROOT"
 echo "============================================="
 
-python -m forge.apps.grpo \
+python -m forge.apps.agent_rl \
     examples/math/gsm8k_rl.py \
     --config examples/math/gsm8k_grpo_npu.yaml \
     "actor.path=$MODEL_PATH" \

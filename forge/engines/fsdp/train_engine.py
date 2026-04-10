@@ -64,6 +64,8 @@ class FSDPTrainEngineConfig:
     warmup_steps: int = 10
     dtype: str = "bfloat16"
     loss_config: dict[str, Any] = field(default_factory=dict)
+    checkpoint_dir: str = ""
+    save_every: int = 0
 
 
 class FSDPTrainEngine:
@@ -87,9 +89,15 @@ class FSDPTrainEngine:
         self._initialized = False
 
     def initialize(self) -> dict:
-        """Load model, wrap with FSDP2, create optimizer and scheduler."""
+        """Load model, wrap with FSDP2, create optimizer and scheduler.
+
+        Also initializes ``torch.distributed`` if not already done
+        (standalone mode without AReaL).
+        """
         import torch
         import torch.distributed as dist
+
+        self._init_distributed()
 
         cfg = self._config
         dtype_map = {
@@ -238,6 +246,113 @@ class FSDPTrainEngine:
             "dtype": self._config.dtype,
         }
 
+    def save_checkpoint(self, path: str | None = None) -> str:
+        """Save model checkpoint to disk.
+
+        Args:
+            path: Directory to save to. If None, uses config checkpoint_dir.
+
+        Returns:
+            Path where checkpoint was saved.
+        """
+        import os
+
+        import torch
+        import torch.distributed as dist
+
+        if not self._initialized:
+            raise RuntimeError("FSDPTrainEngine not initialized")
+
+        save_dir = path or self._config.checkpoint_dir
+        if not save_dir:
+            save_dir = f"/tmp/forge/checkpoints/step_{self._current_step}"
+        os.makedirs(save_dir, exist_ok=True)
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        if dist.is_initialized():
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+            )
+
+            state_dict = get_model_state_dict(
+                self._model,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
+        else:
+            state_dict = self._model.state_dict()
+
+        if rank == 0:
+            ckpt_path = os.path.join(save_dir, "model.safetensors")
+            try:
+                from safetensors.torch import save_file
+
+                save_file(state_dict, ckpt_path)
+            except ImportError:
+                ckpt_path = os.path.join(save_dir, "pytorch_model.bin")
+                torch.save(state_dict, ckpt_path)
+
+            meta = {
+                "step": self._current_step,
+                "model_path": self._config.model_path,
+                "loss_type": self._config.loss_type,
+                "lr": self._scheduler.get_last_lr()[0],
+            }
+            import json
+
+            with open(os.path.join(save_dir, "training_state.json"), "w") as f:
+                json.dump(meta, f, indent=2)
+
+            logger.info("Checkpoint saved: %s (step %d)", save_dir, self._current_step)
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        return save_dir
+
+    def load_checkpoint(self, path: str) -> int:
+        """Load model checkpoint from disk.
+
+        Args:
+            path: Directory containing the checkpoint.
+
+        Returns:
+            The training step at which the checkpoint was saved.
+        """
+        import json
+        import os
+
+        import torch
+
+        if not self._initialized:
+            raise RuntimeError("FSDPTrainEngine not initialized")
+
+        safetensors_path = os.path.join(path, "model.safetensors")
+        bin_path = os.path.join(path, "pytorch_model.bin")
+
+        if os.path.exists(safetensors_path):
+            from safetensors.torch import load_file
+
+            state_dict = load_file(safetensors_path)
+        elif os.path.exists(bin_path):
+            state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+        else:
+            raise FileNotFoundError(f"No checkpoint found in {path}")
+
+        self._model.load_state_dict(state_dict, strict=False)
+
+        meta_path = os.path.join(path, "training_state.json")
+        step = 0
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            step = meta.get("step", 0)
+
+        self._current_step = step
+        logger.info("Checkpoint loaded from %s (step %d)", path, step)
+        return step
+
     def shutdown(self) -> None:
         logger.info("FSDPTrainEngine shutting down")
         if self._model is not None:
@@ -257,16 +372,64 @@ class FSDPTrainEngine:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _init_distributed(self) -> None:
+        """Initialize torch.distributed if not already done."""
+        import os
+
+        import torch
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            return
+
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+        if world_size <= 1:
+            logger.info("Single-process mode, skipping dist init")
+            if torch.cuda.is_available():
+                torch.cuda.set_device(0)
+            elif hasattr(torch, "npu") and torch.npu.is_available():
+                torch.npu.set_device(0)
+            return
+
+        backend = "nccl"
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            backend = "hccl"
+
+        master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        master_port = os.environ.get("MASTER_PORT", "29500")
+        os.environ.setdefault("MASTER_ADDR", master_addr)
+        os.environ.setdefault("MASTER_PORT", master_port)
+
+        logger.info(
+            "Initializing dist: rank=%d, world=%d, backend=%s",
+            rank, world_size, backend,
+        )
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+
+        if torch.cuda.is_available():
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
+            torch.cuda.set_device(local_rank)
+        elif hasattr(torch, "npu") and torch.npu.is_available():
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
+            torch.npu.set_device(local_rank)
+
     def _load_model(self, model_path: str, dtype):
         """Load a HuggingFace causal LM."""
         from transformers import AutoModelForCausalLM
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2",
-        )
+        load_kwargs = {
+            "torch_dtype": dtype,
+            "trust_remote_code": True,
+        }
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, attn_implementation="flash_attention_2", **load_kwargs,
+            )
+        except (ImportError, ValueError):
+            logger.info("flash_attention_2 not available, using default attention")
+            model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
         return model
 
     def _wrap_fsdp(self) -> None:
