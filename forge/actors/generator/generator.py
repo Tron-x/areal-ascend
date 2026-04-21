@@ -358,6 +358,16 @@ class Generator(ForgeActor):
         """
         import time
 
+        # ----- Flat-buffer fast path ----------------------------------
+        # If the backend sent ``flat_key`` + ``flat_plan`` we delegate
+        # straight to WorkerWrapper.pull_weights_flat: one ``ts.get``
+        # into an aligned flat buffer, then local unpack.  This
+        # bypasses the 311-per-key RDMA overhead of the per-parameter
+        # path below.
+        flat_key = payload.get("flat_key")
+        if flat_key is not None:
+            return await self._update_weights_torchstore_flat(version, payload)
+
         items = payload.get("items")
         total_bytes_hint = int(payload.get("total_bytes") or 0)
 
@@ -442,6 +452,109 @@ class Generator(ForgeActor):
             "message": (
                 f"torchstore sync: {direct_count} inplace + "
                 f"{fused_count} fused-fallback"
+            ),
+            "bytes": bytes_total,
+            "num_keys": num_keys,
+            "pull_s": pull_s,
+            "workers_load_s": workers_load_s,
+        }
+
+    async def _update_weights_torchstore_flat(
+        self, version: int, payload: dict
+    ) -> dict:
+        """Flat-buffer variant of ``_update_weights_torchstore``.
+
+        Delegates to ``WorkerWrapper.pull_weights_flat`` which does a
+        single ``ts.get`` into an aligned NPU flat buffer and then
+        unpacks views into model params.  Avoids the per-key pool
+        staging overhead that dominates the per-parameter path.
+        """
+        import time
+
+        flat_key = payload["flat_key"]
+        plan = payload.get("flat_plan") or []
+        total_bytes = int(payload.get("total_bytes") or 0)
+
+        if not plan or total_bytes <= 0:
+            return {
+                "success": False,
+                "message": (
+                    "_update_weights_torchstore_flat: payload needs "
+                    "'flat_plan' + 'total_bytes'"
+                ),
+            }
+
+        self._inproc_engine.pause_generation()
+        pull_t0 = time.perf_counter()
+        try:
+            pull_mesh = await self.workers.pull_weights_flat.call(
+                version=version,
+                key=flat_key,
+                plan=plan,
+                total_bytes=total_bytes,
+            )
+            pull_s = time.perf_counter() - pull_t0
+        except Exception as e:
+            self._inproc_engine.resume_generation()
+            logger.exception("torchstore flat sync failed")
+            return {
+                "success": False,
+                "message": f"torchstore flat sync failed: {e}",
+                "bytes": total_bytes,
+            }
+        self._inproc_engine.resume_generation()
+
+        bytes_total = 0
+        workers_load_s = 0.0
+        num_keys = 0
+        direct_count = 0
+        fused_count = 0
+        alloc_s = rdma_s = unpack_s = fused_load_s = 0.0
+        success_all = True
+        for ref, payload_r in pull_mesh.items():
+            if not isinstance(payload_r, dict):
+                continue
+            if not payload_r.get("success", False):
+                success_all = False
+            bytes_total = max(bytes_total, payload_r.get("bytes", 0))
+            workers_load_s = max(workers_load_s, payload_r.get("workers_load_s", 0.0))
+            num_keys = max(num_keys, payload_r.get("num_keys", 0))
+            direct_count = max(direct_count, payload_r.get("direct_count", 0))
+            fused_count = max(fused_count, payload_r.get("fused_count", 0))
+            alloc_s = max(alloc_s, payload_r.get("alloc_s", 0.0))
+            rdma_s = max(rdma_s, payload_r.get("rdma_s", 0.0))
+            unpack_s = max(unpack_s, payload_r.get("unpack_s", 0.0))
+            fused_load_s = max(fused_load_s, payload_r.get("fused_load_s", 0.0))
+
+        if not success_all:
+            return {
+                "success": False,
+                "message": "one or more workers failed pull_weights_flat",
+                "bytes": bytes_total,
+                "num_keys": num_keys,
+                "pull_s": pull_s,
+                "workers_load_s": workers_load_s,
+            }
+
+        logger.info(
+            "torchstore flat sync v%d: %d keys (%d direct + %d fused), "
+            "%.2f GB, total=%.2fs [alloc=%.2fs rdma=%.2fs unpack=%.2fs "
+            "fused_load=%.2fs]",
+            version,
+            num_keys,
+            direct_count,
+            fused_count,
+            bytes_total / (1024**3),
+            pull_s,
+            alloc_s,
+            rdma_s,
+            unpack_s,
+            fused_load_s,
+        )
+        return {
+            "success": True,
+            "message": (
+                f"torchstore flat: {direct_count} inplace + {fused_count} fused"
             ),
             "bytes": bytes_total,
             "num_keys": num_keys,

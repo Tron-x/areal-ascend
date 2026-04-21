@@ -180,6 +180,17 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
         import torch
         import torchstore as ts
 
+        # NB: torchstore's staging pool is REQUIRED on this worker.  It
+        # provides 2 MiB-aligned NPU buffers; disabling it (by unsetting
+        # ``TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE``) and routing RDMA
+        # straight into vLLM's ``param.data`` fails with
+        # ``hixl_transfer_write ret=503900`` on the first small
+        # parameter (rotary / norm bias / etc.) that lands at a
+        # non-2-MiB-aligned NPU offset, even in RoCE mode.  The
+        # pool->param.data copy we pay on every ``ts.get`` is the price
+        # of admission for bypassing those alignment constraints.
+        # See the flat-buffer discussion in this file's docstring for
+        # the alternative (one big aligned transfer instead).
         model = self.worker.model_runner.model
         name_to_param = dict(model.named_parameters())
 
@@ -200,9 +211,20 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
 
         overall_t0 = time.perf_counter()
 
+        # Phase timers -- so we can see how the 1+ seconds splits
+        # between (parallel RDMA transfers) and (vLLM's in-model fused
+        # concatenation).  Optimizing the right bucket matters; the
+        # two live in very different layers.
+        timing: dict[str, float] = {
+            "direct_rdma_s": 0.0,
+            "fused_rdma_s": 0.0,
+            "fused_load_s": 0.0,
+        }
+
         async def _pull_direct() -> None:
             if not direct_items:
                 return
+            t0 = time.perf_counter()
             # All direct gets in parallel -- torchstore's
             # MonarchRDMA transport runs one handshake + one RDMA
             # per-key, and concurrent calls pipeline through the
@@ -213,6 +235,7 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
                     for it in direct_items
                 ]
             )
+            timing["direct_rdma_s"] = time.perf_counter() - t0
 
         async def _pull_fused() -> tuple[list[tuple[str, torch.Tensor]], int]:
             """Fetch all fused HF tensors concurrently, return
@@ -220,7 +243,9 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
             through one bulk ``model.load_weights`` call."""
             if not fused_items:
                 return [], 0
+            t0 = time.perf_counter()
             tensors = await asyncio.gather(*[ts.get(it["key"]) for it in fused_items])
+            timing["fused_rdma_s"] = time.perf_counter() - t0
             pairs: list[tuple[str, torch.Tensor]] = []
             nbytes = 0
             device = torch.accelerator.current_accelerator()
@@ -249,7 +274,9 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
             # inside its own single pass rather than us paying the
             # per-call overhead N times.
             if fused_pairs:
+                t0 = time.perf_counter()
                 model.load_weights(fused_pairs)
+                timing["fused_load_s"] = time.perf_counter() - t0
             return len(direct_items), fused_nbytes
 
         try:
@@ -271,7 +298,9 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
             f"[WorkerWrapper] pull_weights v{version}: "
             f"{direct_count} direct + {fused_count} fused, "
             f"{total_bytes / 1024**3:.2f} GB, {workers_load_s:.2f}s "
-            f"({gbps:.2f} GB/s)"
+            f"({gbps:.2f} GB/s)  [direct_rdma={timing['direct_rdma_s']:.2f}s, "
+            f"fused_rdma={timing['fused_rdma_s']:.2f}s, "
+            f"fused_load={timing['fused_load_s']:.2f}s]"
         )
         return {
             "success": True,
@@ -281,6 +310,161 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
             "workers_load_s": workers_load_s,
             "direct_count": direct_count,
             "fused_count": fused_count,
+            "direct_rdma_s": timing["direct_rdma_s"],
+            "fused_rdma_s": timing["fused_rdma_s"],
+            "fused_load_s": timing["fused_load_s"],
+        }
+
+    @endpoint
+    def pull_weights_flat(
+        self,
+        version: int,
+        key: str,
+        plan: list | None = None,
+        total_bytes: int = 0,
+    ) -> dict:
+        """Flat-buffer pull: one ``ts.get`` of the packed state_dict, then
+        local unpack into model parameters.
+
+        Counterpart of :meth:`TrainerActor.publish_weights_flat`.  The
+        trainer has packed every HF tensor into a single 2 MiB-aligned
+        NPU buffer and stored it as one torchstore key.  We:
+
+        1. Allocate a matching 2 MiB-aligned NPU flat buffer via
+           ``alloc_aligned_tensor``.  Because the buffer is aligned at
+           allocation time, the whole RDMA path bypasses torchstore's
+           staging pool (``allocate()`` sees a pool-aligned tensor and
+           skips the ``pool.alloc + staged.copy_`` detour).
+        2. Single ``ts.get(key, inplace_tensor=flat)`` -- one HiXL
+           handshake, one TransferSync of the whole state_dict.  This is
+           the same code path our standalone harness
+           (``forge/scripts/test_weight_sync_2node.py``) uses to measure
+           ~17 GB/s steady-state on the same hardware.
+        3. Walk ``plan`` to classify each HF name as *direct* (present
+           in ``model.named_parameters()``) or *fused* (needs
+           ``model.load_weights`` to dispatch to vLLM's fused slot):
+           direct -> ``param.data.copy_(view)`` (NPU->NPU); fused ->
+           accumulate ``(name, view)`` pairs for one bulk
+           ``model.load_weights(fused_pairs)`` at the end.
+
+        The view-over-flat tensors stay alive until ``load_weights``
+        returns because we keep a reference to ``flat`` in
+        ``self._pulled_flat`` (same trick the trainer side uses to
+        avoid tearing down HiXL registration mid-pull).
+        """
+        if plan is None or total_bytes <= 0:
+            return {
+                "success": False,
+                "message": (
+                    "pull_weights_flat: payload needs 'plan' + "
+                    "'total_bytes'.  Check the trainer published via "
+                    "publish_weights_flat."
+                ),
+                "bytes": 0,
+                "num_keys": 0,
+            }
+
+        import asyncio
+        import time
+
+        import torch
+        import torchstore as ts
+
+        from forge.engines.weight_sync._flat_layout import torch_dtype_from_str
+
+        model = self.worker.model_runner.model
+        name_to_param = dict(model.named_parameters())
+
+        overall_t0 = time.perf_counter()
+        timing: dict[str, float] = {
+            "alloc_s": 0.0,
+            "rdma_s": 0.0,
+            "unpack_s": 0.0,
+            "fused_load_s": 0.0,
+        }
+
+        # Step 1: allocate a 2 MiB-aligned NPU flat buffer matching the
+        # trainer's size.  alloc_aligned_tensor is the same API the
+        # trainer uses, so the destination comes out of vLLM's NPU
+        # address space already aligned.
+        t0 = time.perf_counter()
+        # torch.accelerator fallback for the device; vLLM workers run on
+        # NPU 0 in our setup.
+        import torch_npu  # noqa: F401
+        from monarch._src.rdma.xdma import alloc_aligned_tensor
+
+        flat, _raw = alloc_aligned_tensor(
+            (total_bytes,), dtype=torch.uint8, device="npu:0"
+        )
+        timing["alloc_s"] = time.perf_counter() - t0
+
+        # Step 2: single ts.get into the aligned flat buffer.
+        async def _do_get() -> None:
+            await ts.get(key, inplace_tensor=flat)
+
+        t0 = time.perf_counter()
+        try:
+            asyncio.run(_do_get())
+        except Exception as e:
+            logger.exception("pull_weights_flat: ts.get failed")
+            return {
+                "success": False,
+                "message": f"pull_weights_flat ts.get({key}): {e}",
+                "bytes": 0,
+                "num_keys": 0,
+            }
+        # Wait for any DMA tails -- the RDMA is usually sync at the HiXL
+        # layer but synchronize here to make the timing meaningful.
+        torch.npu.synchronize()
+        timing["rdma_s"] = time.perf_counter() - t0
+
+        # Step 3: slice flat into views and dispatch direct vs fused.
+        t0 = time.perf_counter()
+        direct_count = 0
+        fused_pairs: list[tuple[str, torch.Tensor]] = []
+        for name, shape, dtype_str, offset, nbytes in plan:
+            td = torch_dtype_from_str(dtype_str)
+            view = flat[offset : offset + nbytes].view(td).view(tuple(shape))
+            if name in name_to_param:
+                name_to_param[name].data.copy_(view)
+                direct_count += 1
+            else:
+                fused_pairs.append((name, view))
+        torch.npu.synchronize()
+        timing["unpack_s"] = time.perf_counter() - t0
+
+        if fused_pairs:
+            t0 = time.perf_counter()
+            model.load_weights(fused_pairs)
+            timing["fused_load_s"] = time.perf_counter() - t0
+
+        # Retain the flat buffer until the next pull so HiXL's
+        # registration isn't torn down while vLLM may still be touching
+        # the fused-view references inside its own load path.
+        self._pulled_flat = flat
+
+        fused_count = len(fused_pairs)
+        workers_load_s = time.perf_counter() - overall_t0
+        gbps = total_bytes / workers_load_s / (1024**3) if workers_load_s > 0 else 0.0
+        logger.info(
+            f"[WorkerWrapper] pull_weights_flat v{version}: "
+            f"{direct_count} direct + {fused_count} fused, "
+            f"{total_bytes / 1024**3:.2f} GB, {workers_load_s:.2f}s "
+            f"({gbps:.2f} GB/s)  "
+            f"[alloc={timing['alloc_s']:.2f}s, "
+            f"rdma={timing['rdma_s']:.2f}s, "
+            f"unpack={timing['unpack_s']:.2f}s, "
+            f"fused_load={timing['fused_load_s']:.2f}s]"
+        )
+        return {
+            "success": True,
+            "message": f"flat direct={direct_count} fused={fused_count}",
+            "bytes": total_bytes,
+            "num_keys": direct_count + fused_count,
+            "workers_load_s": workers_load_s,
+            "direct_count": direct_count,
+            "fused_count": fused_count,
+            **{f"{k}": v for k, v in timing.items()},
         }
 
     @endpoint

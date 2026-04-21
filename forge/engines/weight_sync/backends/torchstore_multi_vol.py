@@ -104,9 +104,24 @@ class MultiVolTorchstoreBackend:
         *,
         storage_npu_base: int | None = None,
         pool_mb: int = 8192,
+        flat: bool = True,
     ) -> None:
+        """
+        Args:
+            storage_npu_base: first NPU id to pin storage volumes to on
+                the trainer host.  ``None`` = auto (``train_world``).
+            pool_mb: MonarchRDMA staging pool size per storage volume.
+            flat: when True (default), use the single-flat-key fast path
+                (``TrainerActor.publish_weights_flat`` +
+                ``WorkerWrapper.pull_weights_flat``) -- one RDMA transfer
+                of the packed state_dict, ~17 GB/s on RoCE.  When False,
+                fall back to the per-parameter path
+                (``publish_weights`` + ``pull_weights``) which is easier
+                to debug but pays 311 * per-key overhead.
+        """
         self._storage_npu_base = storage_npu_base
         self._pool_mb = pool_mb
+        self._flat = flat
         self._storage_mesh = None
         self._layout: ParallelLayout | None = None
         self._initialized = False
@@ -114,6 +129,11 @@ class MultiVolTorchstoreBackend:
         # doesn't need another round trip to learn the parameter inventory.
         self._cached_meta_version: int | None = None
         self._cached_meta: list[ParamMeta] | None = None
+        # For the flat path we also cache the plan (param name ->
+        # offset/shape/dtype) so the pull side can unpack without
+        # asking the trainer again.
+        self._cached_plan: list | None = None
+        self._cached_total_bytes: int = 0
 
     # ------------------------------------------------------------------ key
 
@@ -194,32 +214,37 @@ class MultiVolTorchstoreBackend:
     # --------------------------------------------------------------- push
 
     async def push(self, trainer_actor: Any, version: int) -> PushResult:
-        """Fan out ``publish_weights(version)`` to every trainer rank.
+        """Drive the trainer-side write.
 
-        Each rank gathers its sharded state_dict into full HF-named tensors
-        (via ``state_dict_for_sync`` on the engine) and calls ``ts.put_batch``
-        with the keys ``self.key_for(version, name)``.  Because every rank
-        has LOCAL_RANK=i set and torchstore uses ``LocalRankStrategy``, each
-        rank's put traffic routes to its colocated volume i -- the writes
-        are fully parallel across N NIC links on the put side.
+        Two code paths, controlled by ``self._flat``:
 
-        Every rank writes the same keys; that is not a redundancy bug but a
-        consequence of LocalRankStrategy's one-volume-per-rank semantics:
-        volume i only sees rank i's write (LocalRankStrategy routing), so
-        the final store has a copy of every key in every volume.  The
-        generator pulls from its LOCAL_RANK-routed volume, so read-side
-        load balances across volumes too.
+        * **flat (default)**: single-key single-transfer fast path.
+          Every trainer rank runs ``publish_weights_flat(version, key)``
+          where ``key = f"policy_ver_{v%2:010d}.flat"``.  Rank 0 packs
+          the gathered state_dict into a 2 MiB-aligned NPU buffer and
+          issues one ``ts.put`` covering the whole thing.  Other ranks
+          participate in the FSDP collective and early-return.
+
+        * **per-param**: legacy fallback where every trainer rank calls
+          ``ts.put_batch`` keyed per-parameter.  Useful for debugging
+          since each ``ts.get(key)`` on the consumer side can be
+          inspected independently, but pays 311 * handshake overhead.
         """
         if not self._initialized:
             raise RuntimeError("MultiVolTorchstoreBackend: not initialized")
 
+        if self._flat:
+            return await self._push_flat(trainer_actor, version)
+        return await self._push_per_param(trainer_actor, version)
+
+    async def _push_flat(self, trainer_actor: Any, version: int) -> PushResult:
+        key = self.flat_key_for(version)
         t0 = time.perf_counter()
-        push_result_mesh = await trainer_actor.publish_weights.call(
-            version=version, key_prefix=f"policy_ver_{version % 2:010d}"
+        push_result_mesh = await trainer_actor.publish_weights_flat.call(
+            version=version, key=key
         )
         push_s = time.perf_counter() - t0
 
-        # Pick rank 0's result for ParamMeta caching; aggregate bytes.
         per_rank: dict[int, dict] = {}
         rank0_payload: dict | None = None
         total_bytes = 0
@@ -237,8 +262,57 @@ class MultiVolTorchstoreBackend:
         if rank0_payload is None:
             rank0_payload = next(iter(per_rank.values())) if per_rank else {}
 
-        # Cache ParamMeta for the pull side to use.
+        plan = rank0_payload.get("plan", [])
         self._cached_meta_version = version
+        self._cached_plan = plan
+        self._cached_total_bytes = total_bytes
+        # Also populate ParamMeta for API compatibility.
+        self._cached_meta = [
+            ParamMeta(
+                name=entry[0],
+                shape=tuple(entry[1]),
+                dtype=entry[2],
+                nbytes=entry[4],
+            )
+            for entry in plan
+        ]
+
+        return PushResult(
+            version=version,
+            num_keys=rank0_payload.get("num_keys", len(plan)),
+            bytes_total=total_bytes,
+            push_s=push_s,
+            build_state_dict_s=build_s_max,
+            per_rank=per_rank,
+        )
+
+    async def _push_per_param(self, trainer_actor: Any, version: int) -> PushResult:
+        t0 = time.perf_counter()
+        push_result_mesh = await trainer_actor.publish_weights.call(
+            version=version, key_prefix=f"policy_ver_{version % 2:010d}"
+        )
+        push_s = time.perf_counter() - t0
+
+        per_rank: dict[int, dict] = {}
+        rank0_payload: dict | None = None
+        total_bytes = 0
+        build_s_max = 0.0
+        for ref, payload in push_result_mesh.items():
+            if not isinstance(payload, dict):
+                continue
+            rank = payload.get("rank", 0)
+            per_rank[rank] = payload
+            if rank == 0:
+                rank0_payload = payload
+            total_bytes = max(total_bytes, payload.get("bytes", 0))
+            build_s_max = max(build_s_max, payload.get("build_state_dict_s", 0.0))
+
+        if rank0_payload is None:
+            rank0_payload = next(iter(per_rank.values())) if per_rank else {}
+
+        self._cached_meta_version = version
+        self._cached_plan = None
+        self._cached_total_bytes = 0
         self._cached_meta = [
             ParamMeta(name=n, shape=tuple(s), dtype=d, nbytes=nb)
             for n, s, d, nb in zip(
@@ -259,14 +333,23 @@ class MultiVolTorchstoreBackend:
             per_rank=per_rank,
         )
 
+    def flat_key_for(self, version: int) -> str:
+        return f"policy_ver_{version % 2:010d}.flat"
+
     # --------------------------------------------------------------- pull
 
     async def pull(self, generator_actor: Any, version: int) -> PullResult:
-        """Ask the generator to run ``pull_weights(version, items)``.
+        """Drive the generator-side read.
 
-        Internally the generator actor fans this out to its vLLM workers.
-        Each worker does the ``ts.get(inplace_tensor=model_param)`` loop
-        inside its own proc, on its own NPU, with no CPU roundtrip.
+        Two code paths, picked to match the push path cached by
+        :meth:`push`:
+
+        * **flat**: one ``ts.get(flat_key)`` per worker into an aligned
+          flat buffer, then a local unpack into model params.  Near
+          theoretical HiXL bandwidth because the pool-staging detour is
+          avoided (the flat buffer is itself 2 MiB aligned).
+        * **per-param**: 311 concurrent ``ts.get`` calls going through
+          the staging pool, ~1 GB/s on our hardware.
         """
         if not self._initialized:
             raise RuntimeError("MultiVolTorchstoreBackend: not initialized")
@@ -279,14 +362,52 @@ class MultiVolTorchstoreBackend:
                 "populate it"
             )
 
+        if self._flat and self._cached_plan is not None:
+            return await self._pull_flat(generator_actor, version)
+        return await self._pull_per_param(generator_actor, version)
+
+    async def _pull_flat(self, generator_actor: Any, version: int) -> PullResult:
+        key = self.flat_key_for(version)
+        total_bytes = self._cached_total_bytes
+        plan = self._cached_plan or []
+
+        t0 = time.perf_counter()
+        pull_mesh = await generator_actor.update_weights_sync.call(
+            version,
+            "torchstore",
+            {
+                "flat_key": key,
+                "flat_plan": plan,
+                "total_bytes": total_bytes,
+            },
+        )
+        pull_s = time.perf_counter() - t0
+
+        workers_load_s = 0.0
+        success_bytes = 0
+        per_worker: dict[int, dict] = {}
+        for ref, payload in pull_mesh.items():
+            if not isinstance(payload, dict):
+                continue
+            per_worker[len(per_worker)] = payload
+            workers_load_s = max(workers_load_s, payload.get("workers_load_s", 0.0))
+            success_bytes = max(success_bytes, payload.get("bytes", 0))
+
+        return PullResult(
+            version=version,
+            num_keys=len(plan) if success_bytes > 0 else 0,
+            bytes_total=success_bytes or total_bytes,
+            pull_s=pull_s,
+            workers_load_s=workers_load_s,
+            per_worker=per_worker,
+        )
+
+    async def _pull_per_param(self, generator_actor: Any, version: int) -> PullResult:
+        meta = self._cached_meta or []
         items = [{"name": m.name, "key": self.key_for(version, m.name)} for m in meta]
         total_bytes = sum(m.nbytes for m in meta)
 
         t0 = time.perf_counter()
-        # ``update_weights_sync`` is the existing Generator.handle_request
-        # dispatch key for torchstore-backed pulls.  We keep using it so
-        # driver-side plumbing stays compatible while the Generator
-        # internally delegates to workers.
         pull_mesh = await generator_actor.update_weights_sync.call(
             version, "torchstore", {"items": items, "total_bytes": total_bytes}
         )

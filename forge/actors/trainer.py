@@ -189,6 +189,120 @@ class TrainerActor(ForgeActor):
             only_rank_zero=True,
         )
 
+    @endpoint
+    def publish_weights_flat(
+        self,
+        version: int,
+        key: str,
+    ) -> dict:
+        """Flat-buffer publish: pack state_dict into one 2 MiB-aligned NPU
+        buffer and write it as a single torchstore key.
+
+        Why this is dramatically faster than :meth:`publish_weights` at
+        the cost of slightly more Python:
+
+        * One ``ts.put(key, flat)`` -> one RDMA handshake + one
+          TransferSync.  Sidesteps the 311-key-by-311-key overhead that
+          torchstore's ``MonarchRDMATransportBuffer`` pays because its
+          ``supports_batch_gets`` / ``puts`` is ``False``.
+
+        * The flat buffer is allocated via
+          ``monarch._src.rdma.xdma.alloc_aligned_tensor`` so the RDMA
+          transfer's local + remote ends are both 2 MiB aligned -- no
+          ``hixl_transfer_write ret=503900`` on small tail params, no
+          per-param pool staging copies.
+
+        Only rank 0 actually publishes (same RdmaManagerActor-per-proc
+        constraint as :meth:`publish_weights`); other ranks participate
+        in the collective gather and early-return.
+
+        Returns the layout plan (``[(name, shape, dtype, offset,
+        nbytes), ...]``) + ``total_bytes`` in the payload so the
+        generator can allocate a matching flat buffer and unpack.
+        """
+        if not self._use_engine:
+            raise RuntimeError("publish_weights_flat requires a TrainEngine")
+        import asyncio
+        import time
+
+        import torch
+        import torch.distributed as dist
+        import torchstore as ts
+
+        from forge.engines.weight_sync._flat_layout import (
+            build_meta_from_state_dict,
+            plan_layout,
+            torch_dtype_from_str,
+        )
+
+        build_t0 = time.perf_counter()
+        state_dict = self._engine.state_dict_for_sync()
+        build_s = time.perf_counter() - build_t0
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        meta = build_meta_from_state_dict(state_dict)
+        plan, total_bytes = plan_layout(meta)
+
+        if rank != 0:
+            return {
+                "num_keys": len(plan),
+                "bytes": total_bytes,
+                "build_state_dict_s": build_s,
+                "pack_s": 0.0,
+                "put_s": 0.0,
+                "plan": [],
+                "rank": rank,
+            }
+
+        # --- rank 0: pack + put ------------------------------------------
+        from monarch._src.rdma.xdma import alloc_aligned_tensor
+
+        # All tensors in state_dict are NPU (state_dict_for_sync keeps
+        # them on device).  Pick the device from the first tensor.
+        first_tensor = next(iter(state_dict.values()))
+        device = first_tensor.device
+
+        pack_t0 = time.perf_counter()
+        flat, _raw = alloc_aligned_tensor(
+            (total_bytes,), dtype=torch.uint8, device=device
+        )
+        # Pack every parameter into its slot.  view().view() reinterprets
+        # the uint8 slice as the target dtype+shape and copy_ does an
+        # NPU->NPU DMA.  311 small NPU->NPU copies should total well
+        # under 50 ms for Qwen3-0.6B.
+        for name, shape, dtype_str, offset, nbytes in plan:
+            td = torch_dtype_from_str(dtype_str)
+            view = flat[offset : offset + nbytes].view(td).view(shape)
+            view.copy_(state_dict[name])
+        if device.type == "npu":
+            torch.npu.synchronize()
+        elif device.type == "cuda":
+            torch.cuda.synchronize()
+        pack_s = time.perf_counter() - pack_t0
+
+        async def _do_put() -> float:
+            put_t0 = time.perf_counter()
+            await ts.put(key, flat)
+            return time.perf_counter() - put_t0
+
+        put_s = asyncio.run(_do_put())
+
+        # Retain the flat buffer until the next publish so HiXL's
+        # registration for this slot isn't torn down while the generator
+        # is still pulling it.
+        self._pushed_flat = flat
+
+        return {
+            "num_keys": len(plan),
+            "bytes": total_bytes,
+            "build_state_dict_s": build_s,
+            "pack_s": pack_s,
+            "put_s": put_s,
+            "plan": plan,
+            "rank": rank,
+        }
+
     def _publish_impl(
         self,
         version: int,
