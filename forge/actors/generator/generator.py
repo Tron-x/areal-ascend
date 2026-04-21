@@ -343,18 +343,18 @@ class Generator(ForgeActor):
     async def _update_weights_torchstore(self, version: int, payload: dict) -> dict:
         """Torchstore / Monarch RDMA weight update.
 
-        The Generator actor pulls each parameter from torchstore into NPU
-        memory via Monarch RDMA (HiXL-aliased through the shared staging pool
-        when on Ascend), builds a CPU state_dict, and then calls the standard
-        ``WorkerWrapper.update_weights(state_dict, version)`` endpoint on each
-        vLLM worker.  Workers go through vLLM's ``model.load_weights`` path,
-        which handles TP resharding internally.
+        Pulls each HF-named parameter from torchstore via Monarch RDMA
+        (HiXL on NPU), builds a CPU state_dict, and hands it to the vLLM
+        workers; workers then drive vLLM's ``model.load_weights`` which
+        handles TP resharding.
 
-        ``payload`` must carry ``param_names``, ``param_shapes``,
-        ``param_dtypes`` (as produced by ``TrainerActor.push_weights_torchstore``).
-
-        The actor assumes ``torchstore.initialize`` has already been called in
-        the driver; the shared Monarch controller is picked up implicitly.
+        ``payload`` carries ``param_names`` / ``param_shapes`` /
+        ``param_dtypes`` as produced by
+        ``TrainerActor.push_weights_torchstore``.  The trainer runs its
+        state_dict through ``sd_adapter.to_hf`` first, so the keys
+        match what vLLM's Qwen3ForCausalLM.load_weights expects
+        (``model.embed_tokens.weight``, ``lm_head.weight``, ...) rather
+        than TorchTitan's native names.
         """
         import time
 
@@ -394,9 +394,7 @@ class Generator(ForgeActor):
                     )
                 # Monarch RPC to the vLLM workers goes through cloudpickle,
                 # which can't serialise NPU tensors directly -- stage to CPU
-                # once here, workers will ``.to(device)`` back on load.  This
-                # trade still saves 1x cross-host transfer (RDMA instead of
-                # disk) relative to the checkpoint-based strategy.
+                # once here; workers will ``.to(device)`` back on load.
                 if tensor.device.type != "cpu":
                     tensor = tensor.cpu()
                 state_dict[name] = tensor

@@ -233,19 +233,23 @@ class FSDPTrainEngine:
     def state_dict_for_sync(self) -> dict:
         """Return the model state dict for weight sync.
 
-        For FSDP2 models, this returns the local shard. The
-        ``WeightSyncStrategy`` handles reassembly if needed.
-
-        Tensors are kept on device (NPU/GPU): HiXL RDMA cannot register
-        CPU-resident memory (``ra_hdc_typical_mr ret=-13``).  Any
-        downstream consumer that really needs CPU should do ``.cpu()``
-        itself after the RDMA transfer completes -- see
-        ``forge/engines/titan/adapter.py::state_dict_for_sync`` for the
-        full root-cause writeup.
+        FSDP2 returns DTensors; we materialise each one via
+        ``.full_tensor()`` (a collective, identical on every rank) so
+        the ``WeightSyncStrategy`` sees plain per-rank-identical
+        tensors.  Tensors are kept on device (NPU/GPU); downstream
+        consumers that really need CPU should ``.cpu()`` themselves.
+        See ``forge/engines/titan/adapter.py::state_dict_for_sync`` for
+        the full root-cause writeup.
         """
         if not self._initialized:
             raise RuntimeError("FSDPTrainEngine not initialized")
-        return dict(self._model.state_dict().items())
+        from torch.distributed.tensor import DTensor
+
+        raw = self._model.state_dict()
+        return {
+            k: (v.full_tensor() if isinstance(v, DTensor) else v)
+            for k, v in raw.items()
+        }
 
     def get_metadata(self) -> dict:
         return {

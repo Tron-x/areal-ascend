@@ -325,27 +325,97 @@ class TitanTrainEngine:
         )
 
     def state_dict_for_sync(self) -> dict:
-        """Return the full state_dict with tensors kept on-device (NPU/GPU).
+        """Return the HF-named full state_dict with tensors on device.
 
-        Critical for HiXL / CANN RoCE weight sync: HiXL registers tensors
-        for one-sided RDMA, and its RA HDC driver rejects CPU-resident
-        memory (``ra_hdc_typical_mr ret=-13``, per HiXL 排查指南 场景二
-        "HOST 内存…当前不支持注册给 ROCE 网卡").  An earlier version of this
-        method returned ``{k: v.cpu() for k, v in ...}`` which -- combined
-        with torchstore's ``MonarchRDMATransportBuffer.allocate`` skipping
-        its NPU staging pool for CPU tensors
-        (``tensor.device.type != "cpu"`` branch in
-        ``torchstore/transport/monarch_rdma.py``) -- caused every
-        ``ts.put_batch`` to hand HiXL a CPU buffer and fail.
+        Three invariants this method must uphold for ``TorchstoreWeightSync``
+        + HiXL RoCE + a vLLM generator:
 
-        Upstream torchforge's GPU path never does ``.cpu()`` here either:
-        ``src/forge/actors/trainer/titan.py::push_weights`` reads directly
-        from ``self.engine.checkpointer.states["model"].state_dict()`` on
-        GPU and passes device tensors to ``ts.put_batch``.
+        1. **Tensors stay on the engine's native device (NPU/GPU).**
+           HiXL's CANN RA HDC driver rejects CPU-resident memory for
+           RoCE MR registration (``ra_hdc_typical_mr ret=-13``, HiXL 排查
+           指南 场景二 "HOST 内存…当前不支持注册给 ROCE 网卡"), and
+           torchstore's ``MonarchRDMATransportBuffer.allocate`` skips its
+           NPU staging pool for CPU tensors -- so ``.cpu()`` here would
+           route straight into the failure path.
+        2. **Tensors are plain ``torch.Tensor``, not ``DTensor``.**
+           FSDP2's ``model.state_dict()`` returns DTensors whose shards
+           are distributed across ranks; copying into a plain flat buffer
+           raises ``aten.copy_.default: got mixed torch.Tensor and
+           DTensor``.  We materialise each DTensor to a replicated full
+           tensor via ``.full_tensor()`` (a collective, invoked
+           identically on every rank).
+        3. **Parameter names are in HuggingFace form, not TorchTitan
+           native.**  TorchTitan's ``Qwen3`` model exposes names like
+           ``tok_embeddings.weight``, ``norm.weight``, ...; the vLLM
+           generator, on the other hand, expects HF-standard names
+           (``model.embed_tokens.weight``, ``lm_head.weight``, ...).
+           Without the rename, vLLM's ``load_weights`` path raises
+           ``ValueError: There is no module or parameter named
+           'tok_embeddings' in Qwen3ForCausalLM``.  We apply the
+           checkpointer's ``sd_adapter.to_hf(...)`` to do the mapping
+           (the exact flow upstream torchforge uses in
+           ``src/forge/actors/trainer/titan.py::push_weights``).
         """
         if not self._initialized:
             raise RuntimeError("Not initialized")
-        return dict(self._engine.model_parts[0].state_dict().items())
+        from torch.distributed.checkpoint._nested_dict import flatten_state_dict
+        from torch.distributed.tensor import DTensor
+
+        # Collect the TorchTitan-native state_dict straight off the
+        # (possibly sharded) model.  We deliberately do *not* go through
+        # ``self._engine.checkpointer.states["model"]`` the way upstream
+        # torchforge does: our ForgeEngineConfig leaves
+        # ``checkpoint.enable=False`` by default (we don't persist
+        # intermediate weights to disk), and CheckpointManager.__init__
+        # early-returns in that case without populating ``self.states``
+        # or ``self.sd_adapter`` -- so accessing either raises
+        # ``AttributeError``.  Reading the model's state_dict directly
+        # gives us the same tensors with none of that coupling.
+        raw = self._engine.model_parts[0].state_dict()
+        flat, _spec = flatten_state_dict(raw)
+
+        sd_adapter = self._get_sd_adapter()
+        if sd_adapter is None:
+            raise RuntimeError(
+                "TitanTrainEngine.state_dict_for_sync: no sd_adapter is "
+                "available for this model (train_spec.state_dict_adapter "
+                "is None).  Without it we cannot translate "
+                "TorchTitan-native parameter names into the HF form vLLM "
+                "expects ('no module or parameter named <tt-native>' on "
+                "the generator side)."
+            )
+        hf_sd = sd_adapter.to_hf(flat)
+
+        out: dict = {}
+        for k, v in hf_sd.items():
+            if isinstance(v, DTensor):
+                v = v.full_tensor()
+            out[k] = v
+        return out
+
+    def _get_sd_adapter(self):
+        """Lazily build (and cache) the TorchTitan StateDictAdapter for
+        this engine's model.
+
+        The adapter is what ``CheckpointManager`` would have constructed
+        if checkpointing were enabled, built from
+        ``self._engine.train_spec.state_dict_adapter`` +
+        ``self._engine.model_args`` + ``self._config.hf_model_path``.
+        """
+        existing = getattr(self, "_sd_adapter", None)
+        if existing is not None:
+            return existing
+        train_spec = getattr(self._engine, "train_spec", None)
+        if (
+            train_spec is None
+            or getattr(train_spec, "state_dict_adapter", None) is None
+        ):
+            return None
+        adapter = train_spec.state_dict_adapter(
+            self._engine.model_args, self._config.hf_model_path or ""
+        )
+        self._sd_adapter = adapter
+        return adapter
 
     def get_metadata(self) -> dict:
         return {

@@ -130,37 +130,33 @@ class TrainerActor(ForgeActor):
     def push_weights_torchstore(self, policy_version: int) -> dict:
         """Push the engine's state_dict to torchstore for TorchstoreWeightSync.
 
-        Each parameter ``name`` is stored as ``policy_ver_{version%2:010d}.{name}``
-        (see ``forge.engines.weight_sync.torchstore_sync.get_param_key``), which
-        matches torchforge's key scheme and keeps the KV store bounded by
-        ping-ponging between two versions.
+        Every parameter is stored under ``policy_ver_{v%2:010d}.{name}``
+        (see ``forge.engines.weight_sync.torchstore_sync.get_param_key``);
+        the ``{0|1}`` slot ping-pong keeps the store bounded by two
+        versions, matching torchforge's scheme.
 
-        The call expects ``torchstore.initialize`` to have already been run in
-        the driver with a storage mesh; the trainer process picks up the same
-        Monarch controller automatically.
+        ``ts.put_batch(entries)`` hands the whole state_dict to
+        torchstore in a single transport-buffer setup -- this is the
+        same API upstream torchforge uses in
+        ``src/forge/actors/trainer/titan.py::push_weights``.  An earlier
+        version of this method drove a per-parameter ``for ... ts.put``
+        loop which, on CANN/HiXL, amplified every per-registration
+        cost into 300 back-to-back HiXL ``RegisterBoundMems`` calls and
+        eventually starved the RA HDC driver (``ra_hdc_typical_mr
+        ret=-13``).
 
-        Note:
-            Declared as a **sync** endpoint because Monarch requires all
-            endpoints on a given Actor class to have the same colour, and
-            the rest of ``TrainerActor`` is sync.  The async ``ts.put``
-            calls are driven via ``asyncio.run(...)`` inside this sync
-            handler -- Monarch runs sync endpoints on a worker thread so
-            spinning up a private event loop is safe (no deadlock risk
-            with the actor's own loop).
+        An even more aggressive "pack into one flat 2 MiB-aligned NPU
+        buffer, put one chunk at a time" variant was evaluated and
+        regressed end-to-end sync latency from ~3 s to ~12 s for
+        Qwen3-0.6B: the extra per-parameter ``full_tensor()`` gather
+        collectives + pack copies on the trainer, combined with the
+        per-view ``.cpu()`` copies on the generator side, dominate any
+        win from the reduced HiXL registration count at this model
+        size.  If that balance shifts at larger models, revisit the
+        flat-buffer path using ``forge.engines.weight_sync._flat_layout``.
 
-        Args:
-            policy_version: Monotonic step/version counter.
-
-        Returns:
-            Dict with:
-                - ``num_keys``: number of params pushed
-                - ``bytes``: total payload bytes
-                - ``build_state_dict_s``: seconds spent materialising the
-                  state_dict on CPU
-                - ``put_s``: seconds spent in ``ts.put``
-                - ``param_names``: list of param names (in push order)
-                - ``param_shapes``: list of shapes (tuples)
-                - ``param_dtypes``: list of dtype strings (e.g. ``"bfloat16"``)
+        Only rank 0 publishes; other ranks participate in the FSDP
+        gather inside ``state_dict_for_sync`` and then exit early.
         """
         if not self._use_engine:
             raise RuntimeError("push_weights_torchstore requires a TrainEngine")
@@ -172,10 +168,11 @@ class TrainerActor(ForgeActor):
 
         from forge.engines.weight_sync.torchstore_sync import get_param_key
 
-        # All ranks participate in ``state_dict_for_sync`` because FSDP/HSDP
-        # sharded tensors need a collective gather to materialise full
-        # tensors on each rank.  Only rank 0 then publishes to torchstore
-        # so we don't get N overlapping writes for the same key.
+        # All ranks participate: FSDP/HSDP sharded tensors need the
+        # collective gather to materialise full tensors (and
+        # ``state_dict_for_sync`` also runs ``DTensor.full_tensor()`` +
+        # ``sd_adapter.to_hf`` underneath, both of which need all
+        # ranks).
         build_t0 = time.perf_counter()
         state_dict = self._engine.state_dict_for_sync()
         build_s = time.perf_counter() - build_t0
@@ -194,19 +191,6 @@ class TrainerActor(ForgeActor):
 
         async def _do_puts() -> float:
             put_t0 = time.perf_counter()
-            # Batch every parameter into a single put_batch so torchstore
-            # creates ONE transport_buffer and drives ONE HiXL RDMA setup
-            # (Connect + RegisterBoundMems + TransferSync) for the whole
-            # state_dict, instead of N separate setups in a tight loop.
-            # Matches upstream torchforge (``titan.py::push_weights``:
-            # ``await ts.put_batch(entries)``) -- the latter is known-good
-            # at GPU scale and was our reference for HiXL on NPU as well.
-            # Doing N back-to-back ``ts.put`` calls instead was an
-            # upper-layer bug in this integration: each call allocates a
-            # fresh ``MonarchRDMATransportBuffer`` and drives a fresh
-            # HiXL RDMA buffer register, which on Ascend 910B + CANN 9.0
-            # eventually exhausts RA HDC driver slots and surfaces as
-            # ``ra_hdc_typical_mr ret=-13`` / ``hixl_connect 503900``.
             entries = {
                 get_param_key(policy_version, name_): tensor_
                 for name_, tensor_ in state_dict.items()
@@ -214,9 +198,6 @@ class TrainerActor(ForgeActor):
             await ts.put_batch(entries)
             return time.perf_counter() - put_t0
 
-        # Single NPU storage volume: only rank 0 pushes to avoid N overlapping
-        # writes of the same key.  Other ranks still participate in the FSDP
-        # gather collective above (``state_dict_for_sync``) but skip ts.put.
         put_s = asyncio.run(_do_puts()) if rank == 0 else 0.0
 
         return {

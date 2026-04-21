@@ -286,14 +286,44 @@ class TitanTrainEngine:
         )
 
     def state_dict_for_sync(self) -> dict:
-        # Keep tensors on device (NPU/GPU): HiXL RDMA cannot register
-        # CPU-resident memory -- a prior ``.cpu()`` here caused every
-        # cross-node ``ts.put_batch`` in ``TorchstoreWeightSync`` to fail
-        # with ``ra_hdc_typical_mr ret=-13``.  See the full explanation in
-        # ``forge/engines/titan/adapter.py::state_dict_for_sync``.
+        # Mirror of ``forge/engines/titan/adapter.py::state_dict_for_sync``.
+        # See that method for the full rationale (on-device tensors,
+        # DTensor materialisation, HF-name translation via sd_adapter,
+        # and why we do not go through ``checkpointer.states["model"]``).
         if not self._initialized:
             raise RuntimeError("Not initialized")
-        return dict(self._engine.model_parts[0].state_dict().items())
+        from torch.distributed.checkpoint._nested_dict import flatten_state_dict
+        from torch.distributed.tensor import DTensor
+
+        raw = self._engine.model_parts[0].state_dict()
+        flat, _spec = flatten_state_dict(raw)
+        sd_adapter = self._get_sd_adapter()
+        if sd_adapter is None:
+            raise RuntimeError(
+                "no sd_adapter available; cannot translate TorchTitan-"
+                "native names to HF form for vLLM."
+            )
+        hf_sd = sd_adapter.to_hf(flat)
+        return {
+            k: (v.full_tensor() if isinstance(v, DTensor) else v)
+            for k, v in hf_sd.items()
+        }
+
+    def _get_sd_adapter(self):
+        existing = getattr(self, "_sd_adapter", None)
+        if existing is not None:
+            return existing
+        train_spec = getattr(self._engine, "train_spec", None)
+        if (
+            train_spec is None
+            or getattr(train_spec, "state_dict_adapter", None) is None
+        ):
+            return None
+        adapter = train_spec.state_dict_adapter(
+            self._engine.model_args, self._config.hf_model_path or ""
+        )
+        self._sd_adapter = adapter
+        return adapter
 
     def get_metadata(self) -> dict:
         return {
