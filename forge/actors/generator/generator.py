@@ -476,13 +476,16 @@ class Generator(ForgeActor):
         total_bytes = int(payload.get("total_bytes") or 0)
 
         if not plan or total_bytes <= 0:
-            return {
-                "success": False,
-                "message": (
-                    "_update_weights_torchstore_flat: payload needs "
-                    "'flat_plan' + 'total_bytes'"
-                ),
-            }
+            # Guard against a bug upstream dropping rank-0's plan.
+            # Returning success=False used to hide this and let the
+            # service look fine; now we raise so the driver-side
+            # sync loop notices and the operator sees the real cause.
+            raise ValueError(
+                f"_update_weights_torchstore_flat(v{version}): payload "
+                f"missing plan (plan_len={len(plan)}) or total_bytes "
+                f"({total_bytes}); the backend's ``_push_flat`` likely "
+                "failed to collect rank-0's publish result."
+            )
 
         self._inproc_engine.pause_generation()
         pull_t0 = time.perf_counter()

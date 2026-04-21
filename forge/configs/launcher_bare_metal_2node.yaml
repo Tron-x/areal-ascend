@@ -55,17 +55,39 @@ launcher:
   # can add sibling keys next to host_idx without a schema break --
   # for slurm this becomes ``{slurm_mesh_name: trainer}``; for k8s,
   # ``{node_selector: {role: trainer}}``.
+  # NB: ``workers:`` above is an *ordered* array -- host_idx is an
+  # integer index into it.  For a 2-node job launched by
+  # ``run_multinode.sh``, the DRIVER_HOST is picked from the *second*
+  # line of the hostfile (so actors with ``hosts=None`` that fall back
+  # to ``this_host()`` end up there).  In the default ``hostfile.txt``
+  # layout ("192.168.0.26\n192.168.0.23"), this means:
+  #
+  #   workers[0] -> 192.168.0.26 = monarch2 (non-driver node)
+  #   workers[1] -> 192.168.0.23 = monarch1 (driver, where the
+  #                                python -m forge.apps.grpo process
+  #                                runs, and therefore where
+  #                                ``this_host()`` resolves to)
+  #
+  # Forge's TrainerActor is spawned with ``hosts=None`` so it rides
+  # ``this_host()`` directly; YAML-declared trainer placement is
+  # documentation-only.  Generator and storage go through
+  # ``launcher.get_host_mesh(name)`` and are actually controlled by
+  # host_idx.  The default layout below keeps trainer & storage
+  # colocated (both on monarch1 = driver) and pins generator to the
+  # other node (monarch2).  Flip storage.host_idx -> 0 to run the
+  # "dedicated PS on generator's host" topology.
   meshes:
     trainer:
-      host_idx: 0         # monarch1 -- 4 NPUs (0..3) for FSDP
+      host_idx: 1         # monarch1 (driver host via this_host()).  Value
+                          # is ignored by the launcher today but kept
+                          # here for completeness.
     generator:
-      host_idx: 1         # monarch2 -- 1 NPU (0) for vLLM
+      host_idx: 0         # monarch2 -- 1 NPU (0) for vLLM
     storage:
-      host_idx: 0         # colocate with trainer; same-host HCCS put,
-                          # cross-node RoCE pull to the generator worker.
-                          # Switch to host_idx: 1 to run the "dedicated
-                          # PS" experiment (storage on monarch2 alongside
-                          # generator, cross-node put, same-host get).
+      host_idx: 1         # monarch1, colocated with trainer.  Set to 0
+                          # to relocate storage to monarch2 ("dedicated
+                          # PS") -- put traffic becomes cross-machine
+                          # RoCE, pull stays intra-host HCCS.
 
   # Weight-sync service configuration.  Forwarded into forge's
   # driver as env-style knobs; each field is individually overridable

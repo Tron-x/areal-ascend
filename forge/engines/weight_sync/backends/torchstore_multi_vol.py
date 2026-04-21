@@ -297,6 +297,21 @@ class MultiVolTorchstoreBackend:
         self._cached_meta_version = version
         self._cached_plan = plan
         self._cached_total_bytes = total_bytes
+
+        # Structured log so the driver-side operator can tell at a
+        # glance whether the push side landed the plan.  An empty plan
+        # or a missing rank=0 payload here is the usual signal that
+        # the pull side will fail with ``success=False`` and the
+        # service will silently look fine -- emit loudly.  print()
+        # instead of logger.info(): the backend's logger is not set to
+        # INFO by default on the driver, and this one line is worth
+        # the noise.
+        print(
+            f"[weight_sync] push_flat(v{version}): "
+            f"ranks_seen={sorted(per_rank.keys())}, "
+            f"plan_len={len(plan)}, total_bytes={total_bytes}",
+            flush=True,
+        )
         # Also populate ParamMeta for API compatibility.
         self._cached_meta = [
             ParamMeta(
@@ -424,14 +439,48 @@ class MultiVolTorchstoreBackend:
             workers_load_s = max(workers_load_s, payload.get("workers_load_s", 0.0))
             success_bytes = max(success_bytes, payload.get("bytes", 0))
 
-        return PullResult(
+        # A worker that returned ``success=False`` means the pull
+        # didn't actually land.  num_keys must be 0 in that case so
+        # ``Service.push_and_pull`` sees ``success=False`` and the
+        # driver's sync loop can react instead of silently believing
+        # weight sync succeeded.
+        any_fail = any(
+            isinstance(p, dict) and not p.get("success", True)
+            for p in per_worker.values()
+        )
+        result = PullResult(
             version=version,
-            num_keys=len(plan) if success_bytes > 0 else 0,
+            num_keys=0 if any_fail else (len(plan) if success_bytes > 0 else 0),
             bytes_total=success_bytes or total_bytes,
             pull_s=pull_s,
             workers_load_s=workers_load_s,
             per_worker=per_worker,
         )
+        # Per-worker summary so any failure on the generator side is
+        # visible from driver logs (Python print()s on the generator
+        # actor don't round-trip back here).  Quiet on success, loud
+        # when any worker returned success=False.
+        if any_fail:
+            per_worker_summary = [
+                {
+                    "idx": idx,
+                    "success": p.get("success") if isinstance(p, dict) else None,
+                    "message": (p.get("message", "") if isinstance(p, dict) else ""),
+                }
+                for idx, p in per_worker.items()
+            ]
+            print(
+                f"[weight_sync] pull_flat(v{version}) had failures: "
+                f"{per_worker_summary}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[weight_sync] pull_flat(v{version}): num_keys={result.num_keys}, "
+                f"pull_s={pull_s:.2f}, workers_load_s={workers_load_s:.2f}",
+                flush=True,
+            )
+        return result
 
     async def _pull_per_param(self, generator_actor: Any, version: int) -> PullResult:
         meta = self._cached_meta or []
