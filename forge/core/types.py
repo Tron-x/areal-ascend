@@ -281,6 +281,7 @@ class Launcher(Enum):
     LOCAL = "local"
     SLURM = "slurm"
     PREALLOCATED = "preallocated"
+    BARE_METAL = "bare_metal"
 
 
 @dataclass
@@ -302,6 +303,8 @@ class LauncherConfig:
     master_port: int = 0
     nnodes: int = 1
     node_rank: int = 0
+    workers: list[str] = field(default_factory=list)
+    worker_port: int = 22222
 
     def __post_init__(self):
         if isinstance(self.launcher, str):

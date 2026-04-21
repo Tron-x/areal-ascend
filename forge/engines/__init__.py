@@ -45,7 +45,7 @@ def create_engine(backend: str = "areal", **kwargs: Any):
         return TitanTrainEngine(**kwargs)
     raise ValueError(
         f"Unknown engine backend: {backend!r}. "
-        f"Available: 'areal', 'fsdp'. "
+        f"Available: 'areal', 'fsdp', 'titan'. "
         f"Contribute new engines in forge/engines/<name>/."
     )
 
@@ -64,13 +64,13 @@ def create_batch_adapter(backend: str = "areal", **kwargs):
         from forge.engines.areal.batch_adapter import AReaLBatchAdapter
 
         return AReaLBatchAdapter(**kwargs)
-    if backend == "fsdp":
+    if backend in ("fsdp", "titan"):
         from forge.engines.fsdp.batch_adapter import FSDPBatchAdapter
 
         return FSDPBatchAdapter(**kwargs)
     raise ValueError(
         f"Unknown batch adapter: {backend!r}. "
-        f"Available: 'areal', 'fsdp'. "
+        f"Available: 'areal', 'fsdp', 'titan'. "
         f"Contribute new adapters in forge/engines/<name>/batch_adapter.py."
     )
 

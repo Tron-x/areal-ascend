@@ -1,0 +1,4 @@
+# Forge multi-node hostfile
+# Format: IP [slots=N]  (slots is informational, not used by worker manager)
+192.168.0.26 slots=8
+192.168.0.23 slots=8

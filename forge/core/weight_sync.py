@@ -35,6 +35,7 @@ class WeightSyncMethod(Enum):
     NCCL = "nccl"
     CHECKPOINT = "checkpoint"
     HIXL = "hixl"
+    TORCHSTORE = "torchstore"
 
 
 @dataclass

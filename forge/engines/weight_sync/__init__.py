@@ -3,7 +3,8 @@
 Available strategies:
     - ``NCCLWeightSync``: Collective broadcast over NCCL/HCCL process group.
     - ``CheckpointWeightSync``: Save to disk, reload on inference side.
-    - ``HIXLWeightSync`` (future): One-sided RDMA via Monarch HIXL library.
+    - ``HIXLWeightSync`` (stub): One-sided RDMA via Monarch HIXL library.
+    - ``TorchstoreWeightSync``: torchstore + Monarch RDMA (HiXL on NPU).
 
 Use ``create_weight_sync()`` to instantiate by method name.
 """
@@ -12,7 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from forge.core.weight_sync import WeightSyncConfig, WeightSyncMethod
+from forge.core.weight_sync import WeightSyncConfig as WeightSyncConfig
+from forge.core.weight_sync import WeightSyncMethod
 
 
 def create_weight_sync(
@@ -43,4 +45,8 @@ def create_weight_sync(
         from forge.engines.weight_sync.hixl_sync import HIXLWeightSync
 
         return HIXLWeightSync(**kwargs)
+    if method == WeightSyncMethod.TORCHSTORE:
+        from forge.engines.weight_sync.torchstore_sync import TorchstoreWeightSync
+
+        return TorchstoreWeightSync(**kwargs)
     raise ValueError(f"Unknown weight sync method: {method!r}")

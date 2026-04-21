@@ -277,6 +277,128 @@ class PreallocatedLauncher(BaseLauncher):
         }
 
 
+class BareMetalLauncher(BaseLauncher):
+    """Launcher for bare-metal multi-node deployment via Monarch TCP transport.
+
+    Connects to pre-started Monarch workers on remote nodes using
+    ``enable_transport`` + ``attach_to_workers``. Each worker address
+    maps to a named HostMesh that actors can be placed on.
+
+    Prerequisites:
+        - Each node runs ``run_worker_loop_forever(address=..., ca=...)``
+        - Network connectivity on the worker port between all nodes
+        - Same conda env and codebase on all nodes
+
+    Usage::
+
+        launcher = BareMetalLauncher(LauncherConfig(
+            launcher=Launcher.BARE_METAL,
+            master_addr="192.168.0.26",
+            workers=["tcp://192.168.0.26:22222", "tcp://192.168.0.23:22222"],
+            gpus_per_node=8,
+        ))
+        await launcher.initialize()
+        host = await launcher.get_host_mesh("trainer")  # first worker
+        host = await launcher.get_host_mesh("generator")  # second worker
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.master_addr = cfg.master_addr or os.environ.get("MASTER_ADDR", "")
+        self.gpus_per_node = cfg.gpus_per_node
+        self.workers = cfg.workers
+        self._full_host_mesh = None
+        self._named_meshes: dict[str, object] = {}
+        self._mesh_assignment: dict[str, int] = {}
+        self._next_worker_idx = 0
+
+    async def initialize(self):
+        from monarch._src.actor.bootstrap import attach_to_workers
+
+        if not self.master_addr:
+            self.master_addr = socket.gethostbyname(socket.gethostname())
+
+        logger.info(
+            "BareMetalLauncher: connecting to %d workers: %s",
+            len(self.workers),
+            self.workers,
+        )
+        self._full_host_mesh = attach_to_workers(
+            ca="trust_all_connections",
+            workers=self.workers,
+        )
+        await self._full_host_mesh.initialized
+        logger.info(
+            "BareMetalLauncher: connected, hosts=%d",
+            self._full_host_mesh.size(),
+        )
+        return None, None
+
+    async def get_host_mesh(self, name: str):
+        """Return a HostMesh slice for the named actor/service.
+
+        Assigns workers round-robin: first unique name gets worker 0,
+        second unique name gets worker 1, etc. Repeated calls with the
+        same name return the same slice.
+        """
+        if name in self._named_meshes:
+            return self._named_meshes[name]
+
+        n_hosts = self._full_host_mesh.size()
+        idx = self._next_worker_idx % n_hosts
+        self._next_worker_idx += 1
+
+        host_slice = self._full_host_mesh.slice(hosts=slice(idx, idx + 1))
+        self._named_meshes[name] = host_slice
+        self._mesh_assignment[name] = idx
+        logger.info(
+            "BareMetalLauncher: assigned mesh '%s' -> worker %d (%s)",
+            name,
+            idx,
+            self.workers[idx] if idx < len(self.workers) else "?",
+        )
+        return host_slice
+
+    async def remote_setup(
+        self, proc_mesh: ProcMesh, env_overrides: dict | None = None
+    ):
+        """Propagate essential environment to remote procs.
+
+        Forces offline mode for remote nodes that may lack internet access.
+        """
+        areal_root = os.environ.get("AREAL_ROOT", os.getcwd())
+        existing_path = os.environ.get("PYTHONPATH", "")
+        new_path = f"{areal_root}:{existing_path}" if existing_path else areal_root
+        env = {
+            "PYTHONPATH": new_path,
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "VLLM_USE_MODELSCOPE": "false",
+            "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+            "FORGE_REMOTE_GENERATOR": "1",
+        }
+        _propagate_ascend_env(env)
+        if env_overrides:
+            env.update(env_overrides)
+        await set_environment(proc_mesh, env)
+
+    async def shutdown(self):
+        if self._full_host_mesh is not None:
+            try:
+                await self._full_host_mesh.stop()
+            except Exception as e:
+                logger.warning("BareMetalLauncher shutdown: %s", e)
+
+    def get_cluster_info(self) -> dict:
+        return {
+            "master_addr": self.master_addr,
+            "workers": self.workers,
+            "gpus_per_node": self.gpus_per_node,
+            "total_gpus": len(self.workers) * self.gpus_per_node,
+            "mesh_assignment": self._mesh_assignment,
+        }
+
+
 class SlurmLauncher(BaseLauncher):
     """Launcher that allocates machines via Monarch SlurmJob.
 
@@ -354,6 +476,8 @@ def get_launcher(cfg) -> BaseLauncher | None:
         return PreallocatedLauncher(cfg)
     if launcher_type == Launcher.SLURM:
         return SlurmLauncher(cfg)
+    if launcher_type == Launcher.BARE_METAL:
+        return BareMetalLauncher(cfg)
 
     return None
 
@@ -393,6 +517,31 @@ class Provisioner:
             logger.info(f"Provisioner using launcher: {type(self.launcher).__name__}")
         else:
             logger.info("Provisioner using local mode (no launcher)")
+
+    async def get_host_mesh(self, name: str):
+        """Get a named HostMesh from the launcher.
+
+        Falls back to this_host() if no launcher is configured.
+        Also registers a GpuManager for remote hosts.
+        """
+        if self.launcher:
+            host_mesh = await self.launcher.get_host_mesh(name)
+            host_id = getattr(host_mesh, "_host_id", None)
+            if host_id is None:
+                host_id = uuid.uuid1()
+                host_mesh._host_id = host_id
+            if host_id not in self._host_gpu_map:
+                remote_gpu_count = await get_host_gpus(host_mesh)
+                self._host_gpu_map[host_id] = GpuManager(
+                    max_device_count=remote_gpu_count
+                )
+                logger.info(
+                    "Registered GpuManager for remote host %s: %d GPUs",
+                    name,
+                    remote_gpu_count,
+                )
+            return host_mesh
+        return this_host()
 
     async def initialize(self):
         """Post-construction async initialization.

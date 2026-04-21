@@ -85,34 +85,6 @@ class TitanTrainEngine:
 
     def initialize(self) -> dict:
         """Create TorchTitan ForgeEngine, build model with full parallelism."""
-        import sys
-
-        print("[TitanInit] ENTER initialize()", flush=True)
-        sys.stderr.write("[TitanInit] ENTER initialize()\n")
-        sys.stderr.flush()
-
-        import torch.distributed as dist
-
-        rank = int(os.environ.get("RANK", -1))
-        world = int(os.environ.get("WORLD_SIZE", -1))
-        master = os.environ.get("MASTER_ADDR", "")
-        port = os.environ.get("MASTER_PORT", "")
-        local_rank = os.environ.get("LOCAL_RANK", "")
-        import sys
-
-        msg = (
-            f"[TitanInit] RANK={rank} WORLD_SIZE={world} "
-            f"MASTER_ADDR={master} MASTER_PORT={port} LOCAL_RANK={local_rank} "
-            f"dist.is_initialized={dist.is_initialized()}"
-        )
-        print(msg, flush=True)
-        sys.stderr.write(msg + "\n")
-        sys.stderr.flush()
-
-        if dist.is_initialized():
-            print("[TitanInit] dist already initialized, destroying", flush=True)
-            dist.destroy_process_group()
-
         from torchtitan.config.job_config import (
             Checkpoint,
             Job,
@@ -127,24 +99,12 @@ class TitanTrainEngine:
 
         cfg = self._config
 
-        model_kwargs = dict(name=cfg.model_name, flavor=cfg.model_flavor)
-        if cfg.hf_model_path:
-            model_kwargs["hf_assets_path"] = cfg.hf_model_path
-
-        checkpoint_kwargs = dict(
-            folder=cfg.checkpoint_dir,
-            interval=cfg.checkpoint_interval,
-        )
-        if cfg.hf_model_path:
-            checkpoint_kwargs.update(
-                initial_load_path=cfg.hf_model_path,
-                initial_load_in_hf=True,
-                initial_load_model_only=True,
-            )
-
         job_config = ForgeJobConfig(
             job=Job(),
-            model=Model(**model_kwargs),
+            model=Model(
+                name=cfg.model_name,
+                flavor=cfg.model_flavor,
+            ),
             optimizer=Optimizer(lr=cfg.lr),
             lr_scheduler=LRScheduler(),
             training=Training(
@@ -159,20 +119,21 @@ class TitanTrainEngine:
                 pipeline_parallel_degree=cfg.pp,
                 context_parallel_degree=cfg.cp,
             ),
-            checkpoint=Checkpoint(**checkpoint_kwargs),
+            checkpoint=Checkpoint(
+                folder=cfg.checkpoint_dir,
+                interval=cfg.checkpoint_interval,
+            ),
         )
 
-        print(f"[TitanInit] rank={rank} creating ForgeEngine...", flush=True)
+        logger.info(
+            "Creating TorchTitan ForgeEngine: model=%s/%s, steps=%d",
+            cfg.model_name,
+            cfg.model_flavor,
+            cfg.max_steps,
+        )
 
         self._engine = ForgeEngine(job_config)
-        print(
-            f"[TitanInit] rank={rank} ForgeEngine created, loading checkpoint...",
-            flush=True,
-        )
-
         self._engine.checkpointer.load(step=1)
-        print(f"[TitanInit] rank={rank} checkpoint loaded, zero_grad...", flush=True)
-
         self._engine.optimizers.zero_grad()
 
         self._loss_fn = self._create_loss()
@@ -325,24 +286,11 @@ class TitanTrainEngine:
         )
 
     def state_dict_for_sync(self) -> dict:
-        """Return the full state_dict with tensors kept on-device (NPU/GPU).
-
-        Critical for HiXL / CANN RoCE weight sync: HiXL registers tensors
-        for one-sided RDMA, and its RA HDC driver rejects CPU-resident
-        memory (``ra_hdc_typical_mr ret=-13``, per HiXL 排查指南 场景二
-        "HOST 内存…当前不支持注册给 ROCE 网卡").  An earlier version of this
-        method returned ``{k: v.cpu() for k, v in ...}`` which -- combined
-        with torchstore's ``MonarchRDMATransportBuffer.allocate`` skipping
-        its NPU staging pool for CPU tensors
-        (``tensor.device.type != "cpu"`` branch in
-        ``torchstore/transport/monarch_rdma.py``) -- caused every
-        ``ts.put_batch`` to hand HiXL a CPU buffer and fail.
-
-        Upstream torchforge's GPU path never does ``.cpu()`` here either:
-        ``src/forge/actors/trainer/titan.py::push_weights`` reads directly
-        from ``self.engine.checkpointer.states["model"].state_dict()`` on
-        GPU and passes device tensors to ``ts.put_batch``.
-        """
+        # Keep tensors on device (NPU/GPU): HiXL RDMA cannot register
+        # CPU-resident memory -- a prior ``.cpu()`` here caused every
+        # cross-node ``ts.put_batch`` in ``TorchstoreWeightSync`` to fail
+        # with ``ra_hdc_typical_mr ret=-13``.  See the full explanation in
+        # ``forge/engines/titan/adapter.py::state_dict_for_sync``.
         if not self._initialized:
             raise RuntimeError("Not initialized")
         return dict(self._engine.model_parts[0].state_dict().items())

@@ -57,13 +57,13 @@ class Generator(ForgeActor):
     def __post_init__(self):
         super().__init__()
         from vllm.engine.arg_utils import EngineArgs
-        from vllm.entrypoints.llm import UsageContext
         from vllm.sampling_params import RequestOutputKind, SamplingParams
 
         self._inproc_engine = None
         self._paused = False
         self.generator_version: int = 0
         self.workers = None
+        self.vllm_config = None
 
         if self.engine_args is None:
             self.engine_args = EngineArgs()
@@ -73,13 +73,22 @@ class Generator(ForgeActor):
             valid_params = set(inspect.signature(EngineArgs.__init__).parameters.keys())
             filtered = {k: v for k, v in self.engine_args.items() if k in valid_params}
             self.engine_args = EngineArgs(**filtered)
-        self.vllm_config = self.engine_args.create_engine_config(UsageContext.LLM_CLASS)
 
         if self.sampling_params is None:
             self.sampling_params = SamplingParams()
         elif isinstance(self.sampling_params, Mapping):
             self.sampling_params = SamplingParams.from_optional(**self.sampling_params)
             self.sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
+
+    def _ensure_vllm_config(self):
+        """Lazily create vllm_config (deferred from __init__ for remote actors)."""
+        if self.vllm_config is None:
+            from vllm.entrypoints.llm import UsageContext
+
+            self.vllm_config = self.engine_args.create_engine_config(
+                UsageContext.LLM_CLASS
+            )
+        return self.vllm_config
 
     @classmethod
     async def launch(cls: type[Generator], *args, **kwargs) -> Generator:
@@ -104,10 +113,15 @@ class Generator(ForgeActor):
         vllm_config = engine_args.create_engine_config(UsageContext.LLM_CLASS)
 
         num_gpus = vllm_config.parallel_config.world_size
+        # launch() runs on the driver (local) node, so create_engine_config is safe here
+        mesh_name = cls.mesh_name or "generator"
 
         provisioner = await _get_provisioner()
 
-        host_mesh = this_host()
+        if cls.hosts:
+            host_mesh = await provisioner.get_host_mesh(mesh_name)
+        else:
+            host_mesh = this_host()
 
         gpu_ids = await provisioner.allocate_gpu_ids(host_mesh, num_gpus)
         logger.info(f"[Generator.launch] Allocated GPUs: {gpu_ids}")
@@ -122,12 +136,22 @@ class Generator(ForgeActor):
             per_host={"procs": 1}, name="generator_proc"
         )
 
+        if cls.hosts and provisioner.launcher:
+            await provisioner.launcher.remote_setup(generator_proc)
+
         worker_registry = generator_proc.spawn("worker_registry", WorkerRegistry)
 
         actor_name = kwargs.pop("name", cls.__name__)
         generator = generator_proc.spawn(actor_name, cls, *args, **kwargs)
         generator._generator_proc = generator_proc
         generator._worker_registry = worker_registry
+        # Expose the underlying host_mesh for callers (e.g. grpo.py's
+        # torchstore weight-sync strategy) that need to spawn sibling
+        # procs (storage volume, etc.) on the same generator host.
+        # Use custom names that don't collide with ``ProcMesh._host_mesh``
+        # / ``_head_host`` internals.
+        generator._forge_gen_host_mesh = host_mesh
+        generator._forge_gen_head_host = head_host
 
         await generator.setup.call(host_mesh, worker_registry, gpu_ids)
         return generator
@@ -145,6 +169,7 @@ class Generator(ForgeActor):
 
         from forge.service.vllm_engine import MonarchVLLMEngine as InprocEngine
 
+        self._ensure_vllm_config()
         num_gpus = self.vllm_config.parallel_config.tensor_parallel_size
         logger.info(
             f"Setting up in-process LLMEngine with {num_gpus} GPUs, "
@@ -288,10 +313,15 @@ class Generator(ForgeActor):
             result = await self._update_weights_xccl()
         elif method == "checkpoint":
             if "model_path" not in payload:
-                return {"success": False, "message": "model_path required for checkpoint sync"}
+                return {
+                    "success": False,
+                    "message": "model_path required for checkpoint sync",
+                }
             result = await self._update_weights_disk(payload)
         elif method == "hixl":
             result = await self._update_weights_hixl(payload)
+        elif method == "torchstore":
+            result = await self._update_weights_torchstore(version, payload)
         else:
             return {"success": False, "message": f"Unknown sync method: {method}"}
 
@@ -309,6 +339,102 @@ class Generator(ForgeActor):
             return {"success": False, "message": f"HIXL update failed: {e}"}
         self._inproc_engine.resume_generation()
         return result
+
+    async def _update_weights_torchstore(self, version: int, payload: dict) -> dict:
+        """Torchstore / Monarch RDMA weight update.
+
+        The Generator actor pulls each parameter from torchstore into NPU
+        memory via Monarch RDMA (HiXL-aliased through the shared staging pool
+        when on Ascend), builds a CPU state_dict, and then calls the standard
+        ``WorkerWrapper.update_weights(state_dict, version)`` endpoint on each
+        vLLM worker.  Workers go through vLLM's ``model.load_weights`` path,
+        which handles TP resharding internally.
+
+        ``payload`` must carry ``param_names``, ``param_shapes``,
+        ``param_dtypes`` (as produced by ``TrainerActor.push_weights_torchstore``).
+
+        The actor assumes ``torchstore.initialize`` has already been called in
+        the driver; the shared Monarch controller is picked up implicitly.
+        """
+        import time
+
+        import torch
+        import torchstore as ts
+
+        from forge.engines.weight_sync.torchstore_sync import get_param_key
+
+        param_names = payload.get("param_names") or []
+        param_shapes = payload.get("param_shapes") or []
+        param_dtypes = payload.get("param_dtypes") or []
+        if not param_names:
+            return {
+                "success": False,
+                "message": (
+                    "torchstore sync requires param_names/param_shapes/param_dtypes "
+                    "in the payload (produced by TrainerActor.push_weights_torchstore)."
+                ),
+            }
+
+        self._inproc_engine.pause_generation()
+        pull_t0 = time.perf_counter()
+        total_bytes = 0
+        state_dict: dict[str, torch.Tensor] = {}
+        try:
+            for name, shape, dtype_name in zip(param_names, param_shapes, param_dtypes):
+                key = get_param_key(version, name)
+                dtype = getattr(torch, dtype_name)
+                tensor = await ts.get(key)
+                if tensor is None:
+                    raise RuntimeError(f"torchstore missed key {key!r}")
+                if tensor.shape != tuple(shape) or tensor.dtype != dtype:
+                    raise RuntimeError(
+                        f"torchstore key {key!r} returned tensor "
+                        f"shape={tensor.shape} dtype={tensor.dtype}, "
+                        f"expected shape={shape} dtype={dtype}"
+                    )
+                # Monarch RPC to the vLLM workers goes through cloudpickle,
+                # which can't serialise NPU tensors directly -- stage to CPU
+                # once here, workers will ``.to(device)`` back on load.  This
+                # trade still saves 1x cross-host transfer (RDMA instead of
+                # disk) relative to the checkpoint-based strategy.
+                if tensor.device.type != "cpu":
+                    tensor = tensor.cpu()
+                state_dict[name] = tensor
+                total_bytes += tensor.numel() * tensor.element_size()
+            pull_s = time.perf_counter() - pull_t0
+
+            load_t0 = time.perf_counter()
+            loaded_mesh = await self.workers.update_weights.call(
+                state_dict=state_dict, version=version
+            )
+            load_s = time.perf_counter() - load_t0
+            loaded = next(iter(loaded_mesh.items()))[1]
+        except Exception as e:
+            self._inproc_engine.resume_generation()
+            logger.exception("torchstore sync failed")
+            return {
+                "success": False,
+                "message": f"torchstore sync failed: {e}",
+                "bytes": total_bytes,
+            }
+        self._inproc_engine.resume_generation()
+
+        logger.info(
+            "torchstore sync v%d: %d keys, %.2f GB, pull=%.2fs, workers.load=%.2fs",
+            version,
+            len(param_names),
+            total_bytes / (1024**3),
+            pull_s,
+            load_s,
+        )
+        return {
+            "success": True,
+            "message": f"torchstore sync: loaded {loaded} params",
+            "bytes": total_bytes,
+            "num_keys": len(param_names),
+            "pull_s": pull_s,
+            "workers_load_s": load_s,
+        }
 
     @endpoint
     async def handle_request(self, ep: str, payload: dict) -> dict:
@@ -341,10 +467,16 @@ class Generator(ForgeActor):
 
         handler = _route_map.get(ep)
         if handler is not None:
-            if ep in ("/forge/weights/update_nccl", "/areal_update_weights_xccl",
-                       "/forge/weights/update_nccl_lora", "/areal_update_weights_lora_xccl",
-                       "/forge/generation/pause", "/areal_pause_generation",
-                       "/forge/generation/resume", "/areal_continue_generation"):
+            if ep in (
+                "/forge/weights/update_nccl",
+                "/areal_update_weights_xccl",
+                "/forge/weights/update_nccl_lora",
+                "/areal_update_weights_lora_xccl",
+                "/forge/generation/pause",
+                "/areal_pause_generation",
+                "/forge/generation/resume",
+                "/areal_continue_generation",
+            ):
                 return await handler()
             return await handler(payload)
         if ep == "/health":
@@ -434,13 +566,7 @@ class Generator(ForgeActor):
         return {"success": True, "message": "Generation resumed"}
 
     async def _collective_rpc(self, method: str, *args):
-        import asyncio
-
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: self.workers.execute_method.call(method, *args).get(timeout=300),
-        )
+        result = await self.workers.execute_method.call(method, *args)
         ret_list = [v for _, v in result.items()]
         success = True
         message = ""

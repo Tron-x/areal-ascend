@@ -37,7 +37,8 @@ ASCEND_ROOT="$(dirname "$CANN_HOME")"
 set -eu
 
 if [[ "${CONDA_DEFAULT_ENV:-}" != "monarch_ascend" ]]; then
-    eval "$(conda shell.bash hook)"
+    CONDA_EXE="${CONDA_EXE:-$(command -v conda 2>/dev/null || echo "$HOME/miniconda3/bin/conda")}"
+    eval "$("$CONDA_EXE" shell.bash hook)"
     conda activate monarch_ascend
 fi
 

@@ -66,15 +66,8 @@ class AReaLInferenceBridge(InferenceEngine):
         self._workflow_executor: WorkflowExecutor | None = None
         self._initialized = False
 
-        self._bg_loop = asyncio.new_event_loop()
-        import threading
-
-        self._bg_thread = threading.Thread(
-            target=self._bg_loop.run_forever,
-            daemon=True,
-            name="AReaLInferenceBridge_bg_loop",
-        )
-        self._bg_thread.start()
+        self._bg_loop = None
+        self._bg_thread = None
 
     # -----------------------------------------------------------------
     # Lifecycle
@@ -131,8 +124,9 @@ class AReaLInferenceBridge(InferenceEngine):
         if self._workflow_executor is not None:
             self._workflow_executor.destroy()
 
-        self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
-        if self._bg_thread.is_alive():
+        if self._bg_loop is not None:
+            self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+        if self._bg_thread is not None and self._bg_thread.is_alive():
             self._bg_thread.join(timeout=2.0)
 
     @property
@@ -257,21 +251,14 @@ class AReaLInferenceBridge(InferenceEngine):
     # -----------------------------------------------------------------
 
     def _rpc_sync(self, endpoint: str, payload: dict, timeout: float = 300):
-        func = getattr(self._generator, "call", None)
-        if func is not None:
-            future = asyncio.run_coroutine_threadsafe(
-                func("handle_request", endpoint, payload), self._bg_loop
-            )
-            return future.result(timeout=timeout)
-        else:
-            return self._generator.handle_request.call_one(endpoint, payload).get(
-                timeout=timeout
-            )
+        return self._generator.handle_request.call_one(endpoint, payload).get(
+            timeout=timeout
+        )
 
     def init_weights_update_group(
         self, meta: WeightUpdateMeta, xccl_group_ranks: list[int] | None = None
     ) -> Future[None]:
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import Future as StdFuture
 
         def _do():
             if xccl_group_ranks is not None:
@@ -286,15 +273,24 @@ class AReaLInferenceBridge(InferenceEngine):
                 )
                 self._rpc_sync(http_req.endpoint, http_req.payload)
 
-        pool = ThreadPoolExecutor(max_workers=1)
-        fut = pool.submit(_do)
-        pool.shutdown(wait=False)
+        import threading
+
+        fut = StdFuture()
+
+        def _run():
+            try:
+                _do()
+                fut.set_result(None)
+            except Exception as e:
+                fut.set_exception(e)
+
+        threading.Thread(target=_run, daemon=True).start()
         return fut
 
     def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> Future[None]:
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import Future as StdFuture
 
         def _do():
             weight_reqs = self._backend.build_distributed_weight_update_requests(
@@ -303,22 +299,40 @@ class AReaLInferenceBridge(InferenceEngine):
             for http_req in weight_reqs.requests:
                 self._rpc_sync(http_req.endpoint, http_req.payload)
 
-        pool = ThreadPoolExecutor(max_workers=1)
-        fut = pool.submit(_do)
-        pool.shutdown(wait=False)
+        import threading
+
+        fut = StdFuture()
+
+        def _run():
+            try:
+                _do()
+                fut.set_result(None)
+            except Exception as e:
+                fut.set_exception(e)
+
+        threading.Thread(target=_run, daemon=True).start()
         return fut
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import Future as StdFuture
 
         def _do():
             weight_reqs = self._backend.build_disk_weight_update_requests(meta)
             for http_req in weight_reqs.requests:
                 self._rpc_sync(http_req.endpoint, http_req.payload)
 
-        pool = ThreadPoolExecutor(max_workers=1)
-        fut = pool.submit(_do)
-        pool.shutdown(wait=False)
+        import threading
+
+        fut = StdFuture()
+
+        def _run():
+            try:
+                _do()
+                fut.set_result(None)
+            except Exception as e:
+                fut.set_exception(e)
+
+        threading.Thread(target=_run, daemon=True).start()
         return fut
 
     def update_weights_from_awex(

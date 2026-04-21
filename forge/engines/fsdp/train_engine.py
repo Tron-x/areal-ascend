@@ -125,7 +125,8 @@ class FSDPTrainEngine:
         rank = dist.get_rank() if dist.is_initialized() else 0
         logger.info(
             "FSDPTrainEngine[rank=%d] initialized: max_steps=%d",
-            rank, cfg.max_steps,
+            rank,
+            cfg.max_steps,
         )
         return {
             "max_steps": cfg.max_steps,
@@ -199,7 +200,9 @@ class FSDPTrainEngine:
 
         return {
             "loss": loss_output.loss.item(),
-            "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else float(grad_norm),
+            "grad_norm": grad_norm.item()
+            if hasattr(grad_norm, "item")
+            else float(grad_norm),
             "lr": self._scheduler.get_last_lr()[0],
             "step": step,
         }
@@ -232,10 +235,17 @@ class FSDPTrainEngine:
 
         For FSDP2 models, this returns the local shard. The
         ``WeightSyncStrategy`` handles reassembly if needed.
+
+        Tensors are kept on device (NPU/GPU): HiXL RDMA cannot register
+        CPU-resident memory (``ra_hdc_typical_mr ret=-13``).  Any
+        downstream consumer that really needs CPU should do ``.cpu()``
+        itself after the RDMA transfer completes -- see
+        ``forge/engines/titan/adapter.py::state_dict_for_sync`` for the
+        full root-cause writeup.
         """
         if not self._initialized:
             raise RuntimeError("FSDPTrainEngine not initialized")
-        return {k: v.cpu() for k, v in self._model.state_dict().items()}
+        return dict(self._model.state_dict().items())
 
     def get_metadata(self) -> dict:
         return {
@@ -404,7 +414,9 @@ class FSDPTrainEngine:
 
         logger.info(
             "Initializing dist: rank=%d, world=%d, backend=%s",
-            rank, world_size, backend,
+            rank,
+            world_size,
+            backend,
         )
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
@@ -425,7 +437,9 @@ class FSDPTrainEngine:
         }
         try:
             model = AutoModelForCausalLM.from_pretrained(
-                model_path, attn_implementation="flash_attention_2", **load_kwargs,
+                model_path,
+                attn_implementation="flash_attention_2",
+                **load_kwargs,
             )
         except (ImportError, ValueError):
             logger.info("flash_attention_2 not available, using default attention")
@@ -466,6 +480,7 @@ class FSDPTrainEngine:
             if step < warmup:
                 return step / max(warmup, 1)
             import math
+
             progress = (step - warmup) / max(max_steps - warmup, 1)
             return 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -477,9 +492,11 @@ class FSDPTrainEngine:
 
         if self._config.loss_type == "grpo":
             from forge.rl.loss import GRPOLoss
+
             return GRPOLoss(**loss_kwargs)
         elif self._config.loss_type == "dapo":
             from forge.rl.loss import DAPOLoss
+
             return DAPOLoss(**loss_kwargs)
         else:
             raise ValueError(f"Unknown loss type: {self._config.loss_type!r}")

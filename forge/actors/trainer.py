@@ -127,6 +127,110 @@ class TrainerActor(ForgeActor):
         return self._engine.state_dict_for_sync()
 
     @endpoint
+    def push_weights_torchstore(self, policy_version: int) -> dict:
+        """Push the engine's state_dict to torchstore for TorchstoreWeightSync.
+
+        Each parameter ``name`` is stored as ``policy_ver_{version%2:010d}.{name}``
+        (see ``forge.engines.weight_sync.torchstore_sync.get_param_key``), which
+        matches torchforge's key scheme and keeps the KV store bounded by
+        ping-ponging between two versions.
+
+        The call expects ``torchstore.initialize`` to have already been run in
+        the driver with a storage mesh; the trainer process picks up the same
+        Monarch controller automatically.
+
+        Note:
+            Declared as a **sync** endpoint because Monarch requires all
+            endpoints on a given Actor class to have the same colour, and
+            the rest of ``TrainerActor`` is sync.  The async ``ts.put``
+            calls are driven via ``asyncio.run(...)`` inside this sync
+            handler -- Monarch runs sync endpoints on a worker thread so
+            spinning up a private event loop is safe (no deadlock risk
+            with the actor's own loop).
+
+        Args:
+            policy_version: Monotonic step/version counter.
+
+        Returns:
+            Dict with:
+                - ``num_keys``: number of params pushed
+                - ``bytes``: total payload bytes
+                - ``build_state_dict_s``: seconds spent materialising the
+                  state_dict on CPU
+                - ``put_s``: seconds spent in ``ts.put``
+                - ``param_names``: list of param names (in push order)
+                - ``param_shapes``: list of shapes (tuples)
+                - ``param_dtypes``: list of dtype strings (e.g. ``"bfloat16"``)
+        """
+        if not self._use_engine:
+            raise RuntimeError("push_weights_torchstore requires a TrainEngine")
+        import asyncio
+        import time
+
+        import torch.distributed as dist
+        import torchstore as ts
+
+        from forge.engines.weight_sync.torchstore_sync import get_param_key
+
+        # All ranks participate in ``state_dict_for_sync`` because FSDP/HSDP
+        # sharded tensors need a collective gather to materialise full
+        # tensors on each rank.  Only rank 0 then publishes to torchstore
+        # so we don't get N overlapping writes for the same key.
+        build_t0 = time.perf_counter()
+        state_dict = self._engine.state_dict_for_sync()
+        build_s = time.perf_counter() - build_t0
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        total_bytes = 0
+        param_names: list[str] = []
+        param_shapes: list[tuple] = []
+        param_dtypes: list[str] = []
+        for name, tensor in state_dict.items():
+            param_names.append(name)
+            param_shapes.append(tuple(tensor.shape))
+            param_dtypes.append(str(tensor.dtype).replace("torch.", ""))
+            total_bytes += tensor.numel() * tensor.element_size()
+
+        async def _do_puts() -> float:
+            put_t0 = time.perf_counter()
+            # Batch every parameter into a single put_batch so torchstore
+            # creates ONE transport_buffer and drives ONE HiXL RDMA setup
+            # (Connect + RegisterBoundMems + TransferSync) for the whole
+            # state_dict, instead of N separate setups in a tight loop.
+            # Matches upstream torchforge (``titan.py::push_weights``:
+            # ``await ts.put_batch(entries)``) -- the latter is known-good
+            # at GPU scale and was our reference for HiXL on NPU as well.
+            # Doing N back-to-back ``ts.put`` calls instead was an
+            # upper-layer bug in this integration: each call allocates a
+            # fresh ``MonarchRDMATransportBuffer`` and drives a fresh
+            # HiXL RDMA buffer register, which on Ascend 910B + CANN 9.0
+            # eventually exhausts RA HDC driver slots and surfaces as
+            # ``ra_hdc_typical_mr ret=-13`` / ``hixl_connect 503900``.
+            entries = {
+                get_param_key(policy_version, name_): tensor_
+                for name_, tensor_ in state_dict.items()
+            }
+            await ts.put_batch(entries)
+            return time.perf_counter() - put_t0
+
+        # Single NPU storage volume: only rank 0 pushes to avoid N overlapping
+        # writes of the same key.  Other ranks still participate in the FSDP
+        # gather collective above (``state_dict_for_sync``) but skip ts.put.
+        put_s = asyncio.run(_do_puts()) if rank == 0 else 0.0
+
+        return {
+            "num_keys": len(param_names),
+            "bytes": total_bytes,
+            "build_state_dict_s": build_s,
+            "put_s": put_s,
+            "param_names": param_names,
+            "param_shapes": param_shapes,
+            "param_dtypes": param_dtypes,
+            "rank": rank,
+        }
+
+    @endpoint
     def get_engine_metadata(self) -> dict:
         """Return engine metadata (TrainEngine path)."""
         if not self._use_engine:

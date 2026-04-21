@@ -125,12 +125,18 @@ class AReaLMonarchExecutor(Executor):
     worker_class = WorkerWrapper
 
     def _init_executor(self) -> None:
-        from monarch.actor import enable_transport
+        from monarch._src.actor.actor_mesh import BindSpec, configure
 
         try:
-            enable_transport("tcp")
-        except RuntimeError:
-            pass
+            local_ip = socket.gethostbyname(socket.gethostname())
+            configure(default_transport=BindSpec(f"tcp://{local_ip}:0"))
+            logger.info(
+                f"[AReaLMonarchExecutor] Set local transport: tcp://{local_ip}:0"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[AReaLMonarchExecutor] Could not reconfigure transport: {e}"
+            )
 
         host_mesh_str = os.environ.get("VLLM_MONARCH_HOST_MESH")
         if not host_mesh_str:

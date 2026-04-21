@@ -75,11 +75,11 @@ def compute_logprobs(
     logits_fp32 = logits.float() / temperature
     B, S, V = logits_fp32.shape
     logprobs = -F.cross_entropy(
-        logits_fp32.view(-1, V),
-        target_ids.view(-1).long(),
+        logits_fp32.reshape(-1, V),
+        target_ids.reshape(-1).long(),
         ignore_index=ignore_index,
         reduction="none",
-    ).view(B, S)
+    ).reshape(B, S)
     return logprobs, []
 
 
