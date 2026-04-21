@@ -322,6 +322,8 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
         key: str,
         plan: list | None = None,
         total_bytes: int = 0,
+        shard_ranges: list | None = None,
+        shard_key_fmt: str = "",
     ) -> dict:
         """Flat-buffer pull: one ``ts.get`` of the packed state_dict, then
         local unpack into model parameters.
@@ -398,18 +400,48 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
         )
         timing["alloc_s"] = time.perf_counter() - t0
 
-        # Step 2: single ts.get into the aligned flat buffer.
-        async def _do_get() -> None:
+        # Step 2: fetch the flat buffer.  Two shapes depending on how
+        # the trainer published:
+        #
+        # * legacy / single-key: one rank writes the whole thing
+        #   under ``key``; we do one ``ts.get(key, inplace=flat)``.
+        # * B1.1 shard-parallel: each trainer rank writes its byte
+        #   range under ``{key}.shard_{rank}``.  We dispatch one
+        #   ``ts.get`` per shard concurrently, each landing a
+        #   contiguous slice of ``flat`` at the matching offset.
+        #   LocalRankStrategy routes get i to volume i, so all N
+        #   RoCE NICs receive in parallel.
+        async def _do_get_single() -> None:
             await ts.get(key, inplace_tensor=flat)
+
+        async def _do_get_shards() -> None:
+            tasks = []
+            for entry in shard_ranges or []:
+                # entry is (rank, start, end)
+                r_rank, r_start, r_end = entry
+                shard_key = shard_key_fmt.format(rank=int(r_rank))
+                shard_view = flat[int(r_start) : int(r_end)]
+                tasks.append(ts.get(shard_key, inplace_tensor=shard_view))
+            # Fire all N shards together; torchstore's per-key
+            # transport_buffer setup runs in parallel under
+            # ``asyncio.gather``.
+            await asyncio.gather(*tasks)
+
+        use_shards = bool(shard_ranges) and bool(shard_key_fmt)
 
         t0 = time.perf_counter()
         try:
-            asyncio.run(_do_get())
+            if use_shards:
+                asyncio.run(_do_get_shards())
+            else:
+                asyncio.run(_do_get_single())
         except Exception as e:
             logger.exception("pull_weights_flat: ts.get failed")
             return {
                 "success": False,
-                "message": f"pull_weights_flat ts.get({key}): {e}",
+                "message": (
+                    f"pull_weights_flat {'shards' if use_shards else 'key=' + key}: {e}"
+                ),
                 "bytes": 0,
                 "num_keys": 0,
             }

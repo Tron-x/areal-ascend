@@ -487,6 +487,9 @@ class Generator(ForgeActor):
                 "failed to collect rank-0's publish result."
             )
 
+        shard_ranges = payload.get("shard_ranges") or []
+        shard_key_fmt = payload.get("shard_key_fmt") or ""
+
         self._inproc_engine.pause_generation()
         pull_t0 = time.perf_counter()
         try:
@@ -495,6 +498,8 @@ class Generator(ForgeActor):
                 key=flat_key,
                 plan=plan,
                 total_bytes=total_bytes,
+                shard_ranges=shard_ranges,
+                shard_key_fmt=shard_key_fmt,
             )
             pull_s = time.perf_counter() - pull_t0
         except Exception as e:

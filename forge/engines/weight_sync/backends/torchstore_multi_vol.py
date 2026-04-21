@@ -151,6 +151,13 @@ class MultiVolTorchstoreBackend:
         # asking the trainer again.
         self._cached_plan: list | None = None
         self._cached_total_bytes: int = 0
+        # Shard byte-ranges for the most recent push, one tuple
+        # ``(rank, start, end)`` per trainer rank.  Used by
+        # ``_pull_flat`` to tell the generator which keys to fetch
+        # and where to land them in the receive-side flat buffer.
+        # Empty list = single-rank publish (legacy behaviour) where
+        # everything lives under the base ``.flat`` key.
+        self._cached_shard_ranges: list[tuple[int, int, int]] = []
 
     # ------------------------------------------------------------------ key
 
@@ -297,19 +304,34 @@ class MultiVolTorchstoreBackend:
         self._cached_meta_version = version
         self._cached_plan = plan
         self._cached_total_bytes = total_bytes
+        # Shard ranges come from rank 0 (it publishes the full list);
+        # non-zero ranks only include their own range.  If rank 0's
+        # payload is missing, fall back to reconstructing from the
+        # per-rank payloads we did receive.
+        shard_ranges = rank0_payload.get("shard_ranges") or []
+        if not shard_ranges:
+            reconstructed: list[tuple[int, int, int]] = []
+            for r, payload in sorted(per_rank.items()):
+                for entry in payload.get("shard_ranges", []):
+                    if len(entry) == 3:
+                        reconstructed.append(tuple(entry))
+                    elif len(entry) == 2:
+                        reconstructed.append((r, int(entry[0]), int(entry[1])))
+            shard_ranges = reconstructed
+        self._cached_shard_ranges = shard_ranges
+        # Per-rank put_s max across ranks gives us a fair push_s;
+        # the cheap ranks will finish fast and only the slowest matters
+        # for end-to-end latency.
+        put_s_max = max(
+            (payload.get("put_s", 0.0) for payload in per_rank.values()),
+            default=0.0,
+        )
 
-        # Structured log so the driver-side operator can tell at a
-        # glance whether the push side landed the plan.  An empty plan
-        # or a missing rank=0 payload here is the usual signal that
-        # the pull side will fail with ``success=False`` and the
-        # service will silently look fine -- emit loudly.  print()
-        # instead of logger.info(): the backend's logger is not set to
-        # INFO by default on the driver, and this one line is worth
-        # the noise.
         print(
             f"[weight_sync] push_flat(v{version}): "
             f"ranks_seen={sorted(per_rank.keys())}, "
-            f"plan_len={len(plan)}, total_bytes={total_bytes}",
+            f"plan_len={len(plan)}, total_bytes={total_bytes}, "
+            f"shard_ranges={shard_ranges}, put_s_max={put_s_max:.2f}",
             flush=True,
         )
         # Also populate ParamMeta for API compatibility.
@@ -416,7 +438,13 @@ class MultiVolTorchstoreBackend:
         key = self.flat_key_for(version)
         total_bytes = self._cached_total_bytes
         plan = self._cached_plan or []
+        shard_ranges = self._cached_shard_ranges
 
+        # When the trainer side wrote per-rank byte shards (the
+        # B1.1 path), hand the generator the shard list so it can
+        # fan out the pull across N torchstore volumes.  Legacy
+        # single-key publishes set shard_ranges=[] and the generator
+        # falls back to the original ``flat_key`` single get.
         t0 = time.perf_counter()
         pull_mesh = await generator_actor.update_weights_sync.call(
             version,
@@ -425,6 +453,8 @@ class MultiVolTorchstoreBackend:
                 "flat_key": key,
                 "flat_plan": plan,
                 "total_bytes": total_bytes,
+                "shard_ranges": shard_ranges,
+                "shard_key_fmt": f"{key}.shard_{{rank}}",
             },
         )
         pull_s = time.perf_counter() - t0

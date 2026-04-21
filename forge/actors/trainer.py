@@ -195,34 +195,47 @@ class TrainerActor(ForgeActor):
         version: int,
         key: str,
     ) -> dict:
-        """Flat-buffer publish: pack state_dict into one 2 MiB-aligned NPU
-        buffer and write it as a single torchstore key.
+        """Flat-buffer publish: pack state_dict into a 2 MiB-aligned NPU
+        buffer and write it to torchstore.
 
-        Why this is dramatically faster than :meth:`publish_weights` at
-        the cost of slightly more Python:
+        Two paths, picked by the env var ``FORGE_SHARD_PUBLISH`` (default
+        off -> rank-0-only):
 
-        * One ``ts.put(key, flat)`` -> one RDMA handshake + one
-          TransferSync.  Sidesteps the 311-key-by-311-key overhead that
-          torchstore's ``MonarchRDMATransportBuffer`` pays because its
-          ``supports_batch_gets`` / ``puts`` is ``False``.
+        Rank-0-only (default, ``FORGE_SHARD_PUBLISH`` unset/0):
+          * Every trainer rank participates in the FSDP state_dict
+            gather (collective), then ranks 1..N-1 early-return.
+          * Rank 0 packs the full state_dict into one flat buffer and
+            issues a single ``ts.put(key, flat)``.  LocalRankStrategy
+            routes it to volume 0.  Steady state ~13 GB/s on our
+            2-node RoCE fabric.
 
-        * The flat buffer is allocated via
-          ``monarch._src.rdma.xdma.alloc_aligned_tensor`` so the RDMA
-          transfer's local + remote ends are both 2 MiB aligned -- no
-          ``hixl_transfer_write ret=503900`` on small tail params, no
-          per-param pool staging copies.
+        Shard-parallel (``FORGE_SHARD_PUBLISH=1``, EXPERIMENTAL):
+          * Each rank packs the full flat buffer on its own NPU and
+            puts *only its byte-shard* under
+            ``{key}.shard_{rank}``.  LocalRankStrategy routes the put
+            to volume ``rank``, so the four shards would in principle
+            land on four separate NIC links in parallel.
+          * **Status: does not work on our CANN / HiXL stack today.**
+            The torchstore ``MonarchRDMATransportBuffer`` + HiXL
+            integration bakes a fixed (client NPU 0 <-> server
+            NPU ``storage_npu_base``) pair into its rankTable.  When
+            ranks 1..N-1 also try to ``ts.put``, HCCL cluster init
+            fails with ``errNo 0x0000000005000007`` and the corresponding
+            rank's ``rdma_manager[0]`` actor gets cleanup'd.  Needs a
+            torchstore-side patch to build the rankTable from the
+            caller's (trainer_rank, storage_rank) pair at RDMA-buffer
+            creation time.  The scaffolding here stays so the fix has
+            a small landing strip once the torchstore change is ready.
 
-        Only rank 0 actually publishes (same RdmaManagerActor-per-proc
-        constraint as :meth:`publish_weights`); other ranks participate
-        in the collective gather and early-return.
-
-        Returns the layout plan (``[(name, shape, dtype, offset,
-        nbytes), ...]``) + ``total_bytes`` in the payload so the
-        generator can allocate a matching flat buffer and unpack.
+        The shard split (when enabled) is aligned to ``HIXL_BLOCK``
+        (2 MiB) so every rank's starting offset is on a 2 MiB
+        boundary -- required by HiXL RoCE registration on the write
+        side.
         """
         if not self._use_engine:
             raise RuntimeError("publish_weights_flat requires a TrainEngine")
         import asyncio
+        import os
         import time
 
         import torch
@@ -230,6 +243,7 @@ class TrainerActor(ForgeActor):
         import torchstore as ts
 
         from forge.engines.weight_sync._flat_layout import (
+            HIXL_BLOCK,
             build_meta_from_state_dict,
             plan_layout,
             torch_dtype_from_str,
@@ -240,11 +254,18 @@ class TrainerActor(ForgeActor):
         build_s = time.perf_counter() - build_t0
 
         rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         meta = build_meta_from_state_dict(state_dict)
         plan, total_bytes = plan_layout(meta)
 
-        if rank != 0:
+        shard_publish_enabled = (
+            os.environ.get("FORGE_SHARD_PUBLISH", "0") == "1" and world_size > 1
+        )
+
+        # Rank-0-only path: ranks 1..N-1 early-return with an empty
+        # plan.  This is the stable, measured-13-GB/s path.
+        if not shard_publish_enabled and rank != 0:
             return {
                 "num_keys": len(plan),
                 "bytes": total_bytes,
@@ -252,14 +273,15 @@ class TrainerActor(ForgeActor):
                 "pack_s": 0.0,
                 "put_s": 0.0,
                 "plan": [],
+                "shard_ranges": [],
+                "world_size": world_size,
                 "rank": rank,
             }
 
-        # --- rank 0: pack + put ------------------------------------------
+        # --- pack side (always runs on rank 0; runs on every rank when
+        # the shard path is enabled) -------------------------------------
         from monarch._src.rdma.xdma import alloc_aligned_tensor
 
-        # All tensors in state_dict are NPU (state_dict_for_sync keeps
-        # them on device).  Pick the device from the first tensor.
         first_tensor = next(iter(state_dict.values()))
         device = first_tensor.device
 
@@ -267,10 +289,6 @@ class TrainerActor(ForgeActor):
         flat, _raw = alloc_aligned_tensor(
             (total_bytes,), dtype=torch.uint8, device=device
         )
-        # Pack every parameter into its slot.  view().view() reinterprets
-        # the uint8 slice as the target dtype+shape and copy_ does an
-        # NPU->NPU DMA.  311 small NPU->NPU copies should total well
-        # under 50 ms for Qwen3-0.6B.
         for name, shape, dtype_str, offset, nbytes in plan:
             td = torch_dtype_from_str(dtype_str)
             view = flat[offset : offset + nbytes].view(td).view(shape)
@@ -281,9 +299,31 @@ class TrainerActor(ForgeActor):
             torch.cuda.synchronize()
         pack_s = time.perf_counter() - pack_t0
 
+        # --- put side ---------------------------------------------------
+        if shard_publish_enabled:
+            # Per-rank byte shards, each aligned to a HIXL_BLOCK
+            # boundary so HiXL register_mem on the write side accepts
+            # the slice.  Last rank eats the tail.
+            def _shard_range(idx: int) -> tuple[int, int]:
+                base = (total_bytes // world_size) // HIXL_BLOCK * HIXL_BLOCK
+                start = idx * base
+                end = (idx + 1) * base if idx < world_size - 1 else total_bytes
+                return start, end
+
+            shard_ranges_full = [_shard_range(i) for i in range(world_size)]
+            shard_start, shard_end = shard_ranges_full[rank]
+            put_key = f"{key}.shard_{rank}"
+            put_tensor = flat[shard_start:shard_end]
+        else:
+            shard_ranges_full = []
+            shard_start = 0
+            shard_end = total_bytes
+            put_key = key
+            put_tensor = flat
+
         async def _do_put() -> float:
             put_t0 = time.perf_counter()
-            await ts.put(key, flat)
+            await ts.put(put_key, put_tensor)
             return time.perf_counter() - put_t0
 
         put_s = asyncio.run(_do_put())
@@ -293,13 +333,30 @@ class TrainerActor(ForgeActor):
         # is still pulling it.
         self._pushed_flat = flat
 
+        if rank == 0:
+            return {
+                "num_keys": len(plan),
+                "bytes": total_bytes,
+                "build_state_dict_s": build_s,
+                "pack_s": pack_s,
+                "put_s": put_s,
+                "plan": plan,
+                # Empty when shard publish is disabled -- pull side
+                # then falls back to the legacy single-key get.
+                "shard_ranges": shard_ranges_full,
+                "world_size": world_size,
+                "rank": rank,
+            }
+        # Non-zero ranks (only reachable when shard publish is on).
         return {
             "num_keys": len(plan),
             "bytes": total_bytes,
             "build_state_dict_s": build_s,
             "pack_s": pack_s,
             "put_s": put_s,
-            "plan": plan,
+            "plan": [],
+            "shard_ranges": [(rank, shard_start, shard_end)],
+            "world_size": world_size,
             "rank": rank,
         }
 
