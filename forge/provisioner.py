@@ -337,26 +337,70 @@ class BareMetalLauncher(BaseLauncher):
     async def get_host_mesh(self, name: str):
         """Return a HostMesh slice for the named actor/service.
 
-        Assigns workers round-robin: first unique name gets worker 0,
-        second unique name gets worker 1, etc. Repeated calls with the
-        same name return the same slice.
+        Lookup order:
+
+        1. Cached result from a previous call (same name always maps to
+           the same slice).
+        2. Explicit placement from ``cfg.meshes`` -- e.g.
+           ``meshes={"trainer": 0, "generator": 1, "storage": 0}``
+           pins each mesh to a specific worker index.  This is the
+           recommended path: topology becomes a declaration rather
+           than a side effect of call order.  Placements can be plain
+           ints (bare-metal: worker index) or dicts with ``host_idx``
+           (forward-compat shape for the day we add k8s/slurm fields
+           alongside).
+        3. Round-robin fallback: first new name gets worker 0, second
+           gets worker 1, etc.  Kept so un-configured smoke tests keep
+           working, but we log a warning if multiple names collide on
+           the same worker this way -- that tends to mean "you forgot
+           to add the mesh to ``cfg.meshes``".
         """
         if name in self._named_meshes:
             return self._named_meshes[name]
 
         n_hosts = self._full_host_mesh.size()
-        idx = self._next_worker_idx % n_hosts
-        self._next_worker_idx += 1
+        cfg_meshes = getattr(self.cfg, "meshes", {}) or {}
+        placement = cfg_meshes.get(name)
+
+        idx: int
+        if placement is not None:
+            # Accept both plain int and dict forms.  Dict form is the
+            # shape we expect k8s/slurm launchers to share.
+            if isinstance(placement, int):
+                idx = placement
+            elif isinstance(placement, dict):
+                idx = int(placement.get("host_idx", 0))
+            else:
+                raise TypeError(
+                    f"BareMetalLauncher: unsupported placement type "
+                    f"{type(placement).__name__} for mesh {name!r}: "
+                    f"expected int or dict with 'host_idx', got {placement!r}"
+                )
+            if idx < 0 or idx >= n_hosts:
+                raise IndexError(
+                    f"BareMetalLauncher: mesh {name!r} placement host_idx="
+                    f"{idx} out of range (have {n_hosts} workers: "
+                    f"{self.workers})"
+                )
+            logger.info(
+                "BareMetalLauncher: mesh '%s' -> worker %d (%s) [explicit]",
+                name,
+                idx,
+                self.workers[idx] if idx < len(self.workers) else "?",
+            )
+        else:
+            idx = self._next_worker_idx % n_hosts
+            self._next_worker_idx += 1
+            logger.info(
+                "BareMetalLauncher: mesh '%s' -> worker %d (%s) [round-robin]",
+                name,
+                idx,
+                self.workers[idx] if idx < len(self.workers) else "?",
+            )
 
         host_slice = self._full_host_mesh.slice(hosts=slice(idx, idx + 1))
         self._named_meshes[name] = host_slice
         self._mesh_assignment[name] = idx
-        logger.info(
-            "BareMetalLauncher: assigned mesh '%s' -> worker %d (%s)",
-            name,
-            idx,
-            self.workers[idx] if idx < len(self.workers) else "?",
-        )
         return host_slice
 
     async def remote_setup(

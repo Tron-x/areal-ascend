@@ -663,6 +663,7 @@ def main():
     provisioner_config = None
 
     bare_metal_args = {}
+    mesh_placement: dict[str, int] = {}
     backend_override = None
     titan_args = {}
     remaining_argv = []
@@ -678,6 +679,28 @@ def main():
         elif argv[i] == "--bare-metal-worker-port":
             bare_metal_args["worker_port"] = int(argv[i + 1])
             i += 2
+        elif argv[i] == "--mesh-placement":
+            # Parse: "trainer=0,generator=1,storage=0" into
+            # {"trainer": 0, "generator": 1, "storage": 0}.
+            # Maps logical mesh names to worker indices in the bare-metal
+            # launcher's worker array.  Future launchers (slurm, k8s)
+            # will accept the same --mesh-placement form but interpret
+            # the right-hand side as a mesh / node selector, not an
+            # index.  Keep this parser dumb and string-typed so
+            # alternate forms (JSON dict, scheme prefix, etc.) can slot
+            # in without restructuring the CLI.
+            for item in argv[i + 1].split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                if "=" not in item:
+                    raise ValueError(
+                        f"--mesh-placement expects 'name=worker_idx' "
+                        f"pairs, got {item!r}"
+                    )
+                name, v = item.split("=", 1)
+                mesh_placement[name.strip()] = int(v.strip())
+            i += 2
         elif argv[i] == "--backend":
             backend_override = argv[i + 1]
             i += 2
@@ -691,12 +714,26 @@ def main():
             remaining_argv.append(argv[i])
             i += 1
 
+    # Env-var fallback for mesh placement so run_multinode.sh can pass
+    # this through without tweaking the command line.  Parsed identically
+    # to --mesh-placement.
+    env_placement = os.environ.get("FORGE_MESH_PLACEMENT", "").strip()
+    if env_placement and not mesh_placement:
+        for item in env_placement.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                name, v = item.split("=", 1)
+                mesh_placement[name.strip()] = int(v.strip())
+
     if bare_metal_args:
         from forge.types import Launcher, LauncherConfig, ProvisionerConfig
 
         provisioner_config = ProvisionerConfig(
             launcher_config=LauncherConfig(
                 launcher=Launcher.BARE_METAL,
+                meshes=mesh_placement,
                 **bare_metal_args,
             )
         )

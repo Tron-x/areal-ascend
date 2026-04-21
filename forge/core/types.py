@@ -306,6 +306,22 @@ class LauncherConfig:
     workers: list[str] = field(default_factory=list)
     worker_port: int = 22222
 
+    # Explicit name -> placement map for launcher.get_host_mesh(name).
+    #
+    # Today (bare-metal) each value is the integer index into `workers`,
+    # e.g. {"trainer": 0, "generator": 1, "storage": 0} pins storage to
+    # the same host as trainer.  Leaving this empty keeps the legacy
+    # round-robin fallback for backward compat.
+    #
+    # Future launchers (slurm, k8s) are expected to keep the same
+    # "name -> placement" shape: the value type will grow into a dict
+    # ({"host_idx": 0, "slurm_mesh_name": ...}) at that point and the
+    # bare-metal launcher will accept both int and dict for a migration
+    # window.  Using a plain int today keeps the schema approachable;
+    # the bare-metal launcher normalizes it to the richer shape
+    # internally before consuming it.
+    meshes: dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self):
         if isinstance(self.launcher, str):
             self.launcher = Launcher(self.launcher)

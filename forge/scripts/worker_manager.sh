@@ -115,18 +115,24 @@ unset TORCHSTORE_RDMA_ENABLED
 # eager D2H path does .cpu() + malloc which is (a) not 2MB-aligned and (b) bypasses
 # HiXL.  Users who really need CPU tensors should .cpu() explicitly before ts.put().
 export TORCHSTORE_MONARCH_RDMA_EAGER_D2H=0
-# Both *client* (trainer / generator) and *server* (storage) procs need to
-# agree on the staging pool: torchstore's transport buffer allocation path
-# (``_empty_for_rdma``) uses the pool as the destination on get, and
-# :meth:`MonarchRDMATransportBuffer.allocate` uses the pool to *stage* any
-# non-pool-resident source tensor into an aligned pool slot (critical --
-# it's the only thing that keeps FSDP state_dict tensors from triggering a
-# fresh HiXL ``register_mem`` each put, which CANN RA rejects with
-# ``ra_hdc_typical_mr ret=-13``).  So keep the pool env here too.  The 8 GB
-# per-proc footprint is acceptable because trainers only use it as
-# transient staging per ``ts.put``; it's not held for the optimizer state.
+# Both *client* (trainer / generator) and *server* (storage) procs need
+# to agree on the staging pool: torchstore's transport buffer allocation
+# path (_empty_for_rdma) uses the pool as the destination on get, and
+# MonarchRDMATransportBuffer.allocate uses the pool to stage any
+# non-pool-resident source tensor into an aligned pool slot (critical
+# -- it is the only thing that keeps FSDP state_dict tensors from
+# triggering a fresh HiXL register_mem each put, which CANN RA rejects
+# with ra_hdc_typical_mr ret=-13).  So keep the pool env here too.  The
+# 8 GB per-proc footprint is acceptable because trainers only use it as
+# transient staging per ts.put; it is not held for the optimizer state.
+# (Backticks stripped from this comment -- this whole block lands inside
+# a bash heredoc whose body does not escape backticks, so any rst/md
+# role like :meth:\`...\` would be command-substituted.)
 export TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:0
-export TORCHSTORE_MONARCH_RDMA_POOL_MB=8192
+# Pool size: honor whatever the launcher shell set (so
+# run_multinode.sh can propagate a lower value when NPU 0 is tight),
+# default 8192 for the common Qwen3-0.6B case.
+export TORCHSTORE_MONARCH_RDMA_POOL_MB=${TORCHSTORE_MONARCH_RDMA_POOL_MB:-8192}
 exec python3 -c "
 from monarch.actor import run_worker_loop_forever
 run_worker_loop_forever(address='tcp://${HOST_IP}:${WORKER_PORT}', ca='trust_all_connections')

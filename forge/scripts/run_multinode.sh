@@ -96,6 +96,32 @@ SSH_CMD="ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 #   TORCHSTORE_MONARCH_RDMA_POOL_MB - HiXL staging pool size per volume
 FORGE_WEIGHT_SYNC_FWD="${FORGE_WEIGHT_SYNC:-nccl}"
 FORGE_WEIGHT_SYNC_BACKEND_FWD="${FORGE_WEIGHT_SYNC_BACKEND:-torchstore_multi_vol}"
+# Explicit mesh placement (name -> worker_idx), e.g.
+#   FORGE_MESH_PLACEMENT="trainer=0,generator=1,storage=0"
+# pins storage to the trainer host (current default layout).  Setting
+# storage=1 relocates it to the generator host, making the trainer->storage
+# leg cross-machine RoCE and the storage->worker leg intra-host HCCS -- the
+# "dedicated PS" topology.  Empty = fall back to the BareMetalLauncher's
+# round-robin assignment (legacy behaviour).
+FORGE_MESH_PLACEMENT_FWD="${FORGE_MESH_PLACEMENT:-}"
+# Relocate storage off the trainer host by name.  Decoupled from the
+# placement map so you can say "put storage on whichever host the
+# 'generator' mesh resolves to" without hardcoding a worker index.
+FORGE_STORAGE_HOST_MESH_FWD="${FORGE_STORAGE_HOST_MESH:-trainer}"
+# When storage moves to a dedicated host, the NPU base usually wants to
+# be 0 (no trainer ranks to avoid on that host); when storage stays on
+# the trainer host, base=train_world_size (the backend's default).
+FORGE_STORAGE_NPU_BASE_FWD="${TORCHSTORE_STORAGE_NPU_BASE:-}"
+# torchstore staging pool per proc, in MB.  Default 8192 covers
+# Qwen3-0.6B (1.4 GB flat + headroom).  On boxes where trainer NPU 0
+# already lives close to capacity (activation + optimizer state)
+# setting this to 4096 or 2048 is the usual rescue knob.  The pool
+# size trades ``_pre_put_hook`` staging overhead against how much NPU
+# room the trainer can spare at weight-sync time.
+TORCHSTORE_POOL_MB_FWD="${TORCHSTORE_MONARCH_RDMA_POOL_MB:-8192}"
+# Re-export so worker_manager.sh + its spawned workers inherit it
+# (their heredoc reads the launcher shell's env at ``cat`` time).
+export TORCHSTORE_MONARCH_RDMA_POOL_MB="${TORCHSTORE_POOL_MB_FWD}"
 
 $SSH_CMD root@${DRIVER_HOST} "\
 source ${CANN_HOME}/set_env.sh 2>/dev/null; \
@@ -111,13 +137,16 @@ export ASCEND_SLOG_PRINT_TO_STDOUT=\"\${ASCEND_SLOG_PRINT_TO_STDOUT:-1}\"; \
 export HCCL_DEBUG=\"\${HCCL_DEBUG:-INFO}\"; \
 export FORGE_WEIGHT_SYNC='${FORGE_WEIGHT_SYNC_FWD}'; \
 export FORGE_WEIGHT_SYNC_BACKEND='${FORGE_WEIGHT_SYNC_BACKEND_FWD}'; \
+export FORGE_MESH_PLACEMENT='${FORGE_MESH_PLACEMENT_FWD}'; \
+export FORGE_STORAGE_HOST_MESH='${FORGE_STORAGE_HOST_MESH_FWD}'; \
+[ -n '${FORGE_STORAGE_NPU_BASE_FWD}' ] && export TORCHSTORE_STORAGE_NPU_BASE='${FORGE_STORAGE_NPU_BASE_FWD}'; \
 export MONARCH_HIXL_TRANSPORT=roce; \
 export HCCL_INTRA_ROCE_ENABLE=1; \
 export HCCL_CONNECT_TIMEOUT=120; \
 export HCCL_NPU_SOCKET_PORT_RANGE=60000-60255; \
 export TORCHSTORE_MONARCH_RDMA_EAGER_D2H=0; \
 export TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:0; \
-export TORCHSTORE_MONARCH_RDMA_POOL_MB=8192; \
+export TORCHSTORE_MONARCH_RDMA_POOL_MB='${TORCHSTORE_POOL_MB_FWD}'; \
 cd ${AREAL_ROOT}; \
 BACKEND_ARGS=''; \
 [ -n '${BACKEND}' ] && BACKEND_ARGS=\"--backend ${BACKEND}\"; \
