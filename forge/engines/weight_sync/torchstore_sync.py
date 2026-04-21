@@ -1,22 +1,27 @@
-"""TorchstoreWeightSync - cross-node weight sync via torchstore + Monarch RDMA.
+"""TorchstoreWeightSync -- legacy single-volume torchstore driver.
 
-Mirrors Meta torchforge's trainer.push_weights / generator.update_weights pattern
-(``src/forge/actors/trainer/titan.py`` / ``src/forge/actors/vllm/v1/generator.py``)
-but adapted to AReaL's WeightSyncStrategy contract and Ascend NPU + HiXL RoCE
-transport.
+**Superseded by** :mod:`forge.engines.weight_sync.service` +
+:mod:`forge.engines.weight_sync.backends.torchstore_multi_vol`.  That path
+uses N storage volumes colocated with trainer ranks (``LocalRankStrategy``),
+lets vLLM workers pull directly into NPU params via ``ts.get(inplace_tensor=
+model_param.data)``, and exposes a pluggable backend interface so future
+topologies (P2P, dedicated PS, AReaL xccl fallback) slot in without touching
+the Trainer / Generator / driver code.
 
-Flow
-----
-1. Driver spawns a storage-volume mesh on the generator host and calls
-   ``ts.initialize(mesh=storage_mesh, strategy=LocalRankStrategy(MonarchRDMA))``.
-   All Monarch actors under the driver share the same named torchstore
-   controller via ``get_or_spawn_controller``.
-2. Trainer actor (endpoint ``push_weights_torchstore``) serializes its HF
-   state_dict into ``policy_ver_{0|1}.{name}`` keyed entries and calls
-   ``ts.put_batch``.  The ``{0|1}`` ping-pong avoids unbounded store growth.
-3. Generator actor (endpoint ``pull_weights_torchstore``) iterates the same
-   keys and calls ``ts.get(key, inplace_tensor=dst)`` into pre-allocated
-   NPU buffers (registered 2 MB-aligned so MonarchRDMA+HiXL can zero-copy).
+This module is kept only for:
+
+1. **Key-scheme helpers** (``get_param_key``, ``get_param_prefix``,
+   ``extract_param_name``) that the new code reuses verbatim so the wire
+   format of stored weights stays stable across the old and new paths.
+
+2. **``TorchstoreWeightSync`` class** as a fallback implementation of the
+   ``WeightSyncStrategy`` protocol.  ``forge/apps/grpo.py`` no longer routes
+   ``FORGE_WEIGHT_SYNC=torchstore`` here (that now dispatches to the new
+   service), but out-of-tree callers that build a ``WeightSyncConfig`` and
+   pass a ``storage_mesh`` in ``extra`` will still work.
+
+New code should import from ``forge.engines.weight_sync.service`` and
+``forge.engines.weight_sync.backends`` instead.
 """
 
 from __future__ import annotations

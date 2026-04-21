@@ -34,97 +34,68 @@ from forge.provisioner import init_provisioner, shutdown
 logger = logging.getLogger("ForgeGRPO")
 
 
-def _storage_bootstrap(dev_id: int):
-    """Bootstrap for a single-NPU torchstore storage proc.
+# Storage spawn / bootstrap helpers used to live here; they moved into the
+# backend implementations (see
+# ``forge/engines/weight_sync/backends/torchstore_multi_vol.py::_storage_bootstrap_factory``)
+# now that weight-sync goes through ``WeightSyncService`` + pluggable backend.
 
-    The storage volume lives in NPU device memory so HiXL RDMA can register
-    it and both trainer and generator engines can do one-sided put/get
-    straight into/out of it.  This is the only supported storage topology:
-    RoCE across hosts, 2 MB-aligned NPU buffers, single staging pool per
-    storage volume.
 
-    ``dev_id`` selects the physical NPU (typically an idle one — e.g. 7 —
-    so the storage HiXL engine doesn't share an HCCL port range with the
-    trainer's FSDP comm group or the generator's vLLM comm group).
+async def _create_weight_sync(forge_cfg, trainer, generator):
+    """Create and initialize a weight-sync driver for TrainEngine backends.
+
+    Two dispatch paths depending on ``FORGE_WEIGHT_SYNC``:
+
+    * ``"torchstore"`` (and future values "p2p_rdma" / "dedicated_ps" /
+      "areal_xccl"):  go through the new ``WeightSyncService`` +
+      ``WeightSyncBackend`` abstraction.  The service owns the
+      parallelism-aware orchestration; backends plug in under it.  This is
+      the path we want all new callers on.
+
+    * ``"nccl"`` / ``"checkpoint"`` / ``"hixl"`` (legacy):  fall through
+      to the old ``WeightSyncStrategy`` factory.  Kept for one release so
+      existing deployments don't break.
+
+    Backend selection for the Service path is controlled by
+    ``FORGE_WEIGHT_SYNC_BACKEND`` (default ``"torchstore_multi_vol"``):
+    see ``forge/engines/weight_sync/backends/__init__.py``.
     """
-    import os as _os
+    method_str = os.environ.get("FORGE_WEIGHT_SYNC", "nccl")
 
-    def _bootstrap():
-        _os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(dev_id)
-        _os.environ["MONARCH_NPU_DEVICE"] = "0"
-        _os.environ["MONARCH_HIXL_TRANSPORT"] = "roce"
-        _os.environ["HCCL_INTRA_ROCE_ENABLE"] = "1"
-        _os.environ.setdefault("HCCL_CONNECT_TIMEOUT", "120")
-        _os.environ.setdefault("HCCL_NPU_SOCKET_PORT_RANGE", "60000-60255")
-        _os.environ["TORCHSTORE_MONARCH_RDMA_EAGER_D2H"] = "0"
-        _os.environ["TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE"] = "npu:0"
-        _os.environ.setdefault("TORCHSTORE_MONARCH_RDMA_POOL_MB", "8192")
-        _os.environ.setdefault("LOCAL_RANK", "0")
-        _os.environ.setdefault("RANK", "0")
-        import torch
-        import torch_npu  # noqa: F401
-
-        torch.npu.set_device(0)
-
-    return _bootstrap
+    if method_str == "torchstore":
+        return await _create_weight_sync_service(forge_cfg, trainer, generator)
+    return await _create_legacy_weight_sync(forge_cfg, trainer, generator, method_str)
 
 
-async def _spawn_storage_mesh(dev_id: int, mesh_name: str = "generator"):
-    """Spawn a single torchstore StorageVolume proc on the generator host.
+async def _create_weight_sync_service(forge_cfg, trainer, generator):
+    """New path: WeightSyncService + pluggable backend."""
+    from forge.engines.weight_sync.backends import create_backend
+    from forge.engines.weight_sync.service import (
+        ParallelLayout,
+        WeightSyncService,
+    )
 
-    Topology (phase-1 goal: measure cross-node HiXL RoCE bandwidth):
+    backend_name = os.environ.get("FORGE_WEIGHT_SYNC_BACKEND", "torchstore_multi_vol")
+    # Backend-specific options from env (kept narrow so YAML stays clean).
+    backend_kwargs: dict = {}
+    if backend_name == "torchstore_multi_vol":
+        # storage_npu_base: where the N storage volumes sit on the trainer
+        # host.  Default is "right after the trainer's NPUs" -- trainer
+        # uses 0..N-1, storage uses N..2N-1.  Setting 0 would collocate
+        # storage on the same NPUs as trainer (untested, likely triggers
+        # HCCL port collision).
+        npu_base_env = os.environ.get("TORCHSTORE_STORAGE_NPU_BASE")
+        if npu_base_env is not None:
+            backend_kwargs["storage_npu_base"] = int(npu_base_env)
+        pool_mb_env = os.environ.get("TORCHSTORE_MONARCH_RDMA_POOL_MB")
+        if pool_mb_env is not None:
+            backend_kwargs["pool_mb"] = int(pool_mb_env)
 
-        trainer NPU 0-3 (node 23)  ──HiXL RoCE write──►  storage (node 26 NPU `dev_id`)
-                                                                        │
-        generator NPU 0 (node 26)  ◄──intra-node HiXL read──────────────┘
-
-    We deliberately put storage on the **generator** host (not the trainer
-    host) for two reasons:
-
-    1. The trainer host runs FSDP's HCCL comm group on NPUs 0-3.  Adding a
-       HiXL engine on an NPU on the same host forces intra-node HiXL
-       Connect(trainer_npu → storage_npu) which races with the FSDP PG at
-       the CANN RA driver level and surfaces as ``RaHdcTypicalMrReg ret=-13
-       / HcclCommPrepare 0x13 / hixl_connect 503900``.
-    2. Putting storage next to the generator makes the heavy trainer→storage
-       path pure **cross-node RoCE** -- which is exactly the bandwidth we
-       want phase-1 to measure -- and keeps the intra-node generator→storage
-       hop short and collision-free (generator uses NPU 0, storage uses an
-       idle NPU e.g. 7, so their HiXL engines don't share an HCCL port
-       range with anything else).
-
-    One storage volume, only trainer rank 0 pushes, generator pulls the
-    full state_dict.  HiXL handshake matrix: 4 cross-node pairs
-    (trainer_rank_i ↔ storage) + 1 intra-node pair (generator ↔ storage).
-
-    Args:
-        dev_id: physical NPU ID to pin the storage proc to (typically 7 -
-            an idle card on the generator host).
-        mesh_name: host-mesh name to colocate with (defaults to ``generator``).
-
-    Returns a Monarch ``ProcMesh`` suitable for ``ts.initialize(mesh=...)``,
-    or ``None`` on failure (caller should skip torchstore sync).
-    """
     try:
-        from forge.provisioner import _get_provisioner
-
-        provisioner = await _get_provisioner()
-        trainer_hosts = await provisioner.get_host_mesh(mesh_name)
-        storage_mesh = trainer_hosts.spawn_procs(
-            per_host={"procs": 1},
-            name="torchstore_storage",
-            bootstrap=_storage_bootstrap(dev_id),
-        )
-        print(
-            f"[WeightSync] spawned 1 NPU storage proc on trainer host mesh "
-            f"'{mesh_name}' pinned to NPU {dev_id} (HiXL/RoCE, mesh={storage_mesh}).",
-            flush=True,
-        )
-        return storage_mesh
+        backend = create_backend(backend_name, **backend_kwargs)
     except Exception as e:
         print(
-            f"[WeightSync] failed to spawn storage mesh on trainer host: "
-            f"{type(e).__name__}: {e}",
+            f"[WeightSync] failed to create backend {backend_name!r}: "
+            f"{type(e).__name__}: {e}.  Disabling sync.",
             flush=True,
         )
         import traceback
@@ -132,54 +103,51 @@ async def _spawn_storage_mesh(dev_id: int, mesh_name: str = "generator"):
         traceback.print_exc()
         return None
 
+    layout = ParallelLayout(
+        train_world=forge_cfg.train_world_size,
+        gen_world=forge_cfg.gen_world_size,
+        gen_tp=int(os.environ.get("FORGE_GEN_TP", "1")),
+        gen_pp=int(os.environ.get("FORGE_GEN_PP", "1")),
+        ps_world=int(os.environ.get("FORGE_PS_WORLD", "0")),
+        trainer_mesh_name="trainer",
+        generator_mesh_name="generator",
+        ps_mesh_name="ps",
+    )
 
-async def _create_weight_sync(forge_cfg, trainer, generator):
-    """Create and initialize a WeightSyncStrategy for TrainEngine backends.
+    service = WeightSyncService(
+        backend=backend,
+        trainer_actor=trainer,
+        generator_actor=generator,
+        layout=layout,
+        config={"forge_cfg": forge_cfg},
+    )
+    try:
+        await service.initialize()
+        print(
+            f"[WeightSync] initialized: method=torchstore, backend={backend_name}, "
+            f"layout=train={layout.train_world} gen={layout.gen_world} "
+            f"tp={layout.gen_tp}",
+            flush=True,
+        )
+    except Exception as e:
+        print(
+            f"[WeightSync] service init failed: {type(e).__name__}: {e}. "
+            "Continuing without sync.",
+            flush=True,
+        )
+        import traceback
 
-    Selection is via ``FORGE_WEIGHT_SYNC`` env var:
-        - ``"nccl"`` (default): HCCL/NCCL collective broadcast
-        - ``"checkpoint"``: save+reload via disk
-        - ``"hixl"``: one-sided HiXL RDMA (stub)
-        - ``"torchstore"``: torchstore + Monarch RDMA (HiXL on NPU).  Reuses
-          the generator actor's proc_mesh as the storage volume mesh so the
-          StorageVolume lives on the same host (and HiXL engine pair) as
-          the generator and can leverage the shared Monarch-RDMA staging pool.
-    """
+        traceback.print_exc()
+        return None
+    return service
+
+
+async def _create_legacy_weight_sync(forge_cfg, trainer, generator, method_str):
+    """Old path: direct WeightSyncStrategy factory (nccl/checkpoint/hixl)."""
     from forge.core.weight_sync import WeightSyncConfig, WeightSyncMethod
     from forge.engines.weight_sync import create_weight_sync
 
-    method_str = os.environ.get("FORGE_WEIGHT_SYNC", "nccl")
     method = WeightSyncMethod(method_str)
-
-    extra: dict | None = None
-    if method == WeightSyncMethod.TORCHSTORE:
-        # Single NPU storage proc on the trainer host: rank 0 pushes, generator
-        # pulls, both via HiXL RoCE one-sided RDMA into/out of the storage's
-        # NPU device memory.  Pin it to an idle NPU (default 7) so it doesn't
-        # share an HCCL port range with the trainer's FSDP comm group.
-        storage_npu = int(os.environ.get("TORCHSTORE_STORAGE_NPU", "7"))
-        storage_host = os.environ.get("TORCHSTORE_STORAGE_HOST_MESH", "generator")
-        storage_mesh = await _spawn_storage_mesh(
-            dev_id=storage_npu, mesh_name=storage_host
-        )
-        if storage_mesh is None:
-            print(
-                "[WeightSync] FORGE_WEIGHT_SYNC=torchstore requested but "
-                f"could not spawn storage proc on host mesh '{storage_host}' "
-                "(see logs above). Disabling sync.",
-                flush=True,
-            )
-            return None
-        extra = {
-            "storage_mesh": storage_mesh,
-            "num_storage_volumes": 1,
-        }
-        print(
-            f"[WeightSync] method=torchstore; 1 NPU storage proc on "
-            f"'{storage_host}' host NPU {storage_npu} ({storage_mesh}).",
-            flush=True,
-        )
-
     config = WeightSyncConfig(
         method=method,
         checkpoint_dir=os.path.join(forge_cfg.fileroot, "weight_sync"),
@@ -188,16 +156,14 @@ async def _create_weight_sync(forge_cfg, trainer, generator):
         world_size=forge_cfg.train_world_size + forge_cfg.gen_world_size,
         rank_offset=forge_cfg.train_world_size,
         backend="hccl" if os.environ.get("ASCEND_VISIBLE_DEVICES") else "nccl",
-        extra=extra,
     )
-
     strategy = create_weight_sync(method_str)
     try:
         await strategy.initialize(trainer, generator, config)
-        print(f"[WeightSync] initialized: method={method_str}", flush=True)
+        print(f"[WeightSync] initialized (legacy): method={method_str}", flush=True)
     except Exception as e:
         print(
-            f"[WeightSync] init failed: {type(e).__name__}: {e}. "
+            f"[WeightSync] legacy init failed: {type(e).__name__}: {e}. "
             "Continuing without sync.",
             flush=True,
         )

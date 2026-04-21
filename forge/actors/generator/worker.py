@@ -101,7 +101,13 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
         state_dict: dict[str, Any] | None = None,
         version: int | None = None,
     ) -> int:
-        """Load weights from a state dict into the model.
+        """Legacy path: load weights from a state dict into the model.
+
+        Kept for the non-torchstore backends and for local debugging where
+        a caller already has CPU / NPU tensors in hand.  The fast path for
+        ``torchstore_multi_vol`` is ``pull_weights`` below -- it runs
+        inside this worker proc and lets HiXL RDMA write straight into the
+        model's NPU parameters without any CPU staging.
 
         Args:
             state_dict: HF-format state dict to load.
@@ -122,6 +128,114 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
             loaded += 1
         logger.info(f"[WorkerWrapper] Loaded {loaded} weights (v{version})")
         return loaded
+
+    @endpoint
+    def pull_weights(
+        self,
+        version: int,
+        items: list[dict] | None = None,
+    ) -> dict:
+        """Zero-CPU fast path: pull weights from torchstore straight into
+        this worker's NPU parameter memory via HiXL RDMA.
+
+        Each ``items[i]`` is ``{"name": str, "key": str}`` (plus optional
+        ``slice_spec`` for Phase-2 TP>1).  For each item:
+
+        1. Look up ``name`` in ``model.named_parameters()``.  vLLM's Qwen3
+           (and many other models) fuses some weights (e.g. ``gate_proj ||
+           up_proj`` -> ``gate_up_proj``), so HF names may not map 1:1 to
+           ``named_parameters`` -- those fall back to the classic
+           ``model.load_weights([(name, tensor)])`` path so vLLM's loader
+           handles the fusion.
+        2. For direct-map params: ``ts.get(key, inplace_tensor=param.data)``.
+           torchstore + MonarchRDMA + HiXL RoCE writes the remote tensor's
+           bytes straight into the NPU memory backing ``param.data``.  No
+           ``.cpu()``, no ``.to(device)``, no intermediate tensor.
+        3. For fused params: first ``ts.get(key)`` into a regular NPU
+           tensor, then ``model.load_weights([(hf_name, tensor)])`` so
+           vLLM's loader does the fused-slot assignment.
+
+        Returns aggregate stats; the caller sums across workers if needed.
+        """
+        if not items:
+            return {
+                "success": False,
+                "message": "pull_weights: empty items",
+                "bytes": 0,
+                "num_keys": 0,
+            }
+
+        import asyncio
+        import time
+
+        import torch
+        import torchstore as ts
+
+        model = self.worker.model_runner.model
+        name_to_param = dict(model.named_parameters())
+
+        load_t0 = time.perf_counter()
+        direct_count = 0
+        fused_count = 0
+        total_bytes = 0
+
+        async def _do_pulls() -> None:
+            nonlocal direct_count, fused_count, total_bytes
+            for item in items:
+                name = item["name"]
+                key = item["key"]
+                param = name_to_param.get(name)
+                if param is not None:
+                    # Direct HiXL RDMA write into NPU param memory.
+                    # Important: .data keeps the exact storage; ts.get
+                    # inplace_tensor writes into the provided tensor's
+                    # storage without reallocating.
+                    await ts.get(key, inplace_tensor=param.data)
+                    direct_count += 1
+                    total_bytes += param.numel() * param.element_size()
+                else:
+                    # Fused-param fallback: let vLLM's loader figure out
+                    # which slot (gate / up / etc.) this HF name maps to.
+                    tensor = await ts.get(key)
+                    if tensor is None:
+                        raise RuntimeError(
+                            f"pull_weights: torchstore miss for key {key!r}"
+                        )
+                    device = torch.accelerator.current_accelerator()
+                    model.load_weights([(name, tensor.to(device))])
+                    fused_count += 1
+                    total_bytes += tensor.numel() * tensor.element_size()
+
+        try:
+            asyncio.run(_do_pulls())
+        except Exception as e:
+            logger.exception("pull_weights failed")
+            return {
+                "success": False,
+                "message": f"pull_weights failed: {e}",
+                "bytes": total_bytes,
+                "num_keys": direct_count + fused_count,
+            }
+
+        workers_load_s = time.perf_counter() - load_t0
+        logger.info(
+            f"[WorkerWrapper] pull_weights v{version}: "
+            f"{direct_count} direct + {fused_count} fused, "
+            f"{total_bytes / 1024**3:.2f} GB, {workers_load_s:.2f}s "
+            f"({total_bytes / workers_load_s / 1024**3:.2f} GB/s)"
+            if workers_load_s > 0
+            else f"[WorkerWrapper] pull_weights v{version}: "
+            f"{direct_count} direct + {fused_count} fused"
+        )
+        return {
+            "success": True,
+            "message": f"direct={direct_count}, fused={fused_count}",
+            "bytes": total_bytes,
+            "num_keys": direct_count + fused_count,
+            "workers_load_s": workers_load_s,
+            "direct_count": direct_count,
+            "fused_count": fused_count,
+        }
 
     @endpoint
     def destroy_process_group(self) -> None:

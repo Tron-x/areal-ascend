@@ -128,51 +128,97 @@ class TrainerActor(ForgeActor):
 
     @endpoint
     def push_weights_torchstore(self, policy_version: int) -> dict:
-        """Push the engine's state_dict to torchstore for TorchstoreWeightSync.
+        """Legacy entry-point: single-volume torchstore push.
 
-        Every parameter is stored under ``policy_ver_{v%2:010d}.{name}``
-        (see ``forge.engines.weight_sync.torchstore_sync.get_param_key``);
-        the ``{0|1}`` slot ping-pong keeps the store bounded by two
-        versions, matching torchforge's scheme.
+        Kept for compatibility with pre-``WeightSyncService`` callers.
+        New code should go through :meth:`publish_weights` which is the
+        backend-agnostic entry point driven by
+        :class:`~forge.engines.weight_sync.service.WeightSyncService`.
+        """
+        from forge.engines.weight_sync.torchstore_sync import get_param_key
 
-        ``ts.put_batch(entries)`` hands the whole state_dict to
-        torchstore in a single transport-buffer setup -- this is the
-        same API upstream torchforge uses in
-        ``src/forge/actors/trainer/titan.py::push_weights``.  An earlier
-        version of this method drove a per-parameter ``for ... ts.put``
-        loop which, on CANN/HiXL, amplified every per-registration
-        cost into 300 back-to-back HiXL ``RegisterBoundMems`` calls and
-        eventually starved the RA HDC driver (``ra_hdc_typical_mr
-        ret=-13``).
+        return self._publish_impl(
+            version=policy_version,
+            key_for=lambda v, name: get_param_key(v, name),
+            only_rank_zero=True,
+        )
 
-        An even more aggressive "pack into one flat 2 MiB-aligned NPU
-        buffer, put one chunk at a time" variant was evaluated and
-        regressed end-to-end sync latency from ~3 s to ~12 s for
-        Qwen3-0.6B: the extra per-parameter ``full_tensor()`` gather
-        collectives + pack copies on the trainer, combined with the
-        per-view ``.cpu()`` copies on the generator side, dominate any
-        win from the reduced HiXL registration count at this model
-        size.  If that balance shifts at larger models, revisit the
-        flat-buffer path using ``forge.engines.weight_sync._flat_layout``.
+    @endpoint
+    def publish_weights(
+        self,
+        version: int,
+        key_prefix: str = "",
+    ) -> dict:
+        """Backend-agnostic publish entry point.
 
-        Only rank 0 publishes; other ranks participate in the FSDP
-        gather inside ``state_dict_for_sync`` and then exit early.
+        Called from :class:`WeightSyncBackend.push` implementations.
+        Every trainer rank runs this endpoint (Monarch fans out the RPC
+        to every proc in the mesh) so FSDP's ``state_dict_for_sync``
+        collective can gather full tensors on every rank, but only rank 0
+        actually calls ``ts.put_batch``.
+
+        Ranks 1..N-1 participate in the collective and then early-return
+        with empty ``put_s``.  They do **not** issue ``ts.put_batch`` even
+        under LocalRankStrategy, because ``RDMABuffer(...)`` inside
+        torchstore's transport layer requires a local ``RdmaManagerActor``
+        Monarch child actor that is not reliably spawned on every trainer
+        proc -- see ``/root/monarch/monarch_rdma/src/rdma_manager_actor.rs``
+        (``RdmaManagerActor::local_handle`` + the ``PanicException:
+        RdmaManagerActor is not in the local process`` surface error when
+        this assumption is violated).
+
+        Consequence: only volume 0 holds data (rank 0 -> volume 0 via
+        LocalRankStrategy).  Generator-side puts are valid as long as the
+        generator proc has ``LOCAL_RANK=0`` too (our bootstrap does set
+        this).  The lost benefit is N-way parallel put bandwidth -- a
+        Phase-2 optimization target that'll require pre-spawning
+        RdmaManagerActor on every trainer rank or teaching the
+        torchstore transport to do a driver-side put.
+
+        ``key_prefix`` is the backend's storage namespace; the multi-vol
+        backend uses ``f"policy_ver_{v%2:010d}"`` which matches the
+        legacy ``get_param_key`` scheme for wire interop.
+        """
+
+        def _key_for(_v: int, name: str) -> str:
+            return f"{key_prefix}.{name}" if key_prefix else name
+
+        return self._publish_impl(
+            version=version,
+            key_for=_key_for,
+            only_rank_zero=True,
+        )
+
+    def _publish_impl(
+        self,
+        version: int,
+        key_for: callable,
+        only_rank_zero: bool,
+    ) -> dict:
+        """Shared state_dict gather + ts.put_batch path.
+
+        FSDP's state_dict materialisation is a collective that every rank
+        has to call; the actual ``ts.put_batch`` can be rank-scoped by the
+        backend (``only_rank_zero=True`` for single-volume legacy paths,
+        ``False`` for multi-volume where ``LocalRankStrategy`` routes every
+        rank's put to its own volume).
+
+        Returned payload is designed to satisfy both the legacy
+        ``WeightSyncStrategy`` consumers (``param_names/shapes/dtypes``
+        triplet) and the new Service (``param_nbytes`` added) without a
+        second endpoint round-trip.
         """
         if not self._use_engine:
-            raise RuntimeError("push_weights_torchstore requires a TrainEngine")
+            raise RuntimeError("publish_weights requires a TrainEngine")
         import asyncio
         import time
 
         import torch.distributed as dist
         import torchstore as ts
 
-        from forge.engines.weight_sync.torchstore_sync import get_param_key
-
-        # All ranks participate: FSDP/HSDP sharded tensors need the
-        # collective gather to materialise full tensors (and
-        # ``state_dict_for_sync`` also runs ``DTensor.full_tensor()`` +
-        # ``sd_adapter.to_hf`` underneath, both of which need all
-        # ranks).
+        # Collective: every rank must call.  See state_dict_for_sync
+        # docstring in titan/adapter.py for why (DTensor.full_tensor +
+        # sd_adapter.to_hf + keep on device).
         build_t0 = time.perf_counter()
         state_dict = self._engine.state_dict_for_sync()
         build_s = time.perf_counter() - build_t0
@@ -183,22 +229,27 @@ class TrainerActor(ForgeActor):
         param_names: list[str] = []
         param_shapes: list[tuple] = []
         param_dtypes: list[str] = []
+        param_nbytes: list[int] = []
         for name, tensor in state_dict.items():
             param_names.append(name)
             param_shapes.append(tuple(tensor.shape))
             param_dtypes.append(str(tensor.dtype).replace("torch.", ""))
-            total_bytes += tensor.numel() * tensor.element_size()
+            nb = tensor.numel() * tensor.element_size()
+            param_nbytes.append(nb)
+            total_bytes += nb
+
+        should_put = (not only_rank_zero) or (rank == 0)
 
         async def _do_puts() -> float:
             put_t0 = time.perf_counter()
             entries = {
-                get_param_key(policy_version, name_): tensor_
+                key_for(version, name_): tensor_
                 for name_, tensor_ in state_dict.items()
             }
             await ts.put_batch(entries)
             return time.perf_counter() - put_t0
 
-        put_s = asyncio.run(_do_puts()) if rank == 0 else 0.0
+        put_s = asyncio.run(_do_puts()) if should_put else 0.0
 
         return {
             "num_keys": len(param_names),
@@ -208,6 +259,7 @@ class TrainerActor(ForgeActor):
             "param_names": param_names,
             "param_shapes": param_shapes,
             "param_dtypes": param_dtypes,
+            "param_nbytes": param_nbytes,
             "rank": rank,
         }
 

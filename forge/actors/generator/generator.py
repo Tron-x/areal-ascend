@@ -341,97 +341,112 @@ class Generator(ForgeActor):
         return result
 
     async def _update_weights_torchstore(self, version: int, payload: dict) -> dict:
-        """Torchstore / Monarch RDMA weight update.
+        """Torchstore / Monarch RDMA weight update -- delegates to workers.
 
-        Pulls each HF-named parameter from torchstore via Monarch RDMA
-        (HiXL on NPU), builds a CPU state_dict, and hands it to the vLLM
-        workers; workers then drive vLLM's ``model.load_weights`` which
-        handles TP resharding.
+        The fast path: each vLLM worker runs ``pull_weights`` inside its
+        own proc and writes the ``ts.get`` result straight into its NPU
+        model parameters (HiXL RDMA inplace).  No CPU detour, no
+        cloudpickle ``state_dict`` RPC payload through this Generator proc.
 
-        ``payload`` carries ``param_names`` / ``param_shapes`` /
-        ``param_dtypes`` as produced by
-        ``TrainerActor.push_weights_torchstore``.  The trainer runs its
-        state_dict through ``sd_adapter.to_hf`` first, so the keys
-        match what vLLM's Qwen3ForCausalLM.load_weights expects
-        (``model.embed_tokens.weight``, ``lm_head.weight``, ...) rather
-        than TorchTitan's native names.
+        ``payload`` must carry either:
+
+        * ``items``: list of ``{"name", "key"}`` dicts (new ``WeightSyncService``
+          / ``MultiVolTorchstoreBackend`` path), or
+        * legacy ``param_names`` / ``param_shapes`` / ``param_dtypes``
+          triplet (pre-Service callers).  We auto-translate that into the
+          ``items`` form so the worker endpoint has a single contract.
         """
         import time
 
-        import torch
-        import torchstore as ts
+        items = payload.get("items")
+        total_bytes_hint = int(payload.get("total_bytes") or 0)
 
-        from forge.engines.weight_sync.torchstore_sync import get_param_key
+        if items is None:
+            # Legacy payload shape -- translate for the worker endpoint.
+            from forge.engines.weight_sync.torchstore_sync import get_param_key
 
-        param_names = payload.get("param_names") or []
-        param_shapes = payload.get("param_shapes") or []
-        param_dtypes = payload.get("param_dtypes") or []
-        if not param_names:
-            return {
-                "success": False,
-                "message": (
-                    "torchstore sync requires param_names/param_shapes/param_dtypes "
-                    "in the payload (produced by TrainerActor.push_weights_torchstore)."
-                ),
-            }
+            names = payload.get("param_names") or []
+            if not names:
+                return {
+                    "success": False,
+                    "message": (
+                        "torchstore sync: payload has neither "
+                        "'items' nor 'param_names'; cannot proceed."
+                    ),
+                }
+            items = [{"name": n, "key": get_param_key(version, n)} for n in names]
 
         self._inproc_engine.pause_generation()
         pull_t0 = time.perf_counter()
-        total_bytes = 0
-        state_dict: dict[str, torch.Tensor] = {}
         try:
-            for name, shape, dtype_name in zip(param_names, param_shapes, param_dtypes):
-                key = get_param_key(version, name)
-                dtype = getattr(torch, dtype_name)
-                tensor = await ts.get(key)
-                if tensor is None:
-                    raise RuntimeError(f"torchstore missed key {key!r}")
-                if tensor.shape != tuple(shape) or tensor.dtype != dtype:
-                    raise RuntimeError(
-                        f"torchstore key {key!r} returned tensor "
-                        f"shape={tensor.shape} dtype={tensor.dtype}, "
-                        f"expected shape={shape} dtype={dtype}"
-                    )
-                # Monarch RPC to the vLLM workers goes through cloudpickle,
-                # which can't serialise NPU tensors directly -- stage to CPU
-                # once here; workers will ``.to(device)`` back on load.
-                if tensor.device.type != "cpu":
-                    tensor = tensor.cpu()
-                state_dict[name] = tensor
-                total_bytes += tensor.numel() * tensor.element_size()
-            pull_s = time.perf_counter() - pull_t0
-
-            load_t0 = time.perf_counter()
-            loaded_mesh = await self.workers.update_weights.call(
-                state_dict=state_dict, version=version
+            pull_mesh = await self.workers.pull_weights.call(
+                version=version, items=items
             )
-            load_s = time.perf_counter() - load_t0
-            loaded = next(iter(loaded_mesh.items()))[1]
+            pull_s = time.perf_counter() - pull_t0
         except Exception as e:
             self._inproc_engine.resume_generation()
             logger.exception("torchstore sync failed")
             return {
                 "success": False,
                 "message": f"torchstore sync failed: {e}",
-                "bytes": total_bytes,
+                "bytes": total_bytes_hint,
             }
         self._inproc_engine.resume_generation()
 
+        # ``pull_mesh`` is a mesh-result dict; all workers return the same
+        # aggregate shape.  Summarise using max() rather than sum() because
+        # every worker pulls the same bytes in TP=1 (each loads its own copy
+        # of the full state_dict); wire-bytes == per-worker-bytes, not
+        # sum-across-workers.
+        bytes_total = 0
+        workers_load_s = 0.0
+        num_keys = 0
+        direct_count = 0
+        fused_count = 0
+        success_all = True
+        for ref, payload in pull_mesh.items():
+            if not isinstance(payload, dict):
+                continue
+            if not payload.get("success", False):
+                success_all = False
+            bytes_total = max(bytes_total, payload.get("bytes", 0))
+            workers_load_s = max(workers_load_s, payload.get("workers_load_s", 0.0))
+            num_keys = max(num_keys, payload.get("num_keys", 0))
+            direct_count = max(direct_count, payload.get("direct_count", 0))
+            fused_count = max(fused_count, payload.get("fused_count", 0))
+
+        if not success_all:
+            return {
+                "success": False,
+                "message": "one or more workers failed pull_weights",
+                "bytes": bytes_total,
+                "num_keys": num_keys,
+                "pull_s": pull_s,
+                "workers_load_s": workers_load_s,
+            }
+
         logger.info(
-            "torchstore sync v%d: %d keys, %.2f GB, pull=%.2fs, workers.load=%.2fs",
+            "torchstore sync v%d: %d keys (%d direct + %d fused), "
+            "%.2f GB, total=%.2fs (pull+load combined in-worker, "
+            "workers_load=%.2fs)",
             version,
-            len(param_names),
-            total_bytes / (1024**3),
+            num_keys,
+            direct_count,
+            fused_count,
+            bytes_total / (1024**3),
             pull_s,
-            load_s,
+            workers_load_s,
         )
         return {
             "success": True,
-            "message": f"torchstore sync: loaded {loaded} params",
-            "bytes": total_bytes,
-            "num_keys": len(param_names),
+            "message": (
+                f"torchstore sync: {direct_count} inplace + "
+                f"{fused_count} fused-fallback"
+            ),
+            "bytes": bytes_total,
+            "num_keys": num_keys,
             "pull_s": pull_s,
-            "workers_load_s": load_s,
+            "workers_load_s": workers_load_s,
         }
 
     @endpoint

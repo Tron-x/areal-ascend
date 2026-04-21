@@ -83,12 +83,19 @@ echo "[3/4] Running GRPO training on ${DRIVER_HOST}..."
 
 SSH_CMD="ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
-# Single path: trainer NPU → storage NPU → generator NPU, all HiXL/RoCE.
-# Storage proc lives on the trainer host on an idle NPU (default 7) to avoid
-# sharing an NPU/HCCL port with the trainer's FSDP comm group or the generator's
-# vLLM comm group.
+# All weight-sync topology is decided by the driver's WeightSyncService +
+# backend (forge/engines/weight_sync/*).  The old TORCHSTORE_STORAGE_NPU env
+# has been retired; the backend picks the storage NPU range (typically right
+# after the trainer's NPUs on the same host, e.g. 4-7 if trainer uses 0-3).
+#
+# Knobs still forwarded from the caller's shell:
+#   FORGE_WEIGHT_SYNC           - sync mode (nccl / checkpoint / hixl / torchstore)
+#   FORGE_WEIGHT_SYNC_BACKEND   - torchstore backend name (default: torchstore_multi_vol)
+#   FORGE_GEN_TP / FORGE_GEN_PP / FORGE_PS_WORLD - layout hints for Service
+#   TORCHSTORE_STORAGE_NPU_BASE - override storage NPU range start (0-based)
+#   TORCHSTORE_MONARCH_RDMA_POOL_MB - HiXL staging pool size per volume
 FORGE_WEIGHT_SYNC_FWD="${FORGE_WEIGHT_SYNC:-nccl}"
-TORCHSTORE_STORAGE_NPU_FWD="${TORCHSTORE_STORAGE_NPU:-7}"
+FORGE_WEIGHT_SYNC_BACKEND_FWD="${FORGE_WEIGHT_SYNC_BACKEND:-torchstore_multi_vol}"
 
 $SSH_CMD root@${DRIVER_HOST} "\
 source ${CANN_HOME}/set_env.sh 2>/dev/null; \
@@ -103,6 +110,7 @@ export ASCEND_GLOBAL_LOG_LEVEL=\"\${ASCEND_GLOBAL_LOG_LEVEL:-3}\"; \
 export ASCEND_SLOG_PRINT_TO_STDOUT=\"\${ASCEND_SLOG_PRINT_TO_STDOUT:-1}\"; \
 export HCCL_DEBUG=\"\${HCCL_DEBUG:-INFO}\"; \
 export FORGE_WEIGHT_SYNC='${FORGE_WEIGHT_SYNC_FWD}'; \
+export FORGE_WEIGHT_SYNC_BACKEND='${FORGE_WEIGHT_SYNC_BACKEND_FWD}'; \
 export MONARCH_HIXL_TRANSPORT=roce; \
 export HCCL_INTRA_ROCE_ENABLE=1; \
 export HCCL_CONNECT_TIMEOUT=120; \
@@ -110,7 +118,6 @@ export HCCL_NPU_SOCKET_PORT_RANGE=60000-60255; \
 export TORCHSTORE_MONARCH_RDMA_EAGER_D2H=0; \
 export TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:0; \
 export TORCHSTORE_MONARCH_RDMA_POOL_MB=8192; \
-export TORCHSTORE_STORAGE_NPU='${TORCHSTORE_STORAGE_NPU_FWD}'; \
 cd ${AREAL_ROOT}; \
 BACKEND_ARGS=''; \
 [ -n '${BACKEND}' ] && BACKEND_ARGS=\"--backend ${BACKEND}\"; \
