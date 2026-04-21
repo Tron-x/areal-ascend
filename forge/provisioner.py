@@ -311,6 +311,18 @@ class BareMetalLauncher(BaseLauncher):
         self._named_meshes: dict[str, object] = {}
         self._mesh_assignment: dict[str, int] = {}
         self._next_worker_idx = 0
+        # Per-worker-idx cache of the slice object.  Two different mesh
+        # names that resolve to the same physical worker must return the
+        # *same* slice instance, because Provisioner (upstream of us)
+        # stamps ``_host_id`` on the slice and keys its GpuManager table
+        # by that id -- if each name were handed a fresh slice, the same
+        # physical host would end up with multiple GpuManagers each
+        # thinking all NPUs were free, and collocated meshes (e.g.
+        # storage volumes on the trainer host) would double-allocate
+        # NPU 0-7 and collide.  The name cache above still exists for
+        # the (common) case of repeat lookups of the same name; this
+        # slice cache is the deeper invariant.
+        self._slice_by_worker_idx: dict[int, object] = {}
 
     async def initialize(self):
         from monarch._src.actor.bootstrap import attach_to_workers
@@ -382,23 +394,35 @@ class BareMetalLauncher(BaseLauncher):
                     f"{idx} out of range (have {n_hosts} workers: "
                     f"{self.workers})"
                 )
-            logger.info(
-                "BareMetalLauncher: mesh '%s' -> worker %d (%s) [explicit]",
-                name,
-                idx,
-                self.workers[idx] if idx < len(self.workers) else "?",
-            )
+            source = "explicit"
         else:
             idx = self._next_worker_idx % n_hosts
             self._next_worker_idx += 1
+            source = "round-robin"
+
+        # Per-idx slice cache: guarantees that two names resolving to
+        # the same physical worker share the same slice object (and
+        # therefore the same ``_host_id`` + GpuManager upstream).
+        host_slice = self._slice_by_worker_idx.get(idx)
+        if host_slice is None:
+            host_slice = self._full_host_mesh.slice(hosts=slice(idx, idx + 1))
+            self._slice_by_worker_idx[idx] = host_slice
             logger.info(
-                "BareMetalLauncher: mesh '%s' -> worker %d (%s) [round-robin]",
+                "BareMetalLauncher: mesh '%s' -> worker %d (%s) [%s, new slice]",
                 name,
                 idx,
                 self.workers[idx] if idx < len(self.workers) else "?",
+                source,
+            )
+        else:
+            logger.info(
+                "BareMetalLauncher: mesh '%s' -> worker %d (%s) [%s, shared slice]",
+                name,
+                idx,
+                self.workers[idx] if idx < len(self.workers) else "?",
+                source,
             )
 
-        host_slice = self._full_host_mesh.slice(hosts=slice(idx, idx + 1))
         self._named_meshes[name] = host_slice
         self._mesh_assignment[name] = idx
         return host_slice

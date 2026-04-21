@@ -655,6 +655,78 @@ async def grpo_main(
     logger.info(f"GRPO training complete. Total steps: {step}")
 
 
+def _load_yaml_launcher_block(
+    forge_config_path: str | None,
+    areal_config_path: str | None,
+) -> tuple[dict, str | None]:
+    """Eagerly extract the ``launcher:`` block from YAML.
+
+    We read the ``launcher:`` block ourselves rather than going through
+    AReaL's ``config_bridge.parse_and_build`` because Monarch transport
+    configuration (``configure(TcpWithHostname)``) and the
+    ``ProvisionerConfig`` we hand to ``grpo_main`` both have to be set
+    up **before** any actor is created, while the AReaL config bridge
+    fires inside ``grpo_main``.  The ``launcher:`` block is small,
+    self-contained, and doesn't use cross-section Hydra interpolation,
+    so a standalone read is safe.
+
+    Two YAML paths are searched in priority order:
+
+    1. ``--forge-config FILE`` -- a forge-specific YAML dedicated to
+       launcher topology.  Recommended: keeps AReaL's experiment YAMLs
+       clean so the same AReaL recipe can be reused with different
+       launcher configs (local / bare_metal / slurm).
+    2. ``--config FILE`` -- AReaL's experiment YAML.  If it happens
+       to carry a top-level ``launcher:`` key we pick that up too,
+       which lets users inline launcher config in a single file when
+       they don't care about the separation.
+
+    Returns ``(block_dict, source_path)`` where ``source_path`` is the
+    file the block came from (for logging), or ``({}, None)`` if no
+    usable block was found.  Callers layer CLI / env overrides on top.
+    """
+    from pathlib import Path
+
+    for source_label, p in (
+        ("--forge-config", forge_config_path),
+        ("--config", areal_config_path),
+    ):
+        if not p:
+            continue
+        path = Path(p)
+        if not path.is_file():
+            continue
+        try:
+            from omegaconf import OmegaConf
+
+            raw = OmegaConf.load(str(path))
+            block = raw.get("launcher", None)
+            if block is None:
+                continue
+            return (
+                OmegaConf.to_container(block, resolve=True),
+                f"{source_label}={p}",
+            )
+        except Exception as e:
+            print(
+                f"[WARN] _load_yaml_launcher_block: failed to parse "
+                f"{source_label}={p!r}: {e}",
+                flush=True,
+            )
+            continue
+    return {}, None
+
+
+def _find_cli_path(argv: list[str], flag: str) -> str | None:
+    """Return the value of ``--flag VALUE`` or ``--flag=VALUE`` in argv."""
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
 def main():
     import sys
 
@@ -668,9 +740,35 @@ def main():
     titan_args = {}
     remaining_argv = []
     argv = sys.argv[1:]
+
+    # Read YAML launcher: block up front.  CLI flags and env vars
+    # will override YAML values where they conflict (priority:
+    # CLI > env > YAML > dataclass defaults) -- this keeps
+    # ``run_multinode.sh`` able to inject dynamic values
+    # (e.g. hostfile-derived workers list) on top of a checked-in
+    # YAML that describes the canonical topology.
+    #
+    # --forge-config takes priority; falling back to --config lets
+    # a single-file YAML (launcher + AReaL recipe merged) work too.
+    forge_config_path = _find_cli_path(argv, "--forge-config")
+    areal_config_path = _find_cli_path(argv, "--config")
+    yaml_launcher, yaml_launcher_source = _load_yaml_launcher_block(
+        forge_config_path, areal_config_path
+    )
+    if yaml_launcher:
+        print(
+            f"[launcher] loaded launcher block from {yaml_launcher_source}",
+            flush=True,
+        )
     i = 0
     while i < len(argv):
-        if argv[i] == "--bare-metal-workers":
+        if argv[i] == "--forge-config":
+            # Consumed by _load_yaml_launcher_block via
+            # ``_find_cli_path(argv, "--forge-config")`` above; we
+            # strip it from the argv handed to AReaL's config_bridge
+            # so argparse doesn't choke on the unknown flag.
+            i += 2
+        elif argv[i] == "--bare-metal-workers":
             bare_metal_args["workers"] = argv[i + 1].split(",")
             i += 2
         elif argv[i] == "--bare-metal-master-addr":
@@ -726,6 +824,69 @@ def main():
             if "=" in item:
                 name, v = item.split("=", 1)
                 mesh_placement[name.strip()] = int(v.strip())
+
+    # --- Merge YAML launcher: block (lowest precedence) -----------------
+    #
+    # YAML acts as the baseline "canonical topology" -- CLI / env can
+    # override individual fields for one-off experiments without
+    # editing the YAML.  The block schema (minimum viable, extend as
+    # new launcher types come online):
+    #
+    #     launcher:
+    #       type: bare_metal            # future: slurm | k8s | local
+    #       bare_metal:
+    #         workers: [tcp://..., ...]
+    #         master_addr: ...
+    #         worker_port: 22222
+    #       meshes:
+    #         trainer:   {host_idx: 0}
+    #         generator: {host_idx: 1}
+    #         storage:   {host_idx: 0}
+    #       weight_sync:                # optional, consumed by forge driver
+    #         backend: torchstore_multi_vol
+    #         storage_mesh: storage     # -> meshes.storage above
+    #         pool_mb: 8192
+    #         storage_npu_base: null    # null = auto (train_world_size)
+    if yaml_launcher:
+        yaml_bare_metal = yaml_launcher.get("bare_metal") or {}
+        if not bare_metal_args.get("workers") and yaml_bare_metal.get("workers"):
+            bare_metal_args["workers"] = list(yaml_bare_metal["workers"])
+        if not bare_metal_args.get("master_addr") and yaml_bare_metal.get(
+            "master_addr"
+        ):
+            bare_metal_args["master_addr"] = yaml_bare_metal["master_addr"]
+        if (
+            "worker_port" not in bare_metal_args
+            and yaml_bare_metal.get("worker_port") is not None
+        ):
+            bare_metal_args["worker_port"] = int(yaml_bare_metal["worker_port"])
+
+        yaml_meshes = yaml_launcher.get("meshes") or {}
+        for name, spec in yaml_meshes.items():
+            if name in mesh_placement:
+                continue  # CLI/env already decided this one
+            if isinstance(spec, dict) and "host_idx" in spec:
+                mesh_placement[name] = int(spec["host_idx"])
+            elif isinstance(spec, int):
+                mesh_placement[name] = int(spec)
+
+        # weight_sync -> env vars (the downstream readers in
+        # _create_weight_sync_service / _spawn_storage_mesh are still
+        # env-driven after Step 2; pushing YAML into env keeps a
+        # single read path).  Existing env takes precedence so an
+        # operator shell setting still wins over YAML.
+        yaml_ws = yaml_launcher.get("weight_sync") or {}
+        _env_fallback = {
+            "FORGE_WEIGHT_SYNC_BACKEND": yaml_ws.get("backend"),
+            "FORGE_STORAGE_HOST_MESH": yaml_ws.get("storage_mesh"),
+            "TORCHSTORE_MONARCH_RDMA_POOL_MB": yaml_ws.get("pool_mb"),
+            "TORCHSTORE_STORAGE_NPU_BASE": yaml_ws.get("storage_npu_base"),
+        }
+        for env_name, val in _env_fallback.items():
+            if val is None:
+                continue
+            if not os.environ.get(env_name):
+                os.environ[env_name] = str(val)
 
     if bare_metal_args:
         from forge.types import Launcher, LauncherConfig, ProvisionerConfig

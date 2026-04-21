@@ -1,0 +1,101 @@
+# Launcher topology for forge's 2-bare-metal-node GRPO run.
+#
+# This file is consumed by ``forge/apps/grpo.py::main()`` as the
+# source of truth for multi-node placement.  Only the ``launcher:``
+# block is read by forge; the rest of the AReaL experiment YAML
+# (dataset / rollout / gconfig / ...) continues to be composed by
+# AReaL's Hydra+OmegaConf pipeline as before.  To use it, add this
+# block to whichever AReaL experiment YAML you're running -- either
+# inline copy it, or use Hydra's composition (``defaults: [...]``).
+#
+# Priority order for every field below (highest wins):
+#
+#   1. CLI flags on ``python -m forge.apps.grpo``
+#        (``--bare-metal-workers``, ``--mesh-placement``, ...)
+#   2. Environment variables
+#        (``FORGE_MESH_PLACEMENT``, ``FORGE_STORAGE_HOST_MESH``,
+#         ``TORCHSTORE_MONARCH_RDMA_POOL_MB``, ...)
+#   3. YAML ``launcher:`` block below
+#   4. Python dataclass defaults (``forge/core/types.py::LauncherConfig``)
+#
+# ``run_multinode.sh`` injects a hostfile-derived workers list via CLI,
+# so this YAML's ``workers:`` field is a documentation/fallback only --
+# it matters when somebody launches ``python -m forge.apps.grpo`` by
+# hand without going through the wrapper script.
+
+launcher:
+  # Launcher kind.  Today we only ship ``bare_metal``; slurm / k8s
+  # are delegated to monarch's native launchers and will land here
+  # as ``type: slurm`` + their own sub-block when we wire those up.
+  type: bare_metal
+
+  # Bare-metal specifics.  Other launcher types add their own sibling
+  # sub-block (``slurm:``, ``k8s:``, ...) that the matching launcher
+  # class picks up.  Unknown keys are ignored, so migrations are easy.
+  bare_metal:
+    # Monarch worker URIs, in the exact order they should populate
+    # the launcher's ``workers`` array.  ``host_idx: N`` in ``meshes:``
+    # below refers to the N-th entry here.
+    workers:
+      - tcp://192.168.0.23:22222
+      - tcp://192.168.0.26:22222
+    # The "driver" address (where ``run_multinode.sh`` fires
+    # ``python -m forge.apps.grpo`` from).  Auto-detected if empty.
+    master_addr: 192.168.0.23
+    worker_port: 22222
+
+  # Named mesh placements.  ``BareMetalLauncher.get_host_mesh(name)``
+  # consults this map first and falls back to round-robin only for
+  # names not listed.  Explicit placement is strongly preferred --
+  # round-robin is a usability crutch that breaks silently when new
+  # mesh names enter the code base.
+  #
+  # host_idx is an integer index into bare_metal.workers[].  The dict
+  # form is used (rather than a bare int) so future launcher types
+  # can add sibling keys next to host_idx without a schema break --
+  # for slurm this becomes ``{slurm_mesh_name: trainer}``; for k8s,
+  # ``{node_selector: {role: trainer}}``.
+  meshes:
+    trainer:
+      host_idx: 0         # monarch1 -- 4 NPUs (0..3) for FSDP
+    generator:
+      host_idx: 1         # monarch2 -- 1 NPU (0) for vLLM
+    storage:
+      host_idx: 0         # colocate with trainer; same-host HCCS put,
+                          # cross-node RoCE pull to the generator worker.
+                          # Switch to host_idx: 1 to run the "dedicated
+                          # PS" experiment (storage on monarch2 alongside
+                          # generator, cross-node put, same-host get).
+
+  # Weight-sync service configuration.  Forwarded into forge's
+  # driver as env-style knobs; each field is individually overridable
+  # via shell env so an operator can run one-off experiments without
+  # editing this file.
+  weight_sync:
+    # Pluggable backend name.  See
+    # forge/engines/weight_sync/backends/__init__.py for the registry.
+    backend: torchstore_multi_vol
+
+    # Name of the mesh (must exist in ``meshes:`` above) whose host
+    # should run torchstore's storage volumes.  ``storage`` is the
+    # conventional name; ``trainer`` colocates manually without an
+    # explicit storage mesh.
+    storage_mesh: storage
+
+    # MonarchRDMA staging pool per torchstore transport proc, in MiB.
+    # The pool lives inside whatever proc calls ``ts.put`` / ``ts.get``
+    # -- on the trainer side that's trainer rank 0, which shares NPU 0
+    # with FSDP's model/optim/activation state.  After a rollout,
+    # trainer NPU 0 typically has ~8 GiB free; requesting an 8192 MiB
+    # pool there sits right on the edge of OOM (``Tried to allocate
+    # 8.00 GiB (NPU 0; ... 7.88 GiB free)``).  6144 MiB gives
+    # comfortable headroom for Qwen3-0.6B (1.4 GiB flat + staging
+    # slack) while leaving NPU 0 room for the training step itself.
+    # Bump to 8192 for bigger models once trainer NPU 0 pressure drops.
+    pool_mb: 6144
+
+    # First NPU id to pin storage volumes to on the chosen host.
+    # ``null`` = auto = ``train_world_size`` (right after the trainer's
+    # NPUs when storage is colocated with trainer).  When storage is
+    # on a dedicated host (no trainer on that box), set to 0.
+    storage_npu_base: null
