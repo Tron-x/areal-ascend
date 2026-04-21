@@ -102,14 +102,30 @@ class MultiVolTorchstoreBackend:
     def __init__(
         self,
         *,
+        storage_mesh: Any | None = None,
         storage_npu_base: int | None = None,
         pool_mb: int = 8192,
         flat: bool = True,
     ) -> None:
         """
         Args:
-            storage_npu_base: first NPU id to pin storage volumes to on
-                the trainer host.  ``None`` = auto (``train_world``).
+            storage_mesh: an already-spawned Monarch ``ProcMesh`` that the
+                backend should use as the torchstore volume host.  When
+                provided, :meth:`initialize` skips its internal spawn and
+                runs ``ts.initialize`` against this mesh directly.  This
+                is the "injected storage" path -- the caller
+                (``grpo.py`` today, or a YAML-driven launcher helper
+                tomorrow) decides where storage lives, which host it sits
+                on, and which NPUs it occupies.  The backend no longer
+                has to know.  Leave ``None`` to keep the legacy
+                "spawn storage on trainer host, NPU
+                ``storage_npu_base..storage_npu_base+train_world-1``"
+                behaviour (used while callers are still migrating).
+            storage_npu_base: (legacy path only) first NPU id to pin
+                volumes to on the trainer host.  ``None`` = auto
+                (``train_world``).  Ignored when ``storage_mesh`` is
+                provided -- the caller's spawn bootstrap already pinned
+                NPUs by then.
             pool_mb: MonarchRDMA staging pool size per storage volume.
             flat: when True (default), use the single-flat-key fast path
                 (``TrainerActor.publish_weights_flat`` +
@@ -119,10 +135,11 @@ class MultiVolTorchstoreBackend:
                 (``publish_weights`` + ``pull_weights``) which is easier
                 to debug but pays 311 * per-key overhead.
         """
+        self._storage_mesh_injected = storage_mesh is not None
+        self._storage_mesh = storage_mesh
         self._storage_npu_base = storage_npu_base
         self._pool_mb = pool_mb
         self._flat = flat
-        self._storage_mesh = None
         self._layout: ParallelLayout | None = None
         self._initialized = False
         # Cache the ParamMeta published by the last push so the pull side
@@ -160,30 +177,44 @@ class MultiVolTorchstoreBackend:
         from torchstore.strategy import LocalRankStrategy
         from torchstore.transport import TransportType
 
-        from forge.provisioner import _get_provisioner
-
         self._layout = layout
         num_vols = layout.train_world
-        if self._storage_npu_base is None:
-            # Avoid NPU collision with the trainer: trainer uses 0..N-1, we
-            # put storage on N..2N-1.  Caller can override via constructor.
-            self._storage_npu_base = num_vols
 
-        provisioner = await _get_provisioner()
-        trainer_hosts = await provisioner.get_host_mesh(layout.trainer_mesh_name)
+        if self._storage_mesh_injected:
+            # Caller already provisioned the storage mesh -- backend is a
+            # pure data-plane client here.  The bootstrap that set up the
+            # NPU pinning, HiXL env vars, and staging pool size is the
+            # caller's responsibility (see
+            # ``_storage_bootstrap_factory`` which the legacy path uses,
+            # and which external spawners are expected to reuse).
+            logger.info("using injected storage mesh (%d volumes assumed)", num_vols)
+        else:
+            # Legacy behaviour retained so callers that haven't migrated
+            # to external spawning keep working unchanged.  Storage goes
+            # on the trainer host mesh at NPU
+            # ``storage_npu_base..storage_npu_base+num_vols-1``.
+            from forge.provisioner import _get_provisioner
 
-        self._storage_mesh = trainer_hosts.spawn_procs(
-            per_host={"procs": num_vols},
-            name="torchstore_storage_multi_vol",
-            bootstrap=_storage_bootstrap_factory(self._storage_npu_base),
-        )
-        logger.info(
-            "spawned %d torchstore volumes on mesh %r (NPU range %d..%d)",
-            num_vols,
-            layout.trainer_mesh_name,
-            self._storage_npu_base,
-            self._storage_npu_base + num_vols - 1,
-        )
+            if self._storage_npu_base is None:
+                # Avoid NPU collision with the trainer: trainer uses
+                # 0..N-1, we put storage on N..2N-1.
+                self._storage_npu_base = num_vols
+
+            provisioner = await _get_provisioner()
+            trainer_hosts = await provisioner.get_host_mesh(layout.trainer_mesh_name)
+
+            self._storage_mesh = trainer_hosts.spawn_procs(
+                per_host={"procs": num_vols},
+                name="torchstore_storage_multi_vol",
+                bootstrap=_storage_bootstrap_factory(self._storage_npu_base),
+            )
+            logger.info(
+                "spawned %d torchstore volumes on mesh %r (NPU range %d..%d)",
+                num_vols,
+                layout.trainer_mesh_name,
+                self._storage_npu_base,
+                self._storage_npu_base + num_vols - 1,
+            )
 
         # LocalRankStrategy needs LOCAL_RANK set in the driver proc too so
         # it can pick a routing volume for any ts.get / ts.put issued here.

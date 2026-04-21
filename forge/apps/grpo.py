@@ -66,6 +66,53 @@ async def _create_weight_sync(forge_cfg, trainer, generator):
     return await _create_legacy_weight_sync(forge_cfg, trainer, generator, method_str)
 
 
+async def _spawn_storage_mesh(
+    host_mesh_name: str,
+    num_vols: int,
+    npu_base: int,
+):
+    """Provision a torchstore storage ``ProcMesh`` on a named host mesh.
+
+    This used to live inside ``MultiVolTorchstoreBackend.initialize`` which
+    (a) hard-coded the host to the trainer's and (b) hid the NPU pinning
+    bootstrap behind the backend API.  Moving it up here turns "where does
+    storage run" into a **driver-level decision** -- today picked by an
+    env var, tomorrow by the ``meshes:`` YAML block, next year by a
+    Slurm/K8s launcher.  The backend just consumes whatever ``ProcMesh``
+    it's handed.
+
+    Args:
+        host_mesh_name: name of a HostMesh already registered with the
+            provisioner (``"trainer"`` / ``"generator"`` / ``"ps"`` /
+            arbitrary custom name).  Must resolve via
+            ``provisioner.get_host_mesh(name)``.
+        num_vols: number of storage volumes to spawn on that host mesh
+            (one proc per volume; a 4-rank trainer typically spawns 4
+            volumes so LocalRankStrategy routes cleanly).
+        npu_base: first physical NPU id to pin volumes to on the host
+            (volume ``i`` lands on NPU ``npu_base + i``).  The trainer's
+            own NPUs must not overlap this range.
+    """
+    from forge.engines.weight_sync.backends.torchstore_multi_vol import (
+        _storage_bootstrap_factory,
+    )
+    from forge.provisioner import _get_provisioner
+
+    provisioner = await _get_provisioner()
+    storage_hosts = await provisioner.get_host_mesh(host_mesh_name)
+    storage_mesh = storage_hosts.spawn_procs(
+        per_host={"procs": num_vols},
+        name="torchstore_storage_multi_vol",
+        bootstrap=_storage_bootstrap_factory(npu_base),
+    )
+    print(
+        f"[WeightSync] spawned {num_vols} storage volumes on host mesh "
+        f"{host_mesh_name!r} (NPU range {npu_base}..{npu_base + num_vols - 1})",
+        flush=True,
+    )
+    return storage_mesh
+
+
 async def _create_weight_sync_service(forge_cfg, trainer, generator):
     """New path: WeightSyncService + pluggable backend."""
     from forge.engines.weight_sync.backends import create_backend
@@ -78,17 +125,54 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
     # Backend-specific options from env (kept narrow so YAML stays clean).
     backend_kwargs: dict = {}
     if backend_name == "torchstore_multi_vol":
-        # storage_npu_base: where the N storage volumes sit on the trainer
-        # host.  Default is "right after the trainer's NPUs" -- trainer
-        # uses 0..N-1, storage uses N..2N-1.  Setting 0 would collocate
-        # storage on the same NPUs as trainer (untested, likely triggers
-        # HCCL port collision).
+        # Placement knobs: these used to be baked into the backend; now
+        # the driver provisions the storage mesh and hands it in, so the
+        # backend becomes topology-agnostic.  Env vars still take
+        # precedence so we can A/B "same host as trainer" vs
+        # "different host" without touching YAML.
+        #
+        #   FORGE_STORAGE_HOST_MESH   -- name of the host mesh to spawn
+        #                                storage volumes on.  Defaults to
+        #                                the trainer host, which
+        #                                reproduces the legacy colocated
+        #                                layout bit-for-bit.  Setting
+        #                                "generator" (or any other
+        #                                registered host name) moves
+        #                                storage off the trainer.
+        #   TORCHSTORE_STORAGE_NPU_BASE -- first NPU id on that host for
+        #                                the volumes.  Defaults to
+        #                                train_world (right after the
+        #                                trainer's NPUs on the trainer
+        #                                host; for a dedicated storage
+        #                                host 0 is usually correct).
+        #
+        # When ``FORGE_STORAGE_SPAWN_IN_BACKEND=1`` we skip external
+        # spawning entirely and let the backend fall back to its legacy
+        # self-spawn path -- useful for the very first smoke while we
+        # bed this refactor in.
         npu_base_env = os.environ.get("TORCHSTORE_STORAGE_NPU_BASE")
-        if npu_base_env is not None:
-            backend_kwargs["storage_npu_base"] = int(npu_base_env)
         pool_mb_env = os.environ.get("TORCHSTORE_MONARCH_RDMA_POOL_MB")
+        storage_host_name = os.environ.get("FORGE_STORAGE_HOST_MESH", "trainer")
+        spawn_in_backend = os.environ.get("FORGE_STORAGE_SPAWN_IN_BACKEND", "0") == "1"
+
         if pool_mb_env is not None:
             backend_kwargs["pool_mb"] = int(pool_mb_env)
+
+        if spawn_in_backend:
+            # Legacy path: backend spawns storage itself on the trainer
+            # host.  Honors TORCHSTORE_STORAGE_NPU_BASE the old way.
+            if npu_base_env is not None:
+                backend_kwargs["storage_npu_base"] = int(npu_base_env)
+        else:
+            # New path: driver spawns storage and injects the mesh.
+            num_vols = forge_cfg.train_world_size
+            npu_base = int(npu_base_env) if npu_base_env is not None else num_vols
+            storage_mesh = await _spawn_storage_mesh(
+                host_mesh_name=storage_host_name,
+                num_vols=num_vols,
+                npu_base=npu_base,
+            )
+            backend_kwargs["storage_mesh"] = storage_mesh
 
     try:
         backend = create_backend(backend_name, **backend_kwargs)
