@@ -139,23 +139,32 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
         this worker's NPU parameter memory via HiXL RDMA.
 
         Each ``items[i]`` is ``{"name": str, "key": str}`` (plus optional
-        ``slice_spec`` for Phase-2 TP>1).  For each item:
+        ``slice_spec`` for Phase-2 TP>1).  Two routing buckets:
 
-        1. Look up ``name`` in ``model.named_parameters()``.  vLLM's Qwen3
-           (and many other models) fuses some weights (e.g. ``gate_proj ||
-           up_proj`` -> ``gate_up_proj``), so HF names may not map 1:1 to
-           ``named_parameters`` -- those fall back to the classic
-           ``model.load_weights([(name, tensor)])`` path so vLLM's loader
-           handles the fusion.
-        2. For direct-map params: ``ts.get(key, inplace_tensor=param.data)``.
-           torchstore + MonarchRDMA + HiXL RoCE writes the remote tensor's
-           bytes straight into the NPU memory backing ``param.data``.  No
-           ``.cpu()``, no ``.to(device)``, no intermediate tensor.
-        3. For fused params: first ``ts.get(key)`` into a regular NPU
-           tensor, then ``model.load_weights([(hf_name, tensor)])`` so
-           vLLM's loader does the fused-slot assignment.
+        * **Direct**: ``name`` has a matching ``model.named_parameters()``
+          entry (no vLLM fusion).  We issue ``ts.get(key,
+          inplace_tensor=param.data)`` per item and gather them all on
+          one event loop so torchstore's per-request handshakes + RDMA
+          transfers pipeline through the storage volume actor
+          concurrently rather than serially.
+        * **Fused**: ``name`` is not in ``named_parameters`` (e.g. Qwen3
+          ``gate_proj`` + ``up_proj`` get concatenated into
+          ``gate_up_proj`` at vLLM load time).  We ``ts.get`` each fused
+          HF tensor (also concurrently) and hand the whole list to one
+          ``model.load_weights(list_of_pairs)`` call -- vLLM's loader
+          then walks its internal WeightsMapper to do the fused-slot
+          assignment in bulk instead of us paying the per-call overhead.
 
-        Returns aggregate stats; the caller sums across workers if needed.
+        Why gather rather than ``ts.get_batch``:
+        ``MonarchRDMATransportBuffer`` inherits ``supports_batch_gets =
+        False`` from the base class, so even the library's ``get_batch``
+        falls through to a serial ``for request in requests`` loop.
+        Driving N client-side calls concurrently via ``asyncio.gather``
+        bypasses that and lets each get run its own handshake + RDMA
+        through the single storage-volume actor, which accepts
+        concurrent RPCs.  Teaching the transport to batch internally
+        (one RDMABuffer covering multiple tensors) is a separate
+        torchstore-side optimization and not in scope here.
         """
         if not items:
             return {
@@ -174,58 +183,95 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
         model = self.worker.model_runner.model
         name_to_param = dict(model.named_parameters())
 
-        load_t0 = time.perf_counter()
-        direct_count = 0
-        fused_count = 0
-        total_bytes = 0
+        # Partition up front: direct vs. fused.  Each bucket is an
+        # independent list of (item, param_or_tensor_placeholder) so we
+        # can launch the two batches in parallel.
+        direct_items: list[dict] = []
+        fused_items: list[dict] = []
+        direct_bytes = 0
+        for item in items:
+            name = item["name"]
+            if name in name_to_param:
+                direct_items.append(item)
+                p = name_to_param[name]
+                direct_bytes += p.numel() * p.element_size()
+            else:
+                fused_items.append(item)
 
-        async def _do_pulls() -> None:
-            nonlocal direct_count, fused_count, total_bytes
-            for item in items:
-                name = item["name"]
-                key = item["key"]
-                param = name_to_param.get(name)
-                if param is not None:
-                    # Direct HiXL RDMA write into NPU param memory.
-                    # Important: .data keeps the exact storage; ts.get
-                    # inplace_tensor writes into the provided tensor's
-                    # storage without reallocating.
-                    await ts.get(key, inplace_tensor=param.data)
-                    direct_count += 1
-                    total_bytes += param.numel() * param.element_size()
-                else:
-                    # Fused-param fallback: let vLLM's loader figure out
-                    # which slot (gate / up / etc.) this HF name maps to.
-                    tensor = await ts.get(key)
-                    if tensor is None:
-                        raise RuntimeError(
-                            f"pull_weights: torchstore miss for key {key!r}"
-                        )
-                    device = torch.accelerator.current_accelerator()
-                    model.load_weights([(name, tensor.to(device))])
-                    fused_count += 1
-                    total_bytes += tensor.numel() * tensor.element_size()
+        overall_t0 = time.perf_counter()
+
+        async def _pull_direct() -> None:
+            if not direct_items:
+                return
+            # All direct gets in parallel -- torchstore's
+            # MonarchRDMA transport runs one handshake + one RDMA
+            # per-key, and concurrent calls pipeline through the
+            # storage volume actor's async dispatch.
+            await asyncio.gather(
+                *[
+                    ts.get(it["key"], inplace_tensor=name_to_param[it["name"]].data)
+                    for it in direct_items
+                ]
+            )
+
+        async def _pull_fused() -> tuple[list[tuple[str, torch.Tensor]], int]:
+            """Fetch all fused HF tensors concurrently, return
+            (name, tensor) pairs + total bytes so we can feed them
+            through one bulk ``model.load_weights`` call."""
+            if not fused_items:
+                return [], 0
+            tensors = await asyncio.gather(*[ts.get(it["key"]) for it in fused_items])
+            pairs: list[tuple[str, torch.Tensor]] = []
+            nbytes = 0
+            device = torch.accelerator.current_accelerator()
+            for it, tensor in zip(fused_items, tensors):
+                if tensor is None:
+                    raise RuntimeError(
+                        f"pull_weights: torchstore miss for fused key {it['key']!r}"
+                    )
+                # torchstore returns NPU tensors when _STORAGE_DEVICE is set;
+                # ``.to(device)`` is a no-op in that case but guards the
+                # configuration where storage lands on a different device.
+                pairs.append((it["name"], tensor.to(device)))
+                nbytes += tensor.numel() * tensor.element_size()
+            return pairs, nbytes
+
+        async def _do() -> tuple[int, int]:
+            # Launch direct + fused pulls concurrently.  gather waits
+            # for both before returning.
+            _, fused_result = await asyncio.gather(
+                _pull_direct(),
+                _pull_fused(),
+            )
+            fused_pairs, fused_nbytes = fused_result
+            # One bulk load_weights call for all fused params -- lets
+            # vLLM's WeightsMapper concatenate gate_proj + up_proj etc.
+            # inside its own single pass rather than us paying the
+            # per-call overhead N times.
+            if fused_pairs:
+                model.load_weights(fused_pairs)
+            return len(direct_items), fused_nbytes
 
         try:
-            asyncio.run(_do_pulls())
+            direct_count, fused_bytes = asyncio.run(_do())
         except Exception as e:
             logger.exception("pull_weights failed")
             return {
                 "success": False,
                 "message": f"pull_weights failed: {e}",
-                "bytes": total_bytes,
-                "num_keys": direct_count + fused_count,
+                "bytes": 0,
+                "num_keys": 0,
             }
 
-        workers_load_s = time.perf_counter() - load_t0
+        fused_count = len(fused_items)
+        total_bytes = direct_bytes + fused_bytes
+        workers_load_s = time.perf_counter() - overall_t0
+        gbps = total_bytes / workers_load_s / (1024**3) if workers_load_s > 0 else 0.0
         logger.info(
             f"[WorkerWrapper] pull_weights v{version}: "
             f"{direct_count} direct + {fused_count} fused, "
             f"{total_bytes / 1024**3:.2f} GB, {workers_load_s:.2f}s "
-            f"({total_bytes / workers_load_s / 1024**3:.2f} GB/s)"
-            if workers_load_s > 0
-            else f"[WorkerWrapper] pull_weights v{version}: "
-            f"{direct_count} direct + {fused_count} fused"
+            f"({gbps:.2f} GB/s)"
         )
         return {
             "success": True,
