@@ -1,0 +1,68 @@
+# Launcher topology variant: "dedicated PS" on the non-trainer host.
+#
+# Difference from ``launcher_bare_metal_2node.yaml`` (the default
+# colocated layout):
+#
+#   default: trainer + storage on monarch1 (same host)
+#            generator on monarch2
+#            put  traffic: same-host HCCS    (trainer -> storage)
+#            pull traffic: cross-node RoCE   (storage -> worker)
+#
+#   this:    trainer on monarch1
+#            storage + generator on monarch2 (same host)
+#            put  traffic: cross-node RoCE   (trainer -> storage)
+#            pull traffic: same-host HCCS    (storage -> worker)
+#
+# Use this variant to measure whether the choice of which leg rides
+# RoCE vs HCCS matters for end-to-end sync latency.  It also verifies
+# that the mesh-injection plumbing (backend accepts an externally
+# spawned storage proc_mesh) actually works for a non-colocated PS --
+# which is the intended building block for larger "PS cluster on
+# dedicated nodes" topologies we'll want later.
+
+launcher:
+  type: bare_metal
+
+  bare_metal:
+    # Match hostfile.txt order (run_multinode.sh overrides via CLI).
+    workers:
+      - tcp://192.168.0.26:22222
+      - tcp://192.168.0.23:22222
+    master_addr: 192.168.0.23
+    worker_port: 22222
+
+  # host_idx is an ordered index into bare_metal.workers[].  With
+  # hostfile.txt listing 192.168.0.26 first and 192.168.0.23 second,
+  # run_multinode.sh's generated workers list ends up
+  # [monarch2, monarch1]; the driver is picked from the hostfile's
+  # *second* entry, so TrainerActor (via ``this_host()``) lands on
+  # monarch1 = workers[1].
+  #
+  # The only meaningful change vs the colocated YAML is the storage
+  # placement: host_idx: 0 pins it to monarch2, which is generator's
+  # host.  The trainer still uses this_host() so its nominal host_idx
+  # is documentation-only.
+  meshes:
+    trainer:
+      host_idx: 1         # monarch1 (driver / TrainerActor via this_host)
+    generator:
+      host_idx: 0         # monarch2 -- 1 NPU (0) for vLLM
+    storage:
+      host_idx: 0         # monarch2 -- dedicated PS colocated with the
+                          # generator; put goes cross-node, pull stays
+                          # intra-host HCCS.
+
+  weight_sync:
+    backend: torchstore_multi_vol
+    storage_mesh: storage
+    # Same pool budget as the default YAML -- this value is what
+    # actually lands inside the ``MonarchRDMATransportBuffer`` staging
+    # pool on the trainer proc (and, via worker_manager.sh's env
+    # forward, on the storage and generator-worker procs).
+    pool_mb: 6144
+    # When storage lives on a host that runs *no* trainer ranks, NPU
+    # 0 on that host is free.  Setting storage_npu_base: 4 keeps the
+    # layout identical to the colocated case for a fair A/B (storage
+    # always on NPU 4..7).  Use 0 if you want to compete with vLLM
+    # for NPU 0 instead.
+    storage_npu_base: 4

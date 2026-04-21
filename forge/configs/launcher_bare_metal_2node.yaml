@@ -33,14 +33,22 @@ launcher:
   # sub-block (``slurm:``, ``k8s:``, ...) that the matching launcher
   # class picks up.  Unknown keys are ignored, so migrations are easy.
   bare_metal:
-    # Monarch worker URIs, in the exact order they should populate
-    # the launcher's ``workers`` array.  ``host_idx: N`` in ``meshes:``
+    # Monarch worker URIs, in the exact order they populate the
+    # launcher's ``workers`` array.  ``host_idx: N`` in ``meshes:``
     # below refers to the N-th entry here.
+    #
+    # Note: ``run_multinode.sh`` builds the effective workers list from
+    # ``forge/configs/hostfile.txt`` at runtime and passes it via
+    # ``--bare-metal-workers``, which takes precedence over whatever's
+    # written here (CLI > env > YAML).  So this field is a documented
+    # fallback for direct ``python -m forge.apps.grpo`` invocations.
+    # Keep the ordering identical to hostfile.txt to avoid confusion.
     workers:
-      - tcp://192.168.0.23:22222
       - tcp://192.168.0.26:22222
+      - tcp://192.168.0.23:22222
     # The "driver" address (where ``run_multinode.sh`` fires
     # ``python -m forge.apps.grpo`` from).  Auto-detected if empty.
+    # With the hostfile above, the driver is monarch1 (0.23).
     master_addr: 192.168.0.23
     worker_port: 22222
 
