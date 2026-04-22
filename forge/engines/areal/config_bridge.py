@@ -76,6 +76,18 @@ class AReaLConfigBridge:
 
         trainer_env = self._build_trainer_env(config)
 
+        # Break the alloc_mode DSL into per-component parallel dims so
+        # downstream mesh-spawning (``grpo.py``) can pick the right
+        # ``procs`` / ``gpus_per_proc`` from a single authoritative
+        # source.  Fallback to 1 when a side is absent (e.g. the user
+        # only specified ``vllm:d4p1t1`` without a trainer half).
+        gen_dp = alloc_mode.gen.dp_size if alloc_mode.gen else 1
+        gen_tp = alloc_mode.gen.tp_size if alloc_mode.gen else 1
+        gen_pp = alloc_mode.gen.pp_size if alloc_mode.gen else 1
+        train_dp = alloc_mode.train.dp_size if alloc_mode.train else 1
+        train_tp = alloc_mode.train.tp_size if alloc_mode.train else 1
+        train_pp = alloc_mode.train.pp_size if alloc_mode.train else 1
+
         forge_cfg = ForgeConfig(
             experiment_name=config.experiment_name,
             trial_name=config.trial_name,
@@ -83,6 +95,12 @@ class AReaLConfigBridge:
             model_path=config.vllm.model,
             train_world_size=train_ws,
             gen_world_size=alloc_mode.gen.world_size,
+            gen_dp_size=gen_dp,
+            gen_tp_size=gen_tp,
+            gen_pp_size=gen_pp,
+            train_dp_size=train_dp,
+            train_tp_size=train_tp,
+            train_pp_size=train_pp,
             master_addr=master_addr,
             master_port=master_port,
             reward_fn_path=(

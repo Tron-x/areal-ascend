@@ -630,6 +630,7 @@ class Provisioner:
         env_vars: dict[str, str] | None = None,
         addr: str | None = None,
         port: str | None = None,
+        gpus_per_proc: int = 1,
     ) -> ProcMesh:
         """Allocate a ProcMesh with optional GPU isolation.
 
@@ -642,6 +643,16 @@ class Provisioner:
             env_vars: Additional environment variables.
             addr: Distributed address override.
             port: Distributed port override.
+            gpus_per_proc: Devices visible to *each* spawned proc. All
+                spawned procs receive the same
+                ``CUDA_VISIBLE_DEVICES`` / ``ASCEND_RT_VISIBLE_DEVICES``
+                string (Monarch's ``set_environment`` is per-mesh, not
+                per-proc), so this is really "how many devices each
+                proc should be able to see". Total devices reserved on
+                the host is ``num_procs * gpus_per_proc``. Default 1
+                preserves the historical one-device-per-proc behavior.
+                Set to >1 when a single Python proc internally spawns
+                tensor-parallel workers (e.g. vLLM engine with TP>1).
 
         Returns:
             A configured ProcMesh.
@@ -678,11 +689,20 @@ class Provisioner:
             if with_gpus:
                 if not addr or not port:
                     addr, port = await get_remote_info(host_mesh)
-                gpu_ids = gpu_manager.get_gpus(num_procs)
+                # Reserve `num_procs * gpus_per_proc` devices so that TP>1
+                # procs (e.g. 1 vLLM engine with TP=4) get multiple
+                # devices visible. For the common case gpus_per_proc=1
+                # this is identical to the old get_gpus(num_procs).
+                total_gpus = num_procs * max(1, gpus_per_proc)
+                gpu_ids = gpu_manager.get_gpus(total_gpus)
 
                 env_vars["MASTER_ADDR"] = addr
                 env_vars["MASTER_PORT"] = port
 
+                # WORLD_SIZE is the torch.distributed view (Monarch-spawned
+                # procs), not the vLLM-internal TP/PP view. So it stays at
+                # num_procs*num_hosts even when gpus_per_proc>1 -- vLLM
+                # builds its own NCCL comm inside a proc.
                 world_size = num_procs * (num_hosts or 1)
                 env_vars["WORLD_SIZE"] = str(world_size)
 
@@ -845,6 +865,7 @@ async def get_proc_mesh(
     provisioner = await _get_provisioner()
     return await provisioner.get_proc_mesh(
         num_procs=process_config.procs,
+        gpus_per_proc=getattr(process_config, "gpus_per_proc", 1),
         with_gpus=process_config.with_gpus,
         num_hosts=process_config.hosts,
         mesh_name=process_config.mesh_name,

@@ -50,6 +50,7 @@ class ForgeActor(Actor):
     """
 
     procs: int = 1
+    gpus_per_proc: int = 1
     hosts: int | None = None
     with_gpus: bool = False
     num_replicas: int = 1
@@ -83,6 +84,7 @@ class ForgeActor(Actor):
         cls: type[T],
         *,
         procs: int = 1,
+        gpus_per_proc: int = 1,
         hosts: int | None = None,
         with_gpus: bool = False,
         num_replicas: int = 1,
@@ -96,9 +98,18 @@ class ForgeActor(Actor):
 
             gen_cfg = Generator.options(procs=1, with_gpus=True, num_replicas=2)
             service = await gen_cfg.as_service(model="Qwen/Qwen2.5-1.5B")
+
+        ``gpus_per_proc`` controls how many accelerator devices each
+        spawned proc should see (via
+        ``CUDA_VISIBLE_DEVICES`` / ``ASCEND_RT_VISIBLE_DEVICES``). The
+        default 1 matches the historical one-device-per-proc layout.
+        Use >1 when a single proc drives internal TP workers
+        (e.g. a vLLM engine with ``tensor_parallel_size=N`` should be
+        launched as ``procs=1, gpus_per_proc=N``).
         """
         attrs = {
             "procs": procs,
+            "gpus_per_proc": gpus_per_proc,
             "hosts": hosts,
             "with_gpus": with_gpus,
             "num_replicas": num_replicas,
@@ -118,6 +129,7 @@ class ForgeActor(Actor):
 
         cfg_kwargs = {
             "procs": cls.procs,
+            "gpus_per_proc": cls.gpus_per_proc,
             "hosts": cls.hosts,
             "with_gpus": cls.with_gpus,
             "num_replicas": cls.num_replicas,
@@ -153,6 +165,7 @@ class ForgeActor(Actor):
         """
         cfg = ProcessConfig(
             procs=cls.procs,
+            gpus_per_proc=cls.gpus_per_proc,
             hosts=cls.hosts,
             with_gpus=cls.with_gpus,
             mesh_name=cls.mesh_name,

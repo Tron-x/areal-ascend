@@ -67,6 +67,24 @@ class ForgeConfig:
 
     train_world_size: int = 4
     gen_world_size: int = 4
+
+    # Per-component parallel-dim breakdown, derived from AllocationMode.
+    # These exist so ``grpo.py`` can spawn each mesh with the right
+    # ``procs`` and ``gpus_per_proc`` counts without redoing the DSL
+    # parsing, and so that swapping ``allocation_mode`` in YAML is the
+    # single source of truth for topology (e.g. switching from
+    # ``vllm:d4p1t1+d4p1t1`` to ``vllm:d1p1t4+d4p1t1`` flips the
+    # generator from DP=4/TP=1 to DP=1/TP=4 with no code changes).
+    #
+    # Defaults mirror the pre-refactor legacy behavior (single gen
+    # proc, FSDP-only trainer) so pre-existing configs keep running.
+    gen_dp_size: int = 1
+    gen_tp_size: int = 1
+    gen_pp_size: int = 1
+    train_dp_size: int = 1
+    train_tp_size: int = 1
+    train_pp_size: int = 1
+
     master_addr: str = ""
     master_port: int = 0
 

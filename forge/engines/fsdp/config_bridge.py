@@ -68,6 +68,10 @@ class FSDPConfigBridge:
             "seed": args.seed,
         }
 
+        # FSDP path currently assumes TP=PP=1 on both sides (no DSL).
+        # If we ever add CLI knobs for TP/PP here, replace these
+        # defaults with the parsed values; see the areal bridge for
+        # the alloc_mode-DSL-driven version.
         forge_cfg = ForgeConfig(
             experiment_name=args.experiment_name,
             trial_name=args.trial_name,
@@ -75,6 +79,12 @@ class FSDPConfigBridge:
             model_path=args.model,
             train_world_size=args.train_gpus,
             gen_world_size=args.gen_gpus,
+            gen_dp_size=args.gen_gpus,
+            gen_tp_size=1,
+            gen_pp_size=1,
+            train_dp_size=args.train_gpus,
+            train_tp_size=1,
+            train_pp_size=1,
             master_addr=master_addr,
             master_port=master_port,
             reward_fn_path=args.reward_fn,
@@ -173,7 +183,9 @@ class FSDPConfigBridge:
         p.add_argument("--enforce-eager", action="store_true", default=True)
         p.add_argument("--seed", type=int, default=42)
 
-        p.add_argument("--reward-fn", default="forge.examples.harbor.reward.harbor_math_reward")
+        p.add_argument(
+            "--reward-fn", default="forge.examples.harbor.reward.harbor_math_reward"
+        )
         p.add_argument("--fileroot", default="/tmp/forge/experiments")
 
         return p.parse_known_args(argv)

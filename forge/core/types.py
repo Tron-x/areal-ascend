@@ -247,9 +247,25 @@ class AgentAction:
 
 @dataclass
 class ProcessConfig:
-    """Configuration for allocating a Monarch ProcMesh."""
+    """Configuration for allocating a Monarch ProcMesh.
+
+    Fields:
+        procs: number of Python processes to spawn on the mesh.
+        gpus_per_proc: number of accelerator devices (e.g. NPUs) each
+            proc should have visible. Default 1 matches the historical
+            behavior where ``with_gpus=True`` hands one device per proc.
+            Set to >1 when a single proc needs to drive tensor parallel
+            workers internally (e.g. a vLLM engine running TP>1 inside
+            one Python process). Total devices requested from the host's
+            GpuManager is ``procs * gpus_per_proc``.
+        with_gpus: whether to request accelerator isolation at all.
+        hosts: remote host count; ``None`` means local.
+        mesh_name: logical mesh name (used by the launcher to look up
+            which physical host slice to land on).
+    """
 
     procs: int = 1
+    gpus_per_proc: int = 1
     with_gpus: bool = False
     hosts: int | None = None
     mesh_name: str | None = None
@@ -260,6 +276,7 @@ class ServiceConfig:
     """Configuration for a replicated Forge service."""
 
     procs: int = 1
+    gpus_per_proc: int = 1
     num_replicas: int = 1
     with_gpus: bool = False
     hosts: int | None = None
@@ -271,6 +288,7 @@ class ServiceConfig:
     def to_process_config(self) -> ProcessConfig:
         return ProcessConfig(
             procs=self.procs,
+            gpus_per_proc=self.gpus_per_proc,
             with_gpus=self.with_gpus,
             hosts=self.hosts,
             mesh_name=self.mesh_name,

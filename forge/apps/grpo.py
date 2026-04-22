@@ -551,8 +551,21 @@ async def grpo_main(
         and provisioner_config.launcher_config.launcher.value != "local"
     )
 
+    # Generator topology is driven entirely by ``forge_cfg`` (which is
+    # filled from ``allocation_mode`` by the config bridge).  Flipping
+    # the YAML ``allocation_mode`` is the single source of truth:
+    #   vllm:d1p1t1  -> procs=1, gpus_per_proc=1  (legacy default)
+    #   vllm:d1p1t4  -> procs=1, gpus_per_proc=4  (one vLLM engine, TP=4)
+    #   vllm:d4p1t1  -> procs=4, gpus_per_proc=1  (4 independent vLLM replicas)
+    #   vllm:d2p1t2  -> procs=2, gpus_per_proc=2  (mixed TP+DP)
+    # ``engine_args.tensor_parallel_size`` was already resolved to
+    # ``gen_tp_size * gen_pp_size`` by the bridge, so vLLM's internal
+    # worker-spawn matches the device mask we install here.
+    gen_procs = max(1, forge_cfg.gen_dp_size)
+    gen_gpus_per_proc = max(1, forge_cfg.gen_tp_size * forge_cfg.gen_pp_size)
     generator = await Generator.options(
-        procs=1,
+        procs=gen_procs,
+        gpus_per_proc=gen_gpus_per_proc,
         with_gpus=True,
         mesh_name="generator",
         hosts=1 if is_distributed else None,
