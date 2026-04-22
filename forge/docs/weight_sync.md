@@ -64,6 +64,71 @@ orchestration around these two primitives.
 of tensor bytes and must never visit Python — RDMA one-sided direct from source NPU to
 destination NPU is the only acceptable path.
 
+## 2b. Rank taxonomy — which "rank" at which layer
+
+Four independent `rank` spaces are in play at once. Mixing them up is the single biggest
+source of confusion when reading logs; the probe in commit `3b7196a5` was to
+disambiguate them on our running system.
+
+| rank space                 | where it lives                                                             | how to read it                                           | example (trainer rank 2)                                              |
+| -------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------- |
+| **Monarch mesh rank**      | per ProcMesh; always 0..mesh_size-1                                        | `context().actor_instance.rank.rank`                     | 2                                                                     |
+| **torch.distributed rank** | set by TitanTrainer's SPMD setup into `RANK` / `LOCAL_RANK` env            | `dist.get_rank()` / `os.environ["LOCAL_RANK"]`           | 2                                                                     |
+| **HCCL comm rank**         | per HCCL communicator; FSDP gather and each HiXL put use *different* comms | inside HCCL log lines, `rank[<N>]`, `deviceLogicId[<M>]` | FSDP: 2; HiXL put: 0 (it's a 2-rank comm, client=rank0, server=rank1) |
+| **physical NPU id**        | hardware; fixed per chip                                                   | `torch.npu.current_device()` after `set_device`          | 2 (for trainer rank 2)                                                |
+
+Each mesh's internal rank restarts from 0:
+
+```
+trainer mesh   (4 proc)  → ranks 0, 1, 2, 3
+generator mesh (1 proc)  → rank 0
+storage mesh   (4 proc)  → ranks 0, 1, 2, 3
+```
+
+Monarch has no notion of a "global rank" across meshes — if you need one you build it
+yourself.
+
+### Mapping mesh rank → physical NPU
+
+Decided per-mesh, at proc startup, via either the bootstrap (storage) or TitanTrainer's
+SPMD setup (trainer):
+
+| mesh                | bootstrap / setup did                                                       | physical NPU                     |
+| ------------------- | --------------------------------------------------------------------------- | -------------------------------- |
+| trainer             | no mask; `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3` + `torch.npu.set_device(rank)` | `rank` on monarch1 (driver host) |
+| storage (colocated) | `_storage_bootstrap_factory(npu_base=4)` masks proc to one NPU              | `4 + rank` on monarch1           |
+| storage (dedicated) | same bootstrap, different host                                              | `4 + rank` on monarch2           |
+| generator           | vLLM's own setup, single proc                                               | NPU 0 on monarch2                |
+
+**Why trainer doesn't use `ASCEND_RT_VISIBLE_DEVICES` masking while storage does**:
+
+- *trainer*: FSDP's 4-way HCCL comm needs every rank to see each peer's `device_ip` and
+  resolve HCCS topology; masking each proc to a single NPU breaks that discovery. So
+  trainer procs see all 4 NPUs and pick their own via `set_device(rank)`.
+- *storage*: each volume proc is isolated — it does not HCCL with its sibling volumes.
+  The torchstore transport layer currently hardcodes `npu:0` as the staging pool device,
+  which only works if each proc has been masked so that "npu:0" is the one physical NPU
+  you want (`4+i` here).
+
+### The HCCL-per-put twist
+
+Every `ts.put` / `ts.get` under `MonarchRDMATransportBuffer` builds a fresh **2-rank
+HCCL comm** on the fly (client=rank 0, server=rank 1). The rank numbers inside these
+ephemeral comms are local to each comm and unrelated to the Monarch mesh rank. So
+trainer mesh rank 2, doing a `ts.put`, shows up in HCCL logs as "rank\[0\],
+deviceLogicId\[2\]" inside an `[hixl]192.168.0.23:X_192.168.0.23:Y` comm. None of this
+conflicts with its FSDP HCCL rank, which is 2 in a different comm.
+
+Concretely, a trainer proc simultaneously participates in:
+
+1. Monarch `trainer` ProcMesh (rank=2, `_host_id`=UUID-of-monarch1)
+1. FSDP 4-way HCCL comm (rank=2, `deviceLogicId`=2)
+1. HiXL put-side 2-rank comm (rank=0, `deviceLogicId`=2)
+1. Physical NPU 2 (`torch.npu.current_device()`=2)
+
+When a log line prints a rank, ALWAYS check which comm / mesh it belongs to before
+drawing any conclusion.
+
 ## 3. The flat-buffer fast path
 
 Our measured fast path for a ping-pong update is driven by a single RDMA transfer on
