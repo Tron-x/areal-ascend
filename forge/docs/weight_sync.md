@@ -365,7 +365,7 @@ rank 2 local: {"device_id":"2", "device_ip":"29.191.84.209",  "deviceLogicId":2}
 rank 3 local: {"device_id":"3", "device_ip":"29.191.87.140",  "deviceLogicId":3}
 ```
 
-### Bug B — storage-side bootstrap is silently skipped; all vols collapse to NPU 4
+### Bug B — storage-side bootstrap is silently skipped (FIXED)
 
 Even with Bug A' fixed, every trainer rank's rankTable **peer half** reads identically
 to NPU 4:
@@ -411,39 +411,75 @@ failures on shutdown. ... we will move back to bootstrap once it's fixed"). Our
 `_storage_bootstrap_factory` sits on the same bootstrap path, so on our monarch build
 the closure is effectively dead code.
 
-**Fix direction**: migrate storage spawn from `bootstrap=...` to the `EnvSetter`-style
-pattern (same as torchforge GPU path):
+**Fix landed 2026-04-22** (commit `eca54172`). Migrated storage spawn from
+`bootstrap=...` to an `EnvSetter`-style pattern (same shape as torchforge's GPU path):
 
-1. Spawn storage procs with no bootstrap.
-1. Spawn a tiny setter actor (`EnvSetter`) on the storage ProcMesh.
-1. Call its `set_env(env_vars)` endpoint; each proc writes `ASCEND_RT_VISIBLE_DEVICES` /
-   `MONARCH_NPU_DEVICE` / etc. into its own env.
+1. Spawn storage procs with no bootstrap (`grpo.py::_spawn_storage_mesh`).
+1. Spawn a `StorageEnvSetter` actor on the storage ProcMesh
+   (`forge/engines/weight_sync/_env_setter.py`).
+1. Call its `setup(npu_base, pool_mb)` endpoint; each proc writes
+   `ASCEND_RT_VISIBLE_DEVICES` / `MONARCH_NPU_DEVICE` / HiXL / HCCL / torchstore env
+   vars into its own env **before** importing `torch_npu`, then
+   `torch.npu.set_device(0)` on the masked NPU.
+1. The setter returns a per-rank status dict (`masked_device_count`,
+   `masked_current_device`, `physical_npu`) so the driver can *observe* that masking
+   actually took effect — the evidence we were missing under the silent-bootstrap
+   regime.
 1. *Then* proceed with `ts.initialize`.
 
-~40 LOC in `grpo.py::_spawn_storage_mesh` + `torchstore_multi_vol.py`. Independent of
-the HiXL end-of-month rankTable removal. Once it lands, together with the Bug A' fix
-already deployed on the trainer side, the `FORGE_SHARD_PUBLISH=1` path should actually
-run end-to-end on our setup.
+Verified with `FORGE_SHARD_PUBLISH=1` smoke (Qwen3-0.6B, 1.4 GiB state_dict, 3-step
+ping-pong):
+
+```
+env setup confirmed: [
+  {local_rank=0, physical_npu=4, masked_device_count=1, masked_current_device=0},
+  {local_rank=1, physical_npu=5, masked_device_count=1, masked_current_device=0},
+  {local_rank=2, physical_npu=6, masked_device_count=1, masked_current_device=0},
+  {local_rank=3, physical_npu=7, masked_device_count=1, masked_current_device=0},
+]
+
+push_flat(v3): ranks_seen=[0,1,2,3],
+               shard_ranges=[(0,0,375M), (1,375M,751M), (2,751M,1126M), (3,1126M,1504M)],
+               put_s_max=0.03
+pull_flat(v3): num_keys=311, pull_s=0.11, workers_load_s=0.10
+Weight sync: 0.4 s
+```
+
+Each storage vol is correctly pinned to its own physical NPU; trainer rankTable peer
+halves carry NPU 4/5/6/7 (one per comm); HCCL inits succeed concurrently on all 4 ranks;
+push_flat puts proceed in parallel across 4 NICs. Steady `put_s_max=0.03s` vs
+rank-0-only's `0.07s` — the 4 NIC parallelism kicked in as designed.
+
+Total weight sync stays at 0.4s because **pull is still single NIC** (generator runs
+TP=1, one worker proc, one NIC). Unlocking 4 NIC on the pull side is a separate piece of
+work (generator TP>=2 with per-worker shard-fetch), tracked as §7.4 below.
+
+One subtlety that almost reverted the win: the first revision of the trainer-side shard
+fix nulled `_GLOBAL_POOL` at the top of *every* `publish_weights_flat` call to force
+pool re-init on the right NPU. That worked on v1, but on v2 the pool teardown ran while
+the previous cycle's storage-side handshake still held references to our RDMABuffer
+registrations — leading to `hixl_transfer_read ret=503900` on server-side
+`handle_put_request`. The fix is a `self._shard_env_set` guard so the pool gets
+rewritten exactly once per trainer proc. See the trap-warning comment inline in
+`publish_weights_flat`.
 
 ### Bug C — HiXL rankTable dependency itself
 
-Originally framed as "the fix". Now, with Bug A' fixed and the HiXL C++ inspected, we
-know the rankTable mechanism **works correctly** for non-colliding (local_device,
-peer_device) pairs — it just requires the caller to supply accurate device_ids on both
-ends. Bug B is the remaining caller-side work; the HiXL end-of-month rankTable removal
-is still welcome (simpler semantics, no caller-side device bookkeeping) but is no longer
-on the critical path for enabling shard publish.
+Originally framed as "the fix". With Bug A' and Bug B both fixed (and HiXL C++
+inspected), we now know the rankTable mechanism **works correctly** for non-colliding
+(local_device, peer_device) pairs — it just requires the caller to supply accurate
+device_ids on both ends. Our 2-node setup runs the full shard-publish path today on the
+existing HiXL rankTable API; the HiXL end-of-month rankTable removal is still welcome
+(simpler semantics, no caller-side device bookkeeping) but is **no longer on the
+critical path**.
 
-**Smoke plan when fix (b) lands**:
+**Follow-ups with rankTable removal**:
 
-1. Update torchstore / monarch against the new CANN + HiXL libs.
-1. Flip `FORGE_SHARD_PUBLISH=1`, run the 3-step ping-pong smoke.
-1. Expect `push_flat`'s `put_s_max` to drop roughly 4x vs rank-0-only (ideal:
-   `total_bytes / (world_size × single_nic_bw)`). `pull_flat` gains a smaller speedup
-   from N volumes answering in parallel.
-1. Watch for second-order effects: four 6 GiB staging pools (one per trainer NPU) may
-   tighten NPU memory vs the rank-0-only layout; possibly need to drop `pool_mb` for the
-   shard path.
+1. Update torchstore / monarch against the new CANN + HiXL libs when available.
+1. Simplify `HixlManagerActor::new` path — no more `resolve_device_id` lookup, no more
+   `MONARCH_NPU_DEVICE` env var, no more `_shard_env_set` guard in trainer. The current
+   complexity is caller-side device bookkeeping, which becomes unneeded.
+1. Re-run the 3-step ping-pong smoke to confirm the steady-state numbers don't regress.
 
 **Also related, not blocking**: once shard-publish runs, **B1.2** (per-rank
 `DTensor.to_local()` packing instead of every rank gathering the full HF state_dict)
