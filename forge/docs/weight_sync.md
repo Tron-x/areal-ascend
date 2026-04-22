@@ -319,25 +319,46 @@ HiXL's choice of the rankTable-based HCCL init API (as opposed to root-info).
 
 **Fix (a) — forge side, env-per-rank pool device.** Landed in
 `TrainerActor.publish_weights_flat`: when `FORGE_SHARD_PUBLISH=1`, each trainer proc
-overrides `TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:{rank}` before building its flat
-buffer, so every rank's torchstore staging pool lives on its own NPU rather than NPU 0.
-Trivial one-liner, but mandatory for multi-client ts.put to ever make sense.
+monkey-patches `torchstore.transport.monarch_rdma._STORAGE_DEVICE = f"npu:{rank}"` (and
+nulls `_GLOBAL_POOL`) before building its flat buffer, so every rank's torchstore
+staging pool lives on its own NPU rather than NPU 0. (Note: we rewrite the module
+constant rather than the env var because torchstore caches
+`_STORAGE_DEVICE = os.environ.get(...)` at import time, and the module is imported long
+before this endpoint runs.) Correct and necessary fix — but validated on 2026-04-22 to
+be insufficient by itself.
 
 **Fix (b) — HiXL / CANN side, drop the rankTable dependency.** HiXL currently uses
 `HcclCommInitClusterInfoMemConfig(rankTable_json, ...)` which requires a rankTable
-matching physical device ids. That's how multi-client HCCL init ends up colliding even
-after fix (a). HCCL itself has a second init path (`HcclCommInitRootInfo`) that
-negotiates peers at runtime — the same path `torch.distributed(backend="hccl")` uses for
-FSDP's 4-rank all-gather, which already works. The HiXL team is scheduled to switch
-HiXL's internal comm init to root-info by **end of the month**. After that, the
-physical-id constraint disappears and multiple trainer ranks can open HiXL connections
-to distinct storage volumes concurrently.
+matching physical device ids. HCCL itself has a second init path
+(`HcclCommInitRootInfo`) that negotiates peers at runtime — the same path
+`torch.distributed(backend="hccl")` uses for FSDP's 4-rank all-gather, which already
+works. The HiXL team is scheduled to switch HiXL's internal comm init to root-info by
+**end of the month**.
+
+**2026-04-22 validation — does fix (a) alone unlock shard publish?** No.
+
+With fix (a)'s monkey-patch in place and `FORGE_SHARD_PUBLISH=1`, every trainer rank's
+rankTable string still reads identically:
+
+```
+{"device":[
+  {"device_id":"0","device_ip":"29.191.188.114","rank_id":"0"},   # local = NPU 0 always
+  {"device_id":"4","device_ip":"29.191.56.199","rank_id":"1"}      # peer  = NPU 4 always
+]}
+```
+
+Four trainer ranks produce four copies of this same rankTable and fail HCCL init with
+`errNo 0x0000000005000007`. This confirms **the rankTable's `device_id` field is NOT
+derived from the torchstore staging pool** — it comes from somewhere deeper in the HiXL
+C++ stack (a hardcoded default, or a different module constant we haven't tracked down).
+So fix (a) is a correctness improvement for the staging pool but doesn't move the needle
+on HCCL multi-client init. **Fix (b) is required.**
 
 **What we can smoke today** (with fix (a) only, fix (b) pending):
 
 - Rank-0-only path: unchanged, 0.4 s / 13 GB/s steady state.
-- Shard-parallel path (`FORGE_SHARD_PUBLISH=1`): still fails — this is expected, not a
-  regression.
+- Shard-parallel path (`FORGE_SHARD_PUBLISH=1`): still fails with the same
+  `errNo 0x05000007` — confirmed 2026-04-22, not a regression.
 
 **Smoke plan when fix (b) lands**:
 

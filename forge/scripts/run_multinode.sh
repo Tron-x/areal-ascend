@@ -109,6 +109,16 @@ FORGE_WEIGHT_SYNC_FWD="${FORGE_WEIGHT_SYNC:-nccl}"
 # "fall through to whatever YAML says".
 FORGE_WEIGHT_SYNC_BACKEND_FWD="${FORGE_WEIGHT_SYNC_BACKEND:-}"
 
+# Experimental: when set to "1", trainer publishes a byte-shard per
+# rank instead of only rank 0 put'ing the whole flat buffer.  Wired
+# through by TrainerActor.publish_weights_flat.  Status tracked in
+# forge/docs/weight_sync.md §7.1 -- currently blocked on the HiXL
+# rankTable assumption, which the CANN/HiXL team is changing at the
+# end of the month, but worth retrying whenever the pool-device fix
+# or any torchstore/monarch-rdma change lands so we can confirm the
+# blocker is still on the HiXL side.
+FORGE_SHARD_PUBLISH_FWD="${FORGE_SHARD_PUBLISH:-}"
+
 # Explicit mesh placement (name -> worker_idx), e.g.
 #   FORGE_MESH_PLACEMENT="trainer=0,generator=1,storage=0"
 FORGE_MESH_PLACEMENT_FWD="${FORGE_MESH_PLACEMENT:-}"
@@ -154,6 +164,7 @@ export HCCL_DEBUG=\"\${HCCL_DEBUG:-INFO}\"; \
 export FORGE_WEIGHT_SYNC='${FORGE_WEIGHT_SYNC_FWD}'; \
 [ -n '${FORGE_WEIGHT_SYNC_BACKEND_FWD}' ] && export FORGE_WEIGHT_SYNC_BACKEND='${FORGE_WEIGHT_SYNC_BACKEND_FWD}'; \
 [ -n '${FORGE_MESH_PLACEMENT_FWD}' ] && export FORGE_MESH_PLACEMENT='${FORGE_MESH_PLACEMENT_FWD}'; \
+[ -n '${FORGE_SHARD_PUBLISH_FWD}' ] && export FORGE_SHARD_PUBLISH='${FORGE_SHARD_PUBLISH_FWD}'; \
 [ -n '${FORGE_STORAGE_HOST_MESH_FWD}' ] && export FORGE_STORAGE_HOST_MESH='${FORGE_STORAGE_HOST_MESH_FWD}'; \
 [ -n '${FORGE_STORAGE_NPU_BASE_FWD}' ] && export TORCHSTORE_STORAGE_NPU_BASE='${FORGE_STORAGE_NPU_BASE_FWD}'; \
 export MONARCH_HIXL_TRANSPORT=roce; \

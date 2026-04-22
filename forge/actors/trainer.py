@@ -256,24 +256,42 @@ class TrainerActor(ForgeActor):
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        # Shard-parallel publish precondition: every trainer proc's
-        # torchstore staging pool must live on *its own* NPU rather
-        # than the module-default ``npu:0`` every proc inherits from
-        # the parent env via ``TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE``.
-        # Otherwise every rank's ``ts.put`` ends up (a) staging through
-        # NPU 0 memory only and (b) the HCCL comm's rankTable carries
-        # ``device_id:0`` for every rank's local endpoint, so all
-        # trainer-to-storage HiXL connections collide on NPU 0's NIC.
-        # Probe evidence: every trainer proc sees
-        # ``ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`` and reports
-        # ``torch.npu.current_device() == rank``, so switching the pool
-        # device to match the proc's current NPU is both safe and
-        # sufficient.
+        # Shard-parallel publish precondition (necessary but NOT
+        # sufficient): pin every trainer proc's torchstore staging
+        # pool to its own NPU rather than the default ``npu:0``.
+        # Without this, every rank would stage through NPU 0, double-
+        # booking one pool on one NPU -- a separate correctness bug on
+        # top of the HiXL rankTable one below.
         #
-        # Only applies to the shard-parallel path -- the rank-0-only
-        # path already ties everything to NPU 0 intentionally, and
-        # that's the 13 GB/s number we ship with.
+        # Why the monkey-patch instead of the env var: torchstore
+        # caches ``_STORAGE_DEVICE`` at module import time
+        # (``_STORAGE_DEVICE = os.environ.get(...)``), and the module
+        # has already been imported by TrainerActor init long before
+        # this endpoint runs.  Rewriting the env var at runtime is a
+        # no-op; rewriting the module constant works.  We also null
+        # ``_GLOBAL_POOL`` so the next ``_get_pool()`` re-inits on the
+        # right device (the pool singleton is otherwise frozen after
+        # first use).
+        #
+        # This fix is correct but BLOCKED at a deeper layer: when we
+        # tried ``FORGE_SHARD_PUBLISH=1`` on 2026-04-22 with this
+        # monkey-patch in place, HCCL still failed multi-client init
+        # with ``errNo 0x05000007`` and the rankTable string still
+        # showed ``device_id:0, device_ip:NPU-0-ip`` for every
+        # trainer rank's local endpoint.  So the HCCL rankTable's
+        # local-NPU field is NOT derived from the torchstore pool's
+        # NPU -- it comes from somewhere in the HiXL C++ stack
+        # (hardcoded or from a different module constant we haven't
+        # tracked down).  Waiting on the HiXL team's end-of-month
+        # switch to ``HcclCommInitRootInfo`` (no rankTable) to
+        # actually unblock.  See forge/docs/weight_sync.md §7.1.
         if os.environ.get("FORGE_SHARD_PUBLISH", "0") == "1" and world_size > 1:
+            import torchstore.transport.monarch_rdma as _mrdma
+
+            _mrdma._STORAGE_DEVICE = f"npu:{rank}"
+            _mrdma._GLOBAL_POOL = None
+            # Also set the env for symmetry with any downstream code
+            # that still reads ``os.environ`` directly.
             os.environ["TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE"] = f"npu:{rank}"
 
         meta = build_meta_from_state_dict(state_dict)
