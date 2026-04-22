@@ -149,7 +149,11 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
     backend_name = os.environ.get("FORGE_WEIGHT_SYNC_BACKEND", "torchstore_multi_vol")
     # Backend-specific options from env (kept narrow so YAML stays clean).
     backend_kwargs: dict = {}
-    if backend_name == "torchstore_multi_vol":
+    # Both torchstore_multi_vol and collective_broadcast share the same
+    # trainer-side HiXL put path, so they take the same storage-mesh
+    # provisioning knobs. The shared block is below; the bcast backend
+    # layers its HCCL-group knobs on top.
+    if backend_name in ("torchstore_multi_vol", "collective_broadcast"):
         # Placement knobs: these used to be baked into the backend; now
         # the driver provisions the storage mesh and hands it in, so the
         # backend becomes topology-agnostic.  Env vars still take
@@ -198,6 +202,16 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
                 npu_base=npu_base,
             )
             backend_kwargs["storage_mesh"] = storage_mesh
+
+        # Bcast-specific extras: which vol is the src, optional master
+        # port override for the HCCL TCPStore. Defaults are fine.
+        if backend_name == "collective_broadcast":
+            src_env = os.environ.get("FORGE_BCAST_SRC_VOL_IDX")
+            port_env = os.environ.get("FORGE_BCAST_MASTER_PORT")
+            if src_env is not None:
+                backend_kwargs["bcast_src_vol_idx"] = int(src_env)
+            if port_env is not None:
+                backend_kwargs["bcast_master_port"] = int(port_env)
 
     try:
         backend = create_backend(backend_name, **backend_kwargs)

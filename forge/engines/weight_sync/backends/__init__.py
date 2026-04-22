@@ -83,6 +83,15 @@ def _load_areal_xccl(**kwargs) -> WeightSyncBackend:
     return ArealXcclBackend(**kwargs)
 
 
+@_register("collective_broadcast")
+def _load_collective_broadcast(**kwargs) -> WeightSyncBackend:
+    from forge.engines.weight_sync.backends.collective_broadcast import (
+        CollectiveBroadcastBackend,
+    )
+
+    return CollectiveBroadcastBackend(**kwargs)
+
+
 def create_backend(name: str, **kwargs) -> WeightSyncBackend:
     """Instantiate a backend by name.
 

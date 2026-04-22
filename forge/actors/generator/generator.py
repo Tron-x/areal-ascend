@@ -208,6 +208,20 @@ class Generator(ForgeActor):
         logger.info(f"Retrieved workers from registry: {self.workers}")
 
     @endpoint
+    async def get_worker_mesh(self):
+        """Expose the internal vLLM WorkerWrapper ActorMesh to the caller.
+
+        Used by weight-sync backends that need to fan out endpoint calls
+        to every TP worker (e.g. CollectiveBroadcastBackend calling
+        ``init_bcast_group`` / ``recv_and_load_flat``). WorkerRegistry
+        already demonstrates that Monarch ActorMesh references are
+        cross-process serializable, so returning this handle is safe.
+        """
+        if self.workers is None:
+            raise RuntimeError("get_worker_mesh called before setup finished")
+        return self.workers
+
+    @endpoint
     async def generate(
         self,
         prompt: str,

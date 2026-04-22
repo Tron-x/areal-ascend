@@ -76,6 +76,12 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
         WorkerWrapperBase.__init__(self, rpc_rank=rank, global_rank=rank)
         Actor.__init__(self)
         self._vllm_config = vllm_config
+        # Collective-broadcast pull-side state: initialized lazily by
+        # ``init_bcast_group`` when the weight-sync backend opts into
+        # the bcast leg.  ``pull_weights_flat`` does not use these.
+        self._bcast_pg = None
+        self._bcast_rank: int | None = None
+        self._bcast_world_size: int | None = None
 
     def init_worker(self, all_kwargs):
         monarch_rank = self.rpc_rank
@@ -498,6 +504,246 @@ class WorkerWrapper(WorkerWrapperBase, Actor):
             "fused_count": fused_count,
             **{f"{k}": v for k, v in timing.items()},
         }
+
+    # ------------------------------------------------------------------
+    # Collective-broadcast pull path (counterpart of storage volume's
+    # ``bcast_tensor``).  See ``forge/docs/weight_sync.md §7.4``.
+    #
+    # Unlike ``pull_weights_flat`` (which independently ``ts.get``s from
+    # every TP worker and therefore scales connections as
+    # ``N_workers * N_storage_vols``), this path joins the TP workers
+    # into one HCCL process group with the storage volume and lets HCCL
+    # itself handle fan-out.  Connection count becomes ``1+N_workers``
+    # for the whole pull, which is the root fix for the 103901
+    # CreateChannel blow-up at TP>1.
+    # ------------------------------------------------------------------
+    @endpoint
+    def init_bcast_group(
+        self,
+        master_addr: str,
+        master_port: int,
+        world_size: int,
+        rank: int,
+        backend: str = "hccl",
+        group_name: str = "torchstore_bcast_reflector",
+        timeout_s: int = 180,
+    ) -> dict:
+        """Rendezvous this worker into the cross-mesh bcast group.
+
+        The rank assignment is the caller's responsibility (the backend
+        driver computes ``rank = rank_offset + this_worker.rpc_rank``).
+        ``rank=0`` is reserved for the storage volume acting as bcast
+        source; TP workers always occupy ``rank >= 1``.
+        """
+        import datetime
+        import os
+
+        import torch
+        import torch.distributed as dist
+        import torch_npu  # noqa: F401
+
+        # vLLM TP workers already have a default PG set up for their
+        # own tensor-parallel all-reduce.  We can't replace that, so
+        # create a named sub-group via ``new_group`` when there's an
+        # existing default PG, otherwise take the default slot.
+        if dist.is_initialized():
+            # ``new_group`` needs every rank in the parent group to
+            # call it with the same ``ranks`` list.  Here every proc in
+            # the bcast group (storage + TP workers) is in a *different*
+            # parent PG -- they don't share one -- so we can't use
+            # ``new_group``.  Instead build a fresh independent PG via
+            # the same ``init_process_group`` path the storage vol
+            # uses, but store it in a private slot.  This is possible
+            # in PyTorch by calling ``_new_process_group_helper`` with
+            # a PrefixStore, which is exactly what AReaL's
+            # ``init_custom_process_group`` does.
+            from areal.engine.core.distributed import init_custom_process_group
+
+            self._bcast_pg = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_addr}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+                timeout=datetime.timedelta(seconds=timeout_s),
+            )
+        else:
+            dist.init_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_addr}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                timeout=datetime.timedelta(seconds=timeout_s),
+            )
+            self._bcast_pg = dist.group.WORLD
+
+        self._bcast_rank = rank
+        self._bcast_world_size = world_size
+        # Pin this proc to its distinct physical NPU *before* the probe
+        # all_reduce, mirroring the MVP-2 fix (test_cross_mesh_bcast_1toN.py):
+        # without an explicit ``set_device(LOCAL_RANK)``, every worker's
+        # ``current_device`` is 0 and HCCL topology discovery blows up
+        # with "rank num[K] != rank list size[M]".  LOCAL_RANK is
+        # populated by ``forge/actors/generator/executor.py::_build_worker_envs``
+        # for each vLLM TP worker.
+        local_rank_env = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.npu.set_device(local_rank_env)
+        device = torch.device("npu", local_rank_env)
+        # Quick sanity: one all_reduce so any init-time HCCL failure
+        # surfaces here, not on the first real bcast.
+        probe = torch.ones(8, dtype=torch.float32, device=device)
+        dist.all_reduce(probe, group=self._bcast_pg)
+        torch.npu.synchronize()
+        return {
+            "rank": rank,
+            "world_size": world_size,
+            "local_rank": local_rank_env,
+            "device": str(device),
+            "probe_sum": float(probe.sum().item()),
+        }
+
+    @endpoint
+    def recv_and_load_flat(
+        self,
+        version: int,
+        plan: list,
+        total_bytes: int,
+        src_rank: int = 0,
+    ) -> dict:
+        """Receive the flat buffer via ``dist.broadcast`` (src=storage)
+        and load weights exactly like ``pull_weights_flat`` does after
+        its ``ts.get``.
+
+        Shares the unpack + direct/fused-load path with
+        ``pull_weights_flat`` so any improvements there (dtype quirks,
+        vLLM compatibility, ...) automatically flow through.
+        """
+        import time
+
+        import torch
+        import torch.distributed as dist
+        import torch_npu  # noqa: F401
+        from monarch._src.rdma.xdma import alloc_aligned_tensor
+
+        from forge.engines.weight_sync._flat_layout import torch_dtype_from_str
+
+        if self._bcast_pg is None:
+            return {
+                "success": False,
+                "message": "recv_and_load_flat called before init_bcast_group",
+                "bytes": 0,
+                "num_keys": 0,
+            }
+
+        model = self.worker.model_runner.model
+        name_to_param = dict(model.named_parameters())
+
+        overall_t0 = time.perf_counter()
+        timing: dict[str, float] = {
+            "alloc_s": 0.0,
+            "bcast_s": 0.0,
+            "unpack_s": 0.0,
+            "fused_load_s": 0.0,
+        }
+
+        # alloc
+        t0 = time.perf_counter()
+        device = f"npu:{torch.npu.current_device()}"
+        flat, _raw = alloc_aligned_tensor(
+            (total_bytes,), dtype=torch.uint8, device=device
+        )
+        timing["alloc_s"] = time.perf_counter() - t0
+
+        # bcast -- the collective matching ``StorageVolume.bcast_tensor``
+        # on the storage side.  Every TP worker joins this call; HCCL
+        # builds its tree/ring once and fans out the tensor.
+        t0 = time.perf_counter()
+        try:
+            dist.broadcast(flat, src=src_rank, group=self._bcast_pg)
+            torch.npu.synchronize()
+        except Exception as e:
+            logger.exception("recv_and_load_flat: broadcast failed")
+            return {
+                "success": False,
+                "message": f"recv_and_load_flat: dist.broadcast raised: {e}",
+                "bytes": 0,
+                "num_keys": 0,
+            }
+        timing["bcast_s"] = time.perf_counter() - t0
+
+        # Unpack + load.  Same three-way dispatch as pull_weights_flat,
+        # but with an extra TP-shape guard: when TP>1, a param that
+        # exists under the same HF name in ``name_to_param`` may still
+        # be TP-sliced (shape differs from the plan's full-tensor
+        # shape) -- direct copy_ would blow up with
+        # "The size of tensor self [shard] must match the size of
+        # tensor src [full]".  In that case we defer to vLLM's
+        # ``load_weights``, which knows how to slice the full tensor
+        # into this rank's TP shard.
+        t0 = time.perf_counter()
+        direct_count = 0
+        fused_pairs: list[tuple[str, torch.Tensor]] = []
+        for name, shape, dtype_str, offset, nbytes in plan:
+            td = torch_dtype_from_str(dtype_str)
+            view = flat[offset : offset + nbytes].view(td).view(tuple(shape))
+            target = name_to_param.get(name)
+            if target is not None and tuple(target.shape) == tuple(shape):
+                target.data.copy_(view)
+                direct_count += 1
+            else:
+                fused_pairs.append((name, view))
+        torch.npu.synchronize()
+        timing["unpack_s"] = time.perf_counter() - t0
+
+        if fused_pairs:
+            t0 = time.perf_counter()
+            model.load_weights(fused_pairs)
+            timing["fused_load_s"] = time.perf_counter() - t0
+
+        # Retain flat buffer until next pull (see pull_weights_flat docs).
+        self._pulled_flat = flat
+
+        fused_count = len(fused_pairs)
+        workers_load_s = time.perf_counter() - overall_t0
+        gbps = total_bytes / workers_load_s / (1024**3) if workers_load_s > 0 else 0.0
+        logger.info(
+            f"[WorkerWrapper] recv_and_load_flat v{version}: "
+            f"{direct_count} direct + {fused_count} fused, "
+            f"{total_bytes / 1024**3:.2f} GB, {workers_load_s:.2f}s "
+            f"({gbps:.2f} GB/s)  "
+            f"[alloc={timing['alloc_s']:.2f}s, "
+            f"bcast={timing['bcast_s']:.2f}s, "
+            f"unpack={timing['unpack_s']:.2f}s, "
+            f"fused_load={timing['fused_load_s']:.2f}s]"
+        )
+        return {
+            "success": True,
+            "message": f"bcast direct={direct_count} fused={fused_count}",
+            "bytes": total_bytes,
+            "num_keys": direct_count + fused_count,
+            "workers_load_s": workers_load_s,
+            "direct_count": direct_count,
+            "fused_count": fused_count,
+            **{f"{k}": v for k, v in timing.items()},
+        }
+
+    @endpoint
+    def shutdown_bcast_group(self) -> dict:
+        import torch.distributed as dist
+
+        if getattr(self, "_bcast_pg", None) is None:
+            return {"ok": True, "was_initialized": False}
+        # Custom PG: destroy via the handle.  Not using the default-PG
+        # ``destroy_process_group()`` because vLLM still needs its
+        # default PG for TP all-reduce.
+        try:
+            dist.destroy_process_group(self._bcast_pg)
+        except Exception:
+            # Best-effort: at shutdown time the remote side may already
+            # be gone.  Swallow and unset so subsequent init can run.
+            pass
+        self._bcast_pg = None
+        return {"ok": True, "was_initialized": True}
 
     @endpoint
     def destroy_process_group(self) -> None:
