@@ -212,11 +212,15 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
         traceback.print_exc()
         return None
 
+    # Layout comes from ``forge_cfg`` (filled by the config bridge from
+    # ``allocation_mode``).  Env-var overrides are still honored for
+    # ad-hoc experiments, but should not be needed in steady state --
+    # flipping ``allocation_mode`` in YAML is now the canonical knob.
     layout = ParallelLayout(
         train_world=forge_cfg.train_world_size,
         gen_world=forge_cfg.gen_world_size,
-        gen_tp=int(os.environ.get("FORGE_GEN_TP", "1")),
-        gen_pp=int(os.environ.get("FORGE_GEN_PP", "1")),
+        gen_tp=int(os.environ.get("FORGE_GEN_TP") or forge_cfg.gen_tp_size or 1),
+        gen_pp=int(os.environ.get("FORGE_GEN_PP") or forge_cfg.gen_pp_size or 1),
         ps_world=int(os.environ.get("FORGE_PS_WORLD", "0")),
         trainer_mesh_name="trainer",
         generator_mesh_name="generator",

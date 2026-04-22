@@ -507,6 +507,67 @@ dependency order:
 - **`HoldingActorMesh`.** Thin in-house holder if torchstore's abstraction tax starts to
   bite for more use cases than weight sync (e.g. MoE expert rotation).
 
+### 7.4 Generator TP>1: pull-side rank-0 + TP-broadcast refactor
+
+**Symptom.** With `allocation_mode: vllm:d1p1t4+d4p1t1` (one vLLM engine, TP=4) the
+`Generator.options` refactor correctly hands 4 NPUs to the driver proc, the vLLM
+executor spawns the 4 `vllm_workers` procs, HCCL heartbeat builds the TP group — and
+then `pull_flat(v1)` fails on the very first weight sync with
+`hixl_connect(192.168.0.23:36087) failed: ret=103901` (CreateChannel). Trainer-side
+`push_flat` is still happy.
+
+**Root cause.** The current pull path calls `ts.get` **inside every
+`WorkerWrapper.pull_weights_flat`**. At TP=1 that's 1 client × 4 storage vols = 4 HiXL
+channels, which is the steady-state layout the code has always been tested at. At TP=4
+it's 4 × 4 = **16 concurrent HiXL client channels**, and HiXL's per-proc client
+resources (channel slots / memory-region registrations) blow up with
+`CreateChannel ret=103901`. This isn't a HiXL bug in the "infra limit" sense — it's a
+correctness gap in forge: push-side has a `FORGE_SHARD_PUBLISH=1` switch that
+deliberately spreads 4 NICs, but pull-side has **no symmetric knob** to *not* have every
+TP worker independently pull.
+
+**What other frameworks do.** torchforge / veRL / OpenRLHF all follow the same pattern:
+**only TP-rank-0 calls `ts.get`**, then `torch.distributed.broadcast` inside the TP
+process group distributes the weights to rank 1..N-1 over HCCS (intra-host HCCS is not
+an NIC, so this path stays cheap even at TP=8). This means the storage side sees exactly
+the same channel count regardless of TP degree, which is the right invariant.
+
+**Fix outline** (not landed yet; tracked as the next piece of work after the
+`allocation_mode`-driven topology refactor):
+
+```python
+# WorkerWrapper.pull_weights_flat (post-refactor sketch)
+tp_rank = self.parallel_config.tensor_parallel_rank
+tp_group = self.parallel_config.tp_group
+
+flat = _alloc_aligned_flat(total_bytes, device)
+
+if tp_rank == 0:
+    # Only rank 0 talks to torchstore.  Reuses the existing
+    # shard-ranges / flat_key plumbing so the storage side doesn't
+    # care whether the caller is TP=1 or TP=4.
+    await _do_ts_get(flat, plan, shard_ranges, shard_key_fmt)
+
+# All TP ranks participate; intra-host HCCS, no NIC.
+torch.distributed.broadcast(flat, src=0, group=tp_group)
+
+_load_weights_from_flat_view(model, flat, plan)
+```
+
+**Why this matters beyond "fix 103901".** Without the rank-0+broadcast refactor, forge
+forces the user to pin `generator.tp_size=1` for correctness — which means there is no
+way to inference-shard a 72B+ model across multiple NPUs inside one replica. Once the
+refactor lands, flipping `allocation_mode` between `d1p1t1`, `d1p1t4`, `d2p1t4`,
+`d4p1t1` etc. becomes a pure policy choice with no code changes, which is the whole
+point of the `allocation_mode`-DSL-driven topology. Until then, the "topology is fully
+driven by YAML" claim in §0/§2 has an asterisk that reads "for TP=1 on the generator
+side".
+
+**Workaround for now.** Keep `allocation_mode.gen` at TP=1 (`d{N}p1t1` for any N) — at
+which point the generator is just N independent vLLM replicas each with its own
+single-NPU NIC path, and the 103901 does not reproduce. TP=1 is what every smoke in this
+doc runs.
+
 ## 8. Commit trail
 
 Forward reading order, with the one-liner for each:
