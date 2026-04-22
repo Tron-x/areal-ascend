@@ -256,6 +256,26 @@ class TrainerActor(ForgeActor):
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
+        # Shard-parallel publish precondition: every trainer proc's
+        # torchstore staging pool must live on *its own* NPU rather
+        # than the module-default ``npu:0`` every proc inherits from
+        # the parent env via ``TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE``.
+        # Otherwise every rank's ``ts.put`` ends up (a) staging through
+        # NPU 0 memory only and (b) the HCCL comm's rankTable carries
+        # ``device_id:0`` for every rank's local endpoint, so all
+        # trainer-to-storage HiXL connections collide on NPU 0's NIC.
+        # Probe evidence: every trainer proc sees
+        # ``ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`` and reports
+        # ``torch.npu.current_device() == rank``, so switching the pool
+        # device to match the proc's current NPU is both safe and
+        # sufficient.
+        #
+        # Only applies to the shard-parallel path -- the rank-0-only
+        # path already ties everything to NPU 0 intentionally, and
+        # that's the 13 GB/s number we ship with.
+        if os.environ.get("FORGE_SHARD_PUBLISH", "0") == "1" and world_size > 1:
+            os.environ["TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE"] = f"npu:{rank}"
+
         meta = build_meta_from_state_dict(state_dict)
         plan, total_bytes = plan_layout(meta)
 
