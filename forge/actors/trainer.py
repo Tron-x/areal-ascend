@@ -288,13 +288,29 @@ class TrainerActor(ForgeActor):
         #     -- their bootstrap already sets
         #     ``MONARCH_NPU_DEVICE=0`` which is correct under
         #     masking.
-        if os.environ.get("FORGE_SHARD_PUBLISH", "0") == "1" and world_size > 1:
+        # Run the shard-path env patch only ONCE per trainer proc: the
+        # first time a rank hits this, we need to rewrite torchstore's
+        # module-level ``_STORAGE_DEVICE`` (it's a module constant
+        # cached at import time, not re-read from env) and wipe the
+        # pool singleton so the lazy re-init picks the right NPU.  On
+        # every subsequent step the pool is already on NPU `rank` and
+        # we MUST NOT null it again, otherwise every ``ts.put`` would
+        # tear down the old pool + RDMABuffer registrations that the
+        # previous step's handshake is still depending on, and the
+        # next step's ``handle_put_request`` on the storage side
+        # fails with ``hixl_transfer_read ret=503900``.
+        if (
+            os.environ.get("FORGE_SHARD_PUBLISH", "0") == "1"
+            and world_size > 1
+            and not getattr(self, "_shard_env_set", False)
+        ):
             import torchstore.transport.monarch_rdma as _mrdma
 
             _mrdma._STORAGE_DEVICE = f"npu:{rank}"
             _mrdma._GLOBAL_POOL = None
             os.environ["TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE"] = f"npu:{rank}"
             os.environ["MONARCH_NPU_DEVICE"] = str(rank)
+            self._shard_env_set = True
 
         meta = build_meta_from_state_dict(state_dict)
         plan, total_bytes = plan_layout(meta)
@@ -350,8 +366,12 @@ class TrainerActor(ForgeActor):
                 end = (idx + 1) * base if idx < world_size - 1 else total_bytes
                 return start, end
 
-            shard_ranges_full = [_shard_range(i) for i in range(world_size)]
-            shard_start, shard_end = shard_ranges_full[rank]
+            # 3-tuple form ``(rank, start, end)`` so the generator /
+            # worker code can unpack uniformly whether the list was
+            # built from rank-0's full view or reconstructed from
+            # non-rank-0 payloads in the backend.
+            shard_ranges_full = [(i, *_shard_range(i)) for i in range(world_size)]
+            _, shard_start, shard_end = shard_ranges_full[rank]
             put_key = f"{key}.shard_{rank}"
             put_tensor = flat[shard_start:shard_end]
         else:

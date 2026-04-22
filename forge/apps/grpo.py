@@ -93,9 +93,19 @@ async def _spawn_storage_mesh(
             (volume ``i`` lands on NPU ``npu_base + i``).  The trainer's
             own NPUs must not overlap this range.
     """
-    from forge.engines.weight_sync.backends.torchstore_multi_vol import (
-        _storage_bootstrap_factory,
-    )
+    # Bootstrap migration note (see forge/docs/weight_sync.md §7.1 Bug B):
+    # the legacy ``_storage_bootstrap_factory`` closure used to be handed
+    # to ``spawn_procs(bootstrap=...)`` so every storage proc could set
+    # ``ASCEND_RT_VISIBLE_DEVICES`` + HiXL/HCCL env vars before any
+    # ``import torch_npu`` happened.  Our Monarch build silently skips
+    # that callback (observed 2026-04-22 via marker-file instrumentation:
+    # no marker files produced on either host), so every storage vol
+    # ended up running without the mask and all 4 HiXL engines converged
+    # on the same physical NPU.  We now mirror torchforge's workaround:
+    # spawn procs with no bootstrap, then spawn a small ``StorageEnvSetter``
+    # actor on the mesh and call its ``setup`` endpoint, which fires in
+    # each proc before torchstore imports.
+    from forge.engines.weight_sync._env_setter import StorageEnvSetter
     from forge.provisioner import _get_provisioner
 
     provisioner = await _get_provisioner()
@@ -103,11 +113,26 @@ async def _spawn_storage_mesh(
     storage_mesh = storage_hosts.spawn_procs(
         per_host={"procs": num_vols},
         name="torchstore_storage_multi_vol",
-        bootstrap=_storage_bootstrap_factory(npu_base),
     )
+
+    setter = storage_mesh.spawn("_storage_env_setter", StorageEnvSetter)
+    # pool_mb reads the env that run_multinode.sh / YAML forwards.
+    pool_mb = int(os.environ.get("TORCHSTORE_MONARCH_RDMA_POOL_MB", "8192"))
+    setup_mesh = await setter.setup.call(npu_base=npu_base, pool_mb=pool_mb)
+
+    # Collect the per-rank confirmation so we can print a single
+    # driver-visible line that proves the env actually landed (as
+    # opposed to the old "spawn worked but bootstrap silently skipped"
+    # situation where we only had the caller-side print of intent).
+    per_rank_info = []
+    for _ref, payload in setup_mesh.items():
+        if isinstance(payload, dict):
+            per_rank_info.append(payload)
+    per_rank_info.sort(key=lambda d: d.get("local_rank", -1))
     print(
         f"[WeightSync] spawned {num_vols} storage volumes on host mesh "
-        f"{host_mesh_name!r} (NPU range {npu_base}..{npu_base + num_vols - 1})",
+        f"{host_mesh_name!r} (NPU range {npu_base}..{npu_base + num_vols - 1}); "
+        f"env setup confirmed: {per_rank_info}",
         flush=True,
     )
     return storage_mesh
