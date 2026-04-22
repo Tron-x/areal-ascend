@@ -256,43 +256,45 @@ class TrainerActor(ForgeActor):
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        # Shard-parallel publish precondition (necessary but NOT
-        # sufficient): pin every trainer proc's torchstore staging
-        # pool to its own NPU rather than the default ``npu:0``.
-        # Without this, every rank would stage through NPU 0, double-
-        # booking one pool on one NPU -- a separate correctness bug on
-        # top of the HiXL rankTable one below.
+        # Shard-parallel publish preconditions.  Two independent env
+        # knobs per trainer rank must both be right; missing either
+        # one triggers the "errNo 0x0000000005000007" HCCL init
+        # collision documented in forge/docs/weight_sync.md §7.1.
         #
-        # Why the monkey-patch instead of the env var: torchstore
-        # caches ``_STORAGE_DEVICE`` at module import time
-        # (``_STORAGE_DEVICE = os.environ.get(...)``), and the module
-        # has already been imported by TrainerActor init long before
-        # this endpoint runs.  Rewriting the env var at runtime is a
-        # no-op; rewriting the module constant works.  We also null
-        # ``_GLOBAL_POOL`` so the next ``_get_pool()`` re-inits on the
-        # right device (the pool singleton is otherwise frozen after
-        # first use).
+        # (1) ``TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE``: torchstore
+        #     caches this at module import time into
+        #     ``monarch_rdma._STORAGE_DEVICE``, so rewriting the env
+        #     var here is a no-op.  Monkey-patch the module constant
+        #     instead + null ``_GLOBAL_POOL`` so the pool singleton
+        #     re-inits on our per-rank NPU.  Without this every
+        #     trainer rank's torchstore staging pool lives on NPU 0.
         #
-        # This fix is correct but BLOCKED at a deeper layer: when we
-        # tried ``FORGE_SHARD_PUBLISH=1`` on 2026-04-22 with this
-        # monkey-patch in place, HCCL still failed multi-client init
-        # with ``errNo 0x05000007`` and the rankTable string still
-        # showed ``device_id:0, device_ip:NPU-0-ip`` for every
-        # trainer rank's local endpoint.  So the HCCL rankTable's
-        # local-NPU field is NOT derived from the torchstore pool's
-        # NPU -- it comes from somewhere in the HiXL C++ stack
-        # (hardcoded or from a different module constant we haven't
-        # tracked down).  Waiting on the HiXL team's end-of-month
-        # switch to ``HcclCommInitRootInfo`` (no rankTable) to
-        # actually unblock.  See forge/docs/weight_sync.md §7.1.
+        # (2) ``MONARCH_NPU_DEVICE``: read by
+        #     ``monarch_rdma::backend::hixl::manager_actor::resolve_device_id``
+        #     (Rust, in this proc) when the ``HixlManagerActor`` is
+        #     first spawned (lazily on the first ``RDMABuffer(...)``
+        #     call inside ``ts.put``).  If unset it falls back to 0
+        #     for every proc, which makes HiXL's rankTable generator
+        #     ask ``aclrtGetPhyDevIdByLogicDevId(0, ...)`` and write
+        #     ``device_id:0, device_ip:NPU-0-ip`` for every trainer
+        #     rank's local endpoint -- four ranks then try to open
+        #     four HiXL comms all advertising (NPU 0 -> NPU 4) and
+        #     collide.  Setting it to our rank here, before
+        #     ``ts.put`` triggers the lazy init, makes
+        #     ``resolve_device_id`` pick up the correct logical
+        #     device for this proc (trainer procs are NOT
+        #     ``ASCEND_RT_VISIBLE_DEVICES``-masked, so logical id
+        #     equals rank).  Storage volume procs do not need this
+        #     -- their bootstrap already sets
+        #     ``MONARCH_NPU_DEVICE=0`` which is correct under
+        #     masking.
         if os.environ.get("FORGE_SHARD_PUBLISH", "0") == "1" and world_size > 1:
             import torchstore.transport.monarch_rdma as _mrdma
 
             _mrdma._STORAGE_DEVICE = f"npu:{rank}"
             _mrdma._GLOBAL_POOL = None
-            # Also set the env for symmetry with any downstream code
-            # that still reads ``os.environ`` directly.
             os.environ["TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE"] = f"npu:{rank}"
+            os.environ["MONARCH_NPU_DEVICE"] = str(rank)
 
         meta = build_meta_from_state_dict(state_dict)
         plan, total_bytes = plan_layout(meta)

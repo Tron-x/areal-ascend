@@ -335,30 +335,72 @@ matching physical device ids. HCCL itself has a second init path
 works. The HiXL team is scheduled to switch HiXL's internal comm init to root-info by
 **end of the month**.
 
-**2026-04-22 validation — does fix (a) alone unlock shard publish?** No.
+**2026-04-22 iterative drill-down** — the original 2-fix plan turned out to split into
+**three** sub-bugs. We've fixed two, one remains.
 
-With fix (a)'s monkey-patch in place and `FORGE_SHARD_PUBLISH=1`, every trainer rank's
-rankTable string still reads identically:
+### Bug A' — trainer-side rankTable local device_id (FIXED)
+
+Found the actual code path by reading HiXL + monarch source: `HixlManagerActor::new` ->
+`monarch_rdma::backend::hixl::manager_actor::resolve_device_id(hint)`, which returns
+`hint` if non-negative and otherwise reads env `MONARCH_NPU_DEVICE` (default 0). Storage
+bootstrap sets `MONARCH_NPU_DEVICE=0` per-proc (correct under ASCEND_RT_VISIBLE_DEVICES
+masking), but **trainer procs never set it**. Every trainer rank's HiXL init went
+through with logical device 0, and `aclrtGetPhyDevIdByLogicDevId(0, ...)` returned NPU 0
+regardless of which trainer rank was running — hence the "every trainer rank's rankTable
+local endpoint is NPU 0" symptom.
+
+Fix landed in `TrainerActor.publish_weights_flat` (shard-publish branch): set
+`os.environ["MONARCH_NPU_DEVICE"] = str(rank)` before the first `ts.put` (i.e. before
+`HixlManagerActor::init` fires). Trainer procs are not
+`ASCEND_RT_VISIBLE_DEVICES`-masked, so logical device id equals the trainer rank. The
+staging-pool monkey-patch (`_STORAGE_DEVICE = f"npu:{rank}"`) also still required.
+
+Verified with `FORGE_SHARD_PUBLISH=1` smoke 2026-04-22: rankTable local endpoint now
+correctly carries NPU 0/1/2/3 and matching `device_ip`s:
 
 ```
-{"device":[
-  {"device_id":"0","device_ip":"29.191.188.114","rank_id":"0"},   # local = NPU 0 always
-  {"device_id":"4","device_ip":"29.191.56.199","rank_id":"1"}      # peer  = NPU 4 always
-]}
+rank 0 local: {"device_id":"0", "device_ip":"29.191.188.114", "deviceLogicId":0}
+rank 1 local: {"device_id":"1", "device_ip":"29.191.181.122", "deviceLogicId":1}
+rank 2 local: {"device_id":"2", "device_ip":"29.191.84.209",  "deviceLogicId":2}
+rank 3 local: {"device_id":"3", "device_ip":"29.191.87.140",  "deviceLogicId":3}
 ```
 
-Four trainer ranks produce four copies of this same rankTable and fail HCCL init with
-`errNo 0x0000000005000007`. This confirms **the rankTable's `device_id` field is NOT
-derived from the torchstore staging pool** — it comes from somewhere deeper in the HiXL
-C++ stack (a hardcoded default, or a different module constant we haven't tracked down).
-So fix (a) is a correctness improvement for the staging pool but doesn't move the needle
-on HCCL multi-client init. **Fix (b) is required.**
+### Bug B — peer (storage) device info still collapses to vol 0
 
-**What we can smoke today** (with fix (a) only, fix (b) pending):
+Even with Bug A' fixed, every trainer rank's rankTable **peer half** still reads
+identically to vol 0:
 
-- Rank-0-only path: unchanged, 0.4 s / 13 GB/s steady state.
-- Shard-parallel path (`FORGE_SHARD_PUBLISH=1`): still fails with the same
-  `errNo 0x05000007` — confirmed 2026-04-22, not a regression.
+```
+{"device_id":"4", "device_ip":"29.191.56.199", "rank_id":"1"}   ← NPU 4 = vol 0, for all 4 trainer rank's comms
+```
+
+`LocalRankStrategy.get_client_id` returns the trainer's `RANK`/`LOCAL_RANK` as string,
+`get_volume_id` is `str(current_rank().rank)` at storage spawn, so routing *ought to*
+dispatch trainer rank `i` to vol `i`. But something below torchstore's strategy layer —
+likely in `MonarchRDMATransportBuffer._pre_put_hook`'s handshake with the storage
+volume, or in the monarch rdma Rust binding's peer-endpoint resolution — overrides that.
+All four trainer comms end up advertising peer = vol 0 (NPU 4), so they collide on a
+single HiXL endpoint and 3 out of 4 fail HCCL init with the same
+`errNo 0x0000000005000007`.
+
+Still under investigation. Likely next steps:
+
+- Instrument `MonarchRDMATransportBuffer._pre_put_hook` to log
+  `self.storage_volume_ref.volume.actor_id()` per ts.put and verify it actually resolves
+  to different volumes per trainer rank.
+- If yes, the bug is in how peer device info is carried across the handshake (Rust
+  binding side).
+- If no, LocalRankStrategy is not being honored by our call path and the routing needs
+  fixing at the torchstore-python level.
+
+### Bug C — HiXL rankTable dependency itself
+
+Originally framed as "the fix". Now, with Bug A' fixed and the HiXL C++ inspected, we
+know the rankTable mechanism **works correctly** for non-colliding (local_device,
+peer_device) pairs — it just requires the caller to supply accurate device_ids on both
+ends. Bug B is the remaining caller-side work; the HiXL end-of-month rankTable removal
+is still welcome (simpler semantics, no caller-side device bookkeeping) but is no longer
+on the critical path for enabling shard publish.
 
 **Smoke plan when fix (b) lands**:
 
