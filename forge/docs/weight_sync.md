@@ -365,33 +365,65 @@ rank 2 local: {"device_id":"2", "device_ip":"29.191.84.209",  "deviceLogicId":2}
 rank 3 local: {"device_id":"3", "device_ip":"29.191.87.140",  "deviceLogicId":3}
 ```
 
-### Bug B — peer (storage) device info still collapses to vol 0
+### Bug B — storage-side bootstrap is silently skipped; all vols collapse to NPU 4
 
-Even with Bug A' fixed, every trainer rank's rankTable **peer half** still reads
-identically to vol 0:
+Even with Bug A' fixed, every trainer rank's rankTable **peer half** reads identically
+to NPU 4:
 
 ```
-{"device_id":"4", "device_ip":"29.191.56.199", "rank_id":"1"}   ← NPU 4 = vol 0, for all 4 trainer rank's comms
+{"device_id":"4", "device_ip":"29.191.56.199", "rank_id":"1"}
 ```
 
-`LocalRankStrategy.get_client_id` returns the trainer's `RANK`/`LOCAL_RANK` as string,
-`get_volume_id` is `str(current_rank().rank)` at storage spawn, so routing *ought to*
-dispatch trainer rank `i` to vol `i`. But something below torchstore's strategy layer —
-likely in `MonarchRDMATransportBuffer._pre_put_hook`'s handshake with the storage
-volume, or in the monarch rdma Rust binding's peer-endpoint resolution — overrides that.
-All four trainer comms end up advertising peer = vol 0 (NPU 4), so they collide on a
-single HiXL endpoint and 3 out of 4 fail HCCL init with the same
-`errNo 0x0000000005000007`.
+**LocalRankStrategy ruled out.** Instrumented `torchstore.client.put_batch` 2026-04-22
+and confirmed routing is per-rank-correct:
 
-Still under investigation. Likely next steps:
+```
+[torchstore-dbg] client RANK='0' -> volume_id='0'
+[torchstore-dbg] client RANK='1' -> volume_id='1'
+[torchstore-dbg] client RANK='2' -> volume_id='2'
+[torchstore-dbg] client RANK='3' -> volume_id='3'
+```
 
-- Instrument `MonarchRDMATransportBuffer._pre_put_hook` to log
-  `self.storage_volume_ref.volume.actor_id()` per ts.put and verify it actually resolves
-  to different volumes per trainer rank.
-- If yes, the bug is in how peer device info is carried across the handshake (Rust
-  binding side).
-- If no, LocalRankStrategy is not being honored by our call path and the routing needs
-  fixing at the torchstore-python level.
+Four trainer ranks each send their `ts.put` to a distinct storage volume. The collapse
+happens *below* torchstore's strategy.
+
+**Smoking gun — `_storage_bootstrap_factory` doesn't actually run**. We added
+marker-file writes inside the bootstrap closure and re-ran the smoke; **no marker files
+appeared** on either host, for any of the 4 storage vol procs. The driver side still
+prints `[WeightSync] spawned 4 storage volumes on host mesh 'storage' (NPU range 4..7)`
+so the spawn succeeded, but the per-proc bootstrap callback that was supposed to
+
+- set `ASCEND_RT_VISIBLE_DEVICES=npu_base+local_rank` per-proc,
+- set `MONARCH_NPU_DEVICE=0` per-proc,
+- call `torch.npu.set_device(0)`,
+
+never fires. With none of this happening on the storage side, all 4 storage vol procs
+inherit the parent env, `resolve_device_id` falls back to 0 for every vol,
+`hixl_init_engine(dev=0, ...)` runs in each, and the ACL proc-default device settles on
+the same NPU across all four. Result: every vol advertises the same physical NPU in its
+HiXL engine handshake, and every trainer rank's rankTable peer side reads the same.
+
+**Why bootstrap is silently skipped**: Monarch's `ProcMesh.spawn_procs(bootstrap=...)`
+path has known stability issues. torchforge works around it by using an `EnvSetter`
+actor instead (see `torchforge/src/forge/controller/provisioner.py::EnvSetter`,
+docstring: "This replaces the old bootstrap approach to avoid Monarch's SetupActor mesh
+failures on shutdown. ... we will move back to bootstrap once it's fixed"). Our
+`_storage_bootstrap_factory` sits on the same bootstrap path, so on our monarch build
+the closure is effectively dead code.
+
+**Fix direction**: migrate storage spawn from `bootstrap=...` to the `EnvSetter`-style
+pattern (same as torchforge GPU path):
+
+1. Spawn storage procs with no bootstrap.
+1. Spawn a tiny setter actor (`EnvSetter`) on the storage ProcMesh.
+1. Call its `set_env(env_vars)` endpoint; each proc writes `ASCEND_RT_VISIBLE_DEVICES` /
+   `MONARCH_NPU_DEVICE` / etc. into its own env.
+1. *Then* proceed with `ts.initialize`.
+
+~40 LOC in `grpo.py::_spawn_storage_mesh` + `torchstore_multi_vol.py`. Independent of
+the HiXL end-of-month rankTable removal. Once it lands, together with the Bug A' fix
+already deployed on the trainer side, the `FORGE_SHARD_PUBLISH=1` path should actually
+run end-to-end on our setup.
 
 ### Bug C — HiXL rankTable dependency itself
 
