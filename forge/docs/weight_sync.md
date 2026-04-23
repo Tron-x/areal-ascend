@@ -22,9 +22,22 @@ Two physical transports are in play:
 
 - **HiXL HCCS** — Huawei on-host 2 MiB-aligned NPU DMA (same-host npu→npu).
 - **HiXL RoCE** — 200 Gb/s per-NPU RDMA over Ethernet (cross-host).
+- **HCCL over RoCE** — collective comm (broadcast / allreduce / ...) via
+  `torch.distributed` (added 2026-04-22 for the collective-broadcast pull backend,
+  §7.4). Uses the same RoCE NICs as HiXL but with HCCL's own transport and rankTable
+  semantics.
 
 Everything else — torchstore, Monarch, the WeightSyncService, the launcher — is
-orchestration around these two primitives.
+orchestration around these three primitives.
+
+**Backend options today** (`FORGE_WEIGHT_SYNC_BACKEND=...`):
+
+- `torchstore_multi_vol` (default) — every inference TP worker independently does
+  `ts.get` against N storage vols. Works great at TP=1; scales connection count as
+  `TP × num_vols` and breaks at TP>1 with HiXL `CreateChannel 103901` (see §7.4).
+- `collective_broadcast` — opt-in for TP>1. Trainer's HiXL put is unchanged, but pull
+  goes through a `1 + TP` HCCL broadcast sourced from storage vol 0 and fanned out to
+  every TP worker. See §7.4 for the full design, debug trail, and measured numbers.
 
 ## 2. Layered architecture
 
@@ -507,66 +520,193 @@ dependency order:
 - **`HoldingActorMesh`.** Thin in-house holder if torchstore's abstraction tax starts to
   bite for more use cases than weight sync (e.g. MoE expert rotation).
 
-### 7.4 Generator TP>1: pull-side rank-0 + TP-broadcast refactor
+### 7.4 Generator TP>1: CollectiveBroadcastBackend (landed)
 
-**Symptom.** With `allocation_mode: vllm:d1p1t4+d4p1t1` (one vLLM engine, TP=4) the
-`Generator.options` refactor correctly hands 4 NPUs to the driver proc, the vLLM
-executor spawns the 4 `vllm_workers` procs, HCCL heartbeat builds the TP group — and
-then `pull_flat(v1)` fails on the very first weight sync with
-`hixl_connect(192.168.0.23:36087) failed: ret=103901` (CreateChannel). Trainer-side
-`push_flat` is still happy.
+**Status**: **SOLVED 2026-04-22**. Landed as
+`forge/engines/weight_sync/backends/collective_broadcast.py` +
+`torchstore/storage_volume.py` bcast endpoints. Flip
+`FORGE_WEIGHT_SYNC_BACKEND=collective_broadcast` to use it.
 
-**Root cause.** The current pull path calls `ts.get` **inside every
-`WorkerWrapper.pull_weights_flat`**. At TP=1 that's 1 client × 4 storage vols = 4 HiXL
-channels, which is the steady-state layout the code has always been tested at. At TP=4
-it's 4 × 4 = **16 concurrent HiXL client channels**, and HiXL's per-proc client
-resources (channel slots / memory-region registrations) blow up with
-`CreateChannel ret=103901`. This isn't a HiXL bug in the "infra limit" sense — it's a
-correctness gap in forge: push-side has a `FORGE_SHARD_PUBLISH=1` switch that
-deliberately spreads 4 NICs, but pull-side has **no symmetric knob** to *not* have every
-TP worker independently pull.
+#### 7.4.1 What the bug was
 
-**What other frameworks do.** torchforge / veRL / OpenRLHF all follow the same pattern:
-**only TP-rank-0 calls `ts.get`**, then `torch.distributed.broadcast` inside the TP
-process group distributes the weights to rank 1..N-1 over HCCS (intra-host HCCS is not
-an NIC, so this path stays cheap even at TP=8). This means the storage side sees exactly
-the same channel count regardless of TP degree, which is the right invariant.
+With `allocation_mode: vllm:d1p1t4+d4p1t1` the `Generator.options` refactor correctly
+hands 4 NPUs to the driver proc, the vLLM executor spawns the 4 `vllm_workers`, HCCL
+builds the TP group — and then `pull_flat(v1)` fails on the first weight sync with
+`hixl_connect(...) failed: ret=103901 (CreateChannel)`.
 
-**Fix outline** (not landed yet; tracked as the next piece of work after the
-`allocation_mode`-driven topology refactor):
+Root cause: the original pull path calls `ts.get` **inside every
+`WorkerWrapper.pull_weights_flat`**. At TP=1 that's 1 client × N storage vols = N HiXL
+channels (fine). At TP=4 it's 4 × N = 16 concurrent HiXL client channels per step, which
+exhausts HiXL's per-proc client resources. Not a HiXL "infra limit" bug — a correctness
+gap in forge's pull-side scaling.
+
+#### 7.4.2 Design: storage-as-reflector
+
+Business decision tree we walked through before landing the code:
+
+1. **Stay with torchforge-style shared-mem staging?** No — our volumes are already
+   NPU-resident and we have RoCE RDMA to the peer host. torchforge's `SharedTensor` adds
+   a device→host→device double-copy we don't need.
+1. **AReaL-style direct trainer↔inference NCCL group?** No — forces a single process
+   group spanning two independent Monarch meshes, and loses torchstore's async / version
+   / fault-tolerance story.
+1. **Storage-as-reflector.** Keep trainer's existing HiXL `ts.put` into storage volumes
+   (device-resident buffer, no host hop). Replace per-worker `ts.get` with a single
+   `dist.broadcast` sourced from storage vol 0 and fanned out to every TP worker over
+   HCCL.
+
+Connection count becomes `1 + TP` (handled by HCCL QP aggregation) independent of TP
+degree. Storage continues to offer the async / version semantics torchstore always did —
+trainers push on their own schedule, storage holds the tensor, bcast reflects it out on
+demand.
+
+#### 7.4.3 Three MVPs that validated the transport story
+
+Before writing the backend, three standalone smoke scripts isolated the transport
+properties we needed:
+
+| MVP                                                | What it proved                                                        | Measured                                         |
+| -------------------------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------ |
+| `forge/scripts/test_cross_mesh_bcast.py`           | Cross-Monarch-mesh HCCL group rendezvous works                        | 10.2 GB/s (2-rank, 1.5 GB payload)               |
+| `forge/scripts/test_cross_mesh_bcast_1toN.py`      | 1-to-N HCCL bcast (1 src + TP=4 dst) fans out correctly               | per-link 8 GB/s, aggregate 32 GB/s               |
+| `forge/scripts/test_cross_mesh_bcast_with_hixl.py` | HiXL put and HCCL bcast coexist in the same storage proc concurrently | put 20 GB/s, bcast agg 32 GB/s (no interference) |
+
+Those three scripts remain the ground-truth harness for anyone poking at the collective
+path without the full GRPO machinery in the way.
+
+#### 7.4.4 Interface
+
+Added to torchstore (strictly additive, doesn't affect existing volumes that never call
+it):
 
 ```python
-# WorkerWrapper.pull_weights_flat (post-refactor sketch)
-tp_rank = self.parallel_config.tensor_parallel_rank
-tp_group = self.parallel_config.tp_group
+class StorageVolume:
+    @endpoint
+    async def init_bcast_group(master_addr, master_port, world_size,
+                               rank, backend="hccl",
+                               group_name="torchstore_bcast_reflector",
+                               timeout_s=180): ...
 
-flat = _alloc_aligned_flat(total_bytes, device)
+    @endpoint
+    async def bcast_tensor(key: str): ...
 
-if tp_rank == 0:
-    # Only rank 0 talks to torchstore.  Reuses the existing
-    # shard-ranges / flat_key plumbing so the storage side doesn't
-    # care whether the caller is TP=1 or TP=4.
-    await _do_ts_get(flat, plan, shard_ranges, shard_key_fmt)
-
-# All TP ranks participate; intra-host HCCS, no NIC.
-torch.distributed.broadcast(flat, src=0, group=tp_group)
-
-_load_weights_from_flat_view(model, flat, plan)
+    @endpoint
+    async def shutdown_bcast_group(): ...
 ```
 
-**Why this matters beyond "fix 103901".** Without the rank-0+broadcast refactor, forge
-forces the user to pin `generator.tp_size=1` for correctness — which means there is no
-way to inference-shard a 72B+ model across multiple NPUs inside one replica. Once the
-refactor lands, flipping `allocation_mode` between `d1p1t1`, `d1p1t4`, `d2p1t4`,
-`d4p1t1` etc. becomes a pure policy choice with no code changes, which is the whole
-point of the `allocation_mode`-DSL-driven topology. Until then, the "topology is fully
-driven by YAML" claim in §0/§2 has an asterisk that reads "for TP=1 on the generator
-side".
+Added to forge:
 
-**Workaround for now.** Keep `allocation_mode.gen` at TP=1 (`d{N}p1t1` for any N) — at
-which point the generator is just N independent vLLM replicas each with its own
-single-NPU NIC path, and the 103901 does not reproduce. TP=1 is what every smoke in this
-doc runs.
+```python
+class WorkerWrapper:
+    @endpoint
+    def init_bcast_group(master_addr, master_port, world_size, rank,
+                         backend="hccl",
+                         group_name="torchstore_bcast_reflector",
+                         timeout_s=180): ...
+
+    @endpoint
+    def recv_and_load_flat(version, plan, total_bytes, src_rank=0): ...
+
+    @endpoint
+    def shutdown_bcast_group(): ...
+
+class Generator:
+    @endpoint
+    async def get_worker_mesh(): ...  # exposes vllm_workers ActorMesh
+```
+
+#### 7.4.5 Control flow per weight-sync cycle
+
+```
+initialize  (once):
+  trainer side: unchanged (MultiVol-style HiXL put path)
+  backend:      spawn StorageVolumes, controller.init.call(...)
+  backend:      rendezvous storage_vol[0] + all TP workers into one
+                HCCL group world=1+TP; one probe all_reduce to eagerly
+                build the HCCL communicator
+
+push(v):    trainer_actor.publish_weights_flat(version=v, key=...)
+            -> rank 0 packs full state_dict into aligned flat
+            -> ts.put lands in storage vol 0 (HiXL)
+
+pull(v):    asyncio.gather(
+              storage_vol[0].bcast_tensor(key),           # HCCL bcast src
+              vllm_workers.recv_and_load_flat(plan, ...)  # fanout recv + load
+            )
+```
+
+#### 7.4.6 Debug trail (8 traps the diff captured)
+
+Listed here so the next person touching this doesn't have to rediscover them:
+
+1. **`ts.initialize` double-init.** After manually spawning StorageVolumes and calling
+   `controller.init`, re-running `ts.initialize` raises "TorchStore is already
+   initialized". `controller.init` alone is sufficient for `ts.put/ts.get` clients.
+1. **Monarch `Extent` API.** No `.items()`; use `list(extent)` for labels and
+   `extent[label]` for size.
+1. **Worker mesh is 2D.** vLLM TP workers live on `{hosts: 1, procs: tp}` not a
+   single-dim mesh; slice all non-`procs` dims to 0.
+1. **`StorageVolume.get_id()` tuple order.** Returns `(volume_id, hostname)`, not
+   `(hostname, volume_id)`. Read `vol_info[1]` for the hostname the HCCL TCPStore should
+   rendezvous on.
+1. **`LOCAL_RANK` doesn't reach workers as a device hint.** Every vLLM worker's
+   `torch.npu.current_device()` is 0 until an explicit
+   `torch.npu.set_device(LOCAL_RANK)` is called. Without this, all TP workers report
+   "(host, device 0)" to HCCL's topology ranktable and init fails with "rank num\[K\] !=
+   rank list size\[M\]".
+1. **`dist.get_rank(pg)` on torch_npu.** The wrapper hits a `_get_default_group()` check
+   even with a custom PG handle. Volumes always take rank 0 by contract here, so
+   hard-code `src=0` in the bcast call and in the return payload.
+1. **PrefixStore scoping.** `init_custom_process_group` installs a
+   `PrefixStore(group_name, store)`; the plain `dist.init_process_group` does not.
+   Storage side MUST use the same `init_custom_process_group` + matching `group_name` as
+   the worker side, otherwise storage rank 0 writes `hcclUniqueId` under a different
+   prefix than workers read from.
+1. **TP-shard vs full-tensor shape mismatch.** vLLM's TP=K rank holds params sliced to
+   `1/K` along the TP axis. Direct `param.data.copy_(full_view)` blows up with
+   "\[shard\] must match \[full\]". Gate direct-copy on
+   `tuple(target.shape) == tuple(shape)`; mismatched entries get passed to
+   `model.load_weights`, which knows how to slice.
+
+#### 7.4.7 Measured
+
+End-to-end 2026-04-22 with Qwen3-0.6B, `vllm:d1p1t4+d4p1t1`,
+`FORGE_WEIGHT_SYNC_BACKEND=collective_broadcast`, 3-step ping-pong:
+
+| step | Weight sync | notes                                  |
+| ---: | ----------: | -------------------------------------- |
+|    0 |       2.0 s | warmup (HCCL group build, first bcast) |
+|    1 |       0.5 s | steady                                 |
+|    2 |       0.4 s | steady                                 |
+
+No `103901`, no TP>1 stall, no pull-side connection explosion. TP=4 generator sustains
+the same steady-state sync budget as TP=1 did on the multi-vol backend.
+
+#### 7.4.8 MVP limitations and follow-ups
+
+Tracked for the next iteration (not shipped here):
+
+- **No shard publish.** `FORGE_SHARD_PUBLISH=1` is rejected when this backend is
+  selected — the bcast source needs the full flat in one place. Multi-vol bcast (one
+  HCCL group per storage vol, workers join all N groups and concatenate) is the natural
+  extension but adds `N`× group lifecycle and re-sharding complexity.
+- **Single bcast source.** Always vol 0 (configurable via `FORGE_BCAST_SRC_VOL_IDX`).
+  For very large models the single-NIC egress from vol 0 may become the bottleneck; see
+  shard publish point above.
+- **Inference side uses `load_weights` for TP-sliced params.** The direct-copy fast path
+  still applies to params that match the full shape (embedding tables on the TP axis,
+  norm weights, etc.). For TP-sliced params we pay a Python-level dispatch into vLLM's
+  `load_weights`. No evidence that this is a bottleneck at today's model sizes.
+- **Group persistence across versions.** Built once in `initialize` and reused. If a TP
+  worker crashes and respawns the group becomes stale; graceful teardown + re-init via
+  `shutdown_bcast_group` is implemented but not yet wired into the replica-supervisor
+  path.
+
+#### 7.4.9 Workaround still valid: keep TP=1
+
+If you don't need generator TP>1, the default `MultiVolTorchstoreBackend` stays the
+shipped path and keeps the measured 0.4 s / 32 GB/s (agg across N vols) numbers. This
+backend is an opt-in for TP>1 topologies.
 
 ## 8. Commit trail
 
@@ -582,9 +722,29 @@ b18c72ef perf(forge): flat-buffer fast path for weight sync (~35x total)
 28caa080 fix(forge): YAML host_idx flipped + surface silent weight-sync failures
 cdbed36a feat(forge): add dedicated-PS launcher variant + workers-order note
 1b767b66 feat(forge): scaffold shard-parallel publish behind FORGE_SHARD_PUBLISH
+3b7196a5 fix(forge): per-rank pool device + rewritten shard-publish diagnosis
+757a47b4 docs(forge): add rank taxonomy section to weight_sync.md
+42347917 chore(forge): confirm fix (a) alone doesn't unlock shard publish
+79e33b63 fix(forge): unlock trainer-side rankTable via MONARCH_NPU_DEVICE
+7c110415 docs(forge): identify Bug B root cause -- bootstrap silently skipped
+eca54172 feat(forge): unlock 4x NIC shard publish via EnvSetter actor
+514235c5 docs(forge): mark Bug B solved, Bug C no longer blocking
+d6c19ec3 refactor(forge): drive mesh topology entirely from allocation_mode
+a809c1a9 feat(forge): wire gen_tp/gen_pp fallback + document pull-side TP>1 gap
+c18756cb feat(forge): MVP Step 1 for storage-as-reflector -- cross-mesh HCCL bcast
+9e2fa38d feat(forge): MVP Step 2 for storage-as-reflector -- 1-to-N HCCL bcast
+70b6a862 feat(forge): MVP Step 3 for storage-as-reflector -- HiXL + HCCL bcast coexist
+e0752fd2 feat(forge): CollectiveBroadcastBackend -- TP>1 pull via storage-as-reflector
 ```
 
-The first three are the weight-sync performance ladder (14 s → 0.4 s). The next six are
-the topology-abstraction series (storage spawn out of backend → YAML driving →
-dedicated-PS variant → shard-parallel scaffolding). Read them in order to reconstruct
-the design history.
+Reading order (pairs with the section layout of this doc):
+
+1. **Performance ladder** (14 s → 0.4 s): `aef73317 → 1b53d107 → b18c72ef`.
+1. **Topology abstraction** (storage spawn out of backend → YAML driving → dedicated-PS
+   variant → shard-parallel scaffolding):
+   `031e326a → 2abe4313 → 317e5cc5 → 28caa080 → cdbed36a → 1b767b66`.
+1. **Shard-publish unlock** (§7.1 Bug A' + Bug B):
+   `3b7196a5 → 757a47b4 → 42347917 → 79e33b63 → 7c110415 → eca54172 → 514235c5`.
+1. **Allocation-mode-driven topology** (§7.2–7.3): `d6c19ec3 → a809c1a9`.
+1. **CollectiveBroadcastBackend** (§7.4, this latest arc): three MVP smokes
+   `c18756cb → 9e2fa38d → 70b6a862` then the backend itself `e0752fd2`.
