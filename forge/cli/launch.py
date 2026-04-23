@@ -251,6 +251,38 @@ def main(argv: list[str]) -> int:
         extra_argv = []
 
     parser = _build_parser()
+
+    # Catch a very common new-user mistake: putting a forge-launch flag
+    # (``--keep-workers`` / ``--skip-preflight`` / ``--hostfile`` / ...)
+    # AFTER the ``--`` separator.  Everything after ``--`` is forwarded
+    # to hydra as OmegaConf overrides, which means a leading ``--`` trips
+    # hydra's grammar lexer and the user sees a cryptic
+    # ``LexerNoViableAltException``.  Produce a concrete, actionable
+    # error instead.
+    launch_flag_names = {
+        act.option_strings[0] for act in parser._actions if act.option_strings
+    }
+    misplaced = [a for a in extra_argv if a.startswith("--") and a in launch_flag_names]
+    if misplaced:
+        print(
+            "=" * 64,
+            " forge launch: misplaced flag(s)",
+            "=" * 64,
+            sep="\n",
+            file=sys.stderr,
+        )
+        for a in misplaced:
+            print(
+                f"  ✗ {a!r} is a `forge launch` option, not a hydra\n"
+                f"    override.  Move it BEFORE the `--` separator.\n"
+                f"    Example:\n"
+                f"      python -m forge launch config.yaml {a} \\\n"
+                f"          --hostfile hostfile.txt \\\n"
+                f"          -- allocation_mode=vllm:d1p1t1+d4p1t1",
+                file=sys.stderr,
+            )
+        return 2
+
     args = parser.parse_args(launch_argv)
 
     config = Path(args.config).resolve()

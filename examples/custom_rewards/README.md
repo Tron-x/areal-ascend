@@ -19,9 +19,12 @@ def exact_match_reward(
     return 1.0 if str(answer).strip().lower() in str(completions).lower() else 0.0
 ```
 
-Signature convention matches existing rewards (`areal.reward.gsm8k.gsm8k_reward_fn` et
-al): positional `prompt, completions, prompt_ids, completion_ids, answer`, plus
-`**kwargs` to be forward-compatible with new dataset fields.
+The runtime always passes these five arguments: `prompt`, `completions`, `prompt_ids`,
+`completion_ids`, `answer` — plus any dataset-specific extras via `**kwargs`. **You only
+need to read the ones you actually use.** For example `gsm8k_reward_fn` looks at only
+`completions` and `answer`; the other three arguments are bound but never read. The
+signature shape (same names, `**kwargs` at the end) is what matters — use what you need,
+ignore the rest.
 
 ## Step 2: reference it in YAML
 
@@ -60,14 +63,28 @@ this. For most forge users, (a) is the recommended workflow.
 
 ## Verify
 
-```python
-from forge.reward import available_rewards
-print(available_rewards())
-# ['clevr_count_70k', 'exact_match', 'geometry3k', 'gsm8k']
+```bash
+python -m forge list-rewards
 ```
 
-If `exact_match` shows up, your function is reachable. Your next `forge launch` with
-`reward: exact_match` in YAML will use it.
+You should see your function in the output, grouped by the module it was defined in:
+
+```
+Found 4 registered reward(s):
+
+  areal.reward.gsm8k
+    • gsm8k        → gsm8k_reward_fn
+
+  forge.reward.exact_match
+    • exact_match  → exact_match_reward
+  ...
+```
+
+If it's missing, the module didn't get imported — revisit Step 3.
+
+(You can also call
+`from forge.reward import available_rewards; print(available_rewards())` from any Python
+REPL inside the conda env, but the CLI is faster.)
 
 ## Backward compatibility
 

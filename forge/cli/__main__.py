@@ -28,6 +28,11 @@ def main() -> int:
 
         return launch_main(sub_argv)
 
+    if sub == "list-rewards":
+        from forge.cli.list_rewards import main as list_rewards_main
+
+        return list_rewards_main(sub_argv)
+
     print(f"forge: unknown subcommand {sub!r}", file=sys.stderr)
     _print_usage()
     return 2
@@ -38,7 +43,8 @@ def _print_usage() -> None:
         "Usage: python -m forge <subcommand> [args...]\n"
         "\n"
         "Subcommands:\n"
-        "  launch <config.yaml> [options]     Multi-node GRPO launch\n"
+        "  launch <config.yaml> [options]  Multi-node GRPO launch\n"
+        "  list-rewards                    Show registered reward functions\n"
         "\n"
         "For subcommand options: python -m forge <subcommand> --help",
         file=sys.stderr,

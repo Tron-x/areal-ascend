@@ -96,19 +96,41 @@ def register_reward(name: str):
 def get_reward(name: str) -> Callable[..., Any]:
     """Lookup a registered reward by short name.
 
-    Raises ``ValueError`` with the list of available names when the
-    short name is unknown.  Callers should catch and translate if they
-    want a different error class.
+    Raises ``ValueError`` with the list of available names AND
+    placement hints when the short name is unknown.  The hints are
+    the single biggest UX issue the first walk-through caught: new
+    users write a function + decorator, put the file under
+    ``examples/custom_rewards/`` (because that's where the sample
+    lives), run training, and hit an opaque "unknown reward" error
+    because auto-discovery only scans ``forge.reward.*`` /
+    ``areal.reward.*``.  This error message tells them exactly what
+    to do.
     """
     ensure_loaded()
     if name not in _REGISTRY:
         available = sorted(_REGISTRY)
         raise ValueError(
-            f"unknown reward {name!r}, available: {available}. "
-            f"Register new ones with @register_reward(...) in a module "
-            f"under forge.reward.* / areal.reward.* (auto-imported at "
-            f"lookup time), or import the module explicitly before "
-            f"calling get_reward()."
+            f"unknown reward {name!r}\n"
+            f"\n"
+            f"Available rewards: {available}\n"
+            f"\n"
+            f"If you wrote `@register_reward({name!r})` but it's not\n"
+            f"listed above, the decorator's module wasn't imported.\n"
+            f"Pick ONE of:\n"
+            f"\n"
+            f"  (a) Auto-discovery (recommended).  Place the file at\n"
+            f"      one of:\n"
+            f"        forge/reward/<anything>.py\n"
+            f"        areal/reward/<anything>.py\n"
+            f"      Auto-discovery scans those two packages at lookup\n"
+            f"      time, so a plain file copy is enough.\n"
+            f"\n"
+            f"  (b) Explicit import from your launch entry script.\n"
+            f"      Add before you start training:\n"
+            f"        import my_reward_module  # noqa: F401\n"
+            f"\n"
+            f"See examples/custom_rewards/README.md for the full\n"
+            f"3-step extension guide."
         )
     return _REGISTRY[name]
 
