@@ -1,3 +1,5 @@
+from forge.reward import register_reward
+
 from areal.utils import logging
 
 from . import get_math_verify_worker
@@ -5,6 +7,7 @@ from . import get_math_verify_worker
 logger = logging.getLogger("GSM8KReward")
 
 
+@register_reward("gsm8k")
 def gsm8k_reward_fn(
     prompt, completions, prompt_ids, completion_ids, answer, **kwargs
 ) -> float:

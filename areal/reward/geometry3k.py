@@ -1,5 +1,7 @@
 import re
 
+from forge.reward import register_reward
+
 from areal.utils import logging
 
 from . import get_math_verify_worker
@@ -22,6 +24,7 @@ def extract_answer(pred_str, use_last_number=True):
     return ""
 
 
+@register_reward("geometry3k")
 def geometry3k_reward_fn(
     prompt, completions, prompt_ids, completion_ids, answer, **kwargs
 ) -> float:

@@ -1,5 +1,7 @@
 import re
 
+from forge.reward import register_reward
+
 
 def extract_answer(pred_str, data_name, use_last_number=True):
     match = re.findall(r"\[([0-9\.]+)\]", pred_str)
@@ -9,6 +11,7 @@ def extract_answer(pred_str, data_name, use_last_number=True):
     return ""
 
 
+@register_reward("clevr_count_70k")
 def clevr_count_70k_reward_fn(
     prompt, completions, prompt_ids, completion_ids, answer, **kwargs
 ):

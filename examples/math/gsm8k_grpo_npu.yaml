@@ -16,6 +16,17 @@ cluster:
 
 allocation_mode: vllm:d4p1t1+d4p1t1
 
+# Reward function short name (preferred, registered via
+# @register_reward("xxx") in forge.reward.* / areal.reward.*).
+# Empty string falls back to reward_fn_path below.
+# See examples/custom_rewards/README.md for the extension flow.
+reward: ""
+
+# Legacy dotted import path for the reward function.  Overridden by
+# ``reward`` above when both are set; kept for backward compat with
+# pre-registry YAMLs.
+reward_fn: "areal.reward.gsm8k.gsm8k_reward_fn"
+
 scheduler:
   type: null
 

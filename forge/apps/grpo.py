@@ -712,8 +712,32 @@ async def grpo_main(
     reward = await RewardActor.options(
         procs=1, with_gpus=use_rm_gpu, mesh_name="reward"
     ).as_actor()
-    if forge_cfg.reward_fn_path:
-        await reward.setup.call(forge_cfg.reward_fn_path)
+    # Resolve rule-based reward: short name takes precedence over
+    # the legacy dotted import path.  When ``reward: xxx`` is set in
+    # YAML, look it up in the forge.reward registry and convert to a
+    # dotted path (the RewardActor endpoint still accepts dotted path
+    # for cross-proc portability).  When only ``reward_fn_path`` is
+    # set, use it verbatim -- old configs keep working.
+    reward_fn_path = forge_cfg.reward_fn_path
+    reward_short_name = getattr(forge_cfg, "reward", "") or ""
+    if reward_short_name:
+        from forge.reward import get_reward
+
+        try:
+            fn = get_reward(reward_short_name)
+            reward_fn_path = f"{fn.__module__}.{fn.__qualname__}"
+            print(
+                f"[Reward] short-name {reward_short_name!r} -> {reward_fn_path}",
+                flush=True,
+            )
+        except ValueError as e:
+            print(
+                f"[Reward] failed to resolve short name {reward_short_name!r}: {e}",
+                flush=True,
+            )
+            raise
+    if reward_fn_path:
+        await reward.setup.call(reward_fn_path)
     if forge_cfg.reward_model_path:
         await reward.setup_model.call(
             model_path=forge_cfg.reward_model_path,

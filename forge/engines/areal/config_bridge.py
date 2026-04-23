@@ -103,6 +103,12 @@ class AReaLConfigBridge:
             train_pp_size=train_pp,
             master_addr=master_addr,
             master_port=master_port,
+            # Both knobs are wired in; grpo.py resolves them with
+            # precedence ``reward (short name) > reward_fn_path (dotted
+            # import)``.  New YAMLs should prefer ``reward:``; older
+            # configs set ``reward_fn``/``reward_fn_path`` and still
+            # work verbatim.
+            reward=config.get("reward") or "",
             reward_fn_path=(
                 config.get("reward_fn") or "areal.reward.gsm8k.gsm8k_reward_fn"
             ),

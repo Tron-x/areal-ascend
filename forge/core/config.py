@@ -89,6 +89,22 @@ class ForgeConfig:
     master_port: int = 0
 
     reward_fn_path: str = ""
+    """Dotted import path for the rule-based reward function (legacy).
+
+    Prefer the short name via ``reward`` below for new configs; this
+    field is retained for backward compat with existing YAML files
+    and test scripts.  If both ``reward`` and ``reward_fn_path`` are
+    set, ``reward`` wins."""
+
+    reward: str = ""
+    """Short name registered via ``@register_reward("xxx")``.
+
+    Preferred over ``reward_fn_path`` for new configs.  The driver
+    resolves the short name to a callable via
+    ``forge.reward.get_reward(name)`` at setup time.  See
+    ``forge/reward/__init__.py`` and
+    ``examples/custom_rewards/README.md`` for the extension flow."""
+
     reward_model_path: str = ""
     reward_mode: str = "rule"
     reward_model_device: str = "auto"
