@@ -303,6 +303,103 @@ class Launcher(Enum):
 
 
 @dataclass
+class BcastBackendConfig:
+    """Per-backend tuning for the ``collective_broadcast`` weight-sync backend.
+
+    All fields have sane defaults; typical users don't need to touch this
+    block at all.  Exposed mostly so operators can pin deterministic
+    ports / vol indices when co-locating multiple forge jobs on the same
+    cluster.
+    """
+
+    src_vol_idx: int = 0
+    """Index of the storage volume that acts as the HCCL broadcast
+    source.  Must be in ``[0, train_world)``.  Always 0 unless an
+    operator has a specific reason to pick another vol."""
+
+    master_port: int | None = None
+    """TCP port used for the HCCL TCPStore rendezvous.  ``None`` = auto-
+    allocate a free port at initialize time; set to a fixed port for
+    deterministic deployments or firewall-restricted environments."""
+
+
+@dataclass
+class WeightSyncBlock:
+    """Data-plane weight-sync configuration (nested under ``launcher``).
+
+    Per the env-to-YAML mapping doc (`forge/docs/env_to_yaml_mapping.md`),
+    this block is the authoritative source for weight-sync knobs: envs
+    (``FORGE_WEIGHT_SYNC_BACKEND`` / ``FORGE_SHARD_PUBLISH`` / ``...``)
+    remain available for one release window as overrides, then go away.
+
+    Precedence: ``yaml > env > default``.
+    """
+
+    # ---- Method / backend -------------------------------------------
+    method: str | None = None
+    """``"nccl"`` (legacy) / ``"checkpoint"`` / ``"hixl"`` (legacy) /
+    ``"torchstore"`` (recommended).  Default ``None`` = read
+    ``FORGE_WEIGHT_SYNC`` env (itself defaults to ``"nccl"`` for backward
+    compat).  The ``torchstore`` path routes through
+    ``WeightSyncService`` + pluggable backends (see ``backend`` below)."""
+
+    backend: str | None = None
+    """Backend name when ``method=torchstore``.  Registered values:
+    ``torchstore_multi_vol`` (default, TP=1), ``collective_broadcast``
+    (TP>1), ``dedicated_ps`` (future), ``areal_xccl`` (fallback).
+    Registration lives in
+    ``forge.engines.weight_sync.backends.create_backend``."""
+
+    # ---- Shared across multi-vol / collective backends --------------
+    storage_mesh: str | None = None
+    """Name of a ``launcher.meshes.*`` entry to host storage volumes.
+    Default ``None`` = ``"trainer"`` (colocated with the training mesh,
+    which is the legacy behavior).  Set to ``"generator"`` or a custom
+    dedicated host for alternative topologies."""
+
+    storage_npu_base: int | None = None
+    """First NPU id used by storage volumes on the chosen host.
+    ``None`` = auto (uses ``train_world_size`` as offset so storage
+    doesn't collide with the trainer's NPUs on a colocated host)."""
+
+    storage_spawn_mode: str = "driver"
+    """``"driver"`` (default) — the grpo driver spawns the storage mesh
+    and injects it into the backend.  ``"backend"`` = backend spawns its
+    own storage mesh internally (legacy path; simpler but harder to
+    compose with other meshes).  Most users should leave at default."""
+
+    pool_mb: int | None = None
+    """MonarchRDMA staging pool size per storage volume (MiB).  ``None`` =
+    use backend default (currently 8192).  Lower this (to e.g. 4096) if
+    NPU memory is tight on the storage host."""
+
+    eager_d2h: bool | None = None
+    """``True`` eagerly moves staged tensors to host memory; ``False``
+    keeps them on NPU.  Default ``None`` = use torchstore's default,
+    which is ``False`` (on-device staging gives better RDMA bandwidth).
+    Only tune if you're debugging HiXL memory registration issues."""
+
+    # ---- Trainer-side (shard-parallel publish) ----------------------
+    shard_publish: bool | None = None
+    """Enables 4-NIC parallel ``ts.put`` on the trainer side (every FSDP
+    rank writes its own byte-shard of the flat tensor).  Measured 4-NIC
+    agg ~32 GB/s at TP=1 but incompatible with
+    ``collective_broadcast`` (which needs the full tensor on one vol).
+    Default ``None`` = read ``FORGE_SHARD_PUBLISH`` env (defaults to
+    off)."""
+
+    # ---- collective_broadcast-specific ------------------------------
+    bcast: BcastBackendConfig = field(default_factory=BcastBackendConfig)
+    """Nested tuning for the collective_broadcast backend.  See
+    ``BcastBackendConfig`` docstring."""
+
+    # ---- dedicated_ps-specific (future) -----------------------------
+    ps_world: int = 0
+    """Number of dedicated parameter-server procs (future
+    ``dedicated_ps`` backend).  0 = feature disabled."""
+
+
+@dataclass
 class LauncherConfig:
     """Cluster launcher configuration.
 
@@ -340,9 +437,29 @@ class LauncherConfig:
     # internally before consuming it.
     meshes: dict[str, Any] = field(default_factory=dict)
 
+    # Weight-sync data-plane policy.  See ``WeightSyncBlock`` docstring
+    # for the full field reference and
+    # ``forge/docs/env_to_yaml_mapping.md`` for the env-to-YAML
+    # precedence rules.  Unset (default-constructed) block is the
+    # legacy state: every knob falls through to its env var (or to
+    # the wired-in default).
+    weight_sync: WeightSyncBlock = field(default_factory=WeightSyncBlock)
+
     def __post_init__(self):
         if isinstance(self.launcher, str):
             self.launcher = Launcher(self.launcher)
+        # OmegaConf / YAML loaders typically hand us ``dict`` here
+        # rather than the target dataclasses -- normalize so
+        # downstream ``self.weight_sync.backend`` access just works.
+        if isinstance(self.weight_sync, dict):
+            raw = dict(self.weight_sync)
+            bcast_raw = raw.pop("bcast", None) or {}
+            bcast = (
+                BcastBackendConfig(**bcast_raw)
+                if isinstance(bcast_raw, dict)
+                else bcast_raw
+            )
+            self.weight_sync = WeightSyncBlock(bcast=bcast, **raw)
 
 
 @dataclass
