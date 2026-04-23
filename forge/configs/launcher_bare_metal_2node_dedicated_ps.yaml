@@ -53,6 +53,7 @@ launcher:
                           # intra-host HCCS.
 
   weight_sync:
+    method: torchstore
     backend: torchstore_multi_vol
     storage_mesh: storage
     # Same pool budget as the default YAML -- this value is what

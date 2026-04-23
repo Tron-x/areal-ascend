@@ -59,11 +59,35 @@ async def _create_weight_sync(forge_cfg, trainer, generator):
     ``FORGE_WEIGHT_SYNC_BACKEND`` (default ``"torchstore_multi_vol"``):
     see ``forge/engines/weight_sync/backends/__init__.py``.
     """
-    method_str = os.environ.get("FORGE_WEIGHT_SYNC", "nccl")
+    method_str = await _resolve_weight_sync_method()
 
     if method_str == "torchstore":
         return await _create_weight_sync_service(forge_cfg, trainer, generator)
     return await _create_legacy_weight_sync(forge_cfg, trainer, generator, method_str)
+
+
+async def _resolve_weight_sync_method() -> str:
+    """Read ``launcher.weight_sync.method`` with env + default fallback."""
+    from forge.core.types import WeightSyncBlock
+    from forge.engines.weight_sync._config_resolver import resolve_str
+    from forge.provisioner import _get_provisioner
+
+    ws: WeightSyncBlock | None = None
+    try:
+        prov = await _get_provisioner()
+        lc = getattr(prov, "launcher_config", None)
+        if lc is not None:
+            ws = getattr(lc, "weight_sync", None)
+    except Exception:
+        ws = None
+    if ws is None:
+        ws = WeightSyncBlock()
+    return resolve_str(
+        yaml_value=ws.method,
+        env_name="FORGE_WEIGHT_SYNC",
+        default="nccl",
+        yaml_field_hint="launcher.weight_sync.method",
+    )
 
 
 async def _spawn_storage_mesh(
@@ -755,7 +779,7 @@ async def grpo_main(
     # ``state_dict_for_sync()`` on the engine side), so the titan path now
     # opts in when ``FORGE_WEIGHT_SYNC=torchstore``.
     if use_engine and weight_sync is None:
-        method_str = os.environ.get("FORGE_WEIGHT_SYNC", "nccl")
+        method_str = await _resolve_weight_sync_method()
         titan_allowed = method_str == "torchstore"
         if forge_cfg.backend_type not in ("titan",) or titan_allowed:
             weight_sync = await _create_weight_sync(forge_cfg, trainer, generator)

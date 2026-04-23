@@ -102,6 +102,11 @@ launcher:
   # via shell env so an operator can run one-off experiments without
   # editing this file.
   weight_sync:
+    # Sync method.  "torchstore" = route through WeightSyncService +
+    # pluggable backend (recommended).  "nccl" / "checkpoint" / "hixl"
+    # are legacy paths kept for backward compat; see
+    # forge/docs/env_to_yaml_mapping.md §5 Q1.
+    method: torchstore
     # Pluggable backend name.  See
     # forge/engines/weight_sync/backends/__init__.py for the registry.
     backend: torchstore_multi_vol
