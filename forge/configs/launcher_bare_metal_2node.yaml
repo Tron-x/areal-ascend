@@ -97,40 +97,99 @@ launcher:
                           # PS") -- put traffic becomes cross-machine
                           # RoCE, pull stays intra-host HCCS.
 
-  # Weight-sync service configuration.  Forwarded into forge's
-  # driver as env-style knobs; each field is individually overridable
-  # via shell env so an operator can run one-off experiments without
-  # editing this file.
+  # Weight-sync data-plane configuration.  Authoritative: every field
+  # below is read by ``forge.apps.grpo`` via
+  # ``forge.engines.weight_sync._config_resolver`` with precedence
+  # ``yaml > env > default``.  Setting any field here makes that field
+  # immune to env-var overrides (and silences the deprecation warning
+  # a legacy env var would otherwise trigger).  See
+  # ``forge/docs/env_to_yaml_mapping.md`` for the complete field
+  # catalog and env-equivalence table.
   weight_sync:
-    # Sync method.  "torchstore" = route through WeightSyncService +
-    # pluggable backend (recommended).  "nccl" / "checkpoint" / "hixl"
-    # are legacy paths kept for backward compat; see
-    # forge/docs/env_to_yaml_mapping.md §5 Q1.
+    # -- Method / backend selection -----------------------------------
+    # method: sync dispatch path.
+    #   "torchstore" = route through WeightSyncService + pluggable
+    #                  backend below (recommended).
+    #   "nccl" / "checkpoint" / "hixl" = legacy paths (see §5 Q1 of
+    #                  env_to_yaml_mapping.md).
     method: torchstore
-    # Pluggable backend name.  See
-    # forge/engines/weight_sync/backends/__init__.py for the registry.
+
+    # backend: which torchstore backend to use when method=torchstore.
+    # Registered names live in
+    # ``forge/engines/weight_sync/backends/__init__.py``:
+    #   torchstore_multi_vol (default, works at any gen TP; uses
+    #     per-worker ts.get which is fine at TP=1 but scales
+    #     connections as TP × num_vols at TP>1 and triggers HiXL
+    #     103901 — flip to collective_broadcast when you go TP>1).
+    #   collective_broadcast (opt-in for gen TP>1; storage vol 0
+    #     becomes the HCCL broadcast source, fanout 1+TP over one
+    #     HCCL group — see weight_sync.md §7.4).
+    #   dedicated_ps (future — standalone parameter-server nodes).
+    #   areal_xccl (HiXL-free fallback via plain HCCL broadcast).
     backend: torchstore_multi_vol
 
-    # Name of the mesh (must exist in ``meshes:`` above) whose host
-    # should run torchstore's storage volumes.  ``storage`` is the
-    # conventional name; ``trainer`` colocates manually without an
-    # explicit storage mesh.
+    # -- Storage placement --------------------------------------------
+    # storage_mesh: which entry in the ``meshes:`` map above should
+    # host the storage volumes.  "storage" is the conventional name.
+    # Set to "trainer" to colocate with the trainer host (saves a
+    # cross-machine hop but puts torchstore's staging pool on the
+    # same NPU that FSDP is using).
     storage_mesh: storage
 
-    # MonarchRDMA staging pool per torchstore transport proc, in MiB.
-    # The pool lives inside whatever proc calls ``ts.put`` / ``ts.get``
-    # -- on the trainer side that's trainer rank 0, which shares NPU 0
-    # with FSDP's model/optim/activation state.  After a rollout,
-    # trainer NPU 0 typically has ~8 GiB free; requesting an 8192 MiB
-    # pool there sits right on the edge of OOM (``Tried to allocate
-    # 8.00 GiB (NPU 0; ... 7.88 GiB free)``).  6144 MiB gives
-    # comfortable headroom for Qwen3-0.6B (1.4 GiB flat + staging
-    # slack) while leaving NPU 0 room for the training step itself.
-    # Bump to 8192 for bigger models once trainer NPU 0 pressure drops.
+    # storage_npu_base: first NPU id on ``storage_mesh``'s host that
+    # storage volumes bind to.  ``null`` = auto (uses
+    # ``train_world_size`` as the offset so storage doesn't collide
+    # with trainer's NPUs on a colocated host).  For dedicated
+    # storage hosts (no trainer on that box) set to 0.
+    storage_npu_base: null
+
+    # storage_spawn_mode: who provisions the storage ProcMesh.
+    #   "driver" (default) -- forge driver spawns storage and injects
+    #     the mesh into the backend constructor (topology-agnostic).
+    #   "backend" -- legacy; backend spawns storage itself on the
+    #     trainer host.  Rare; only useful during backend-side
+    #     refactors.
+    storage_spawn_mode: driver
+
+    # -- Transport tuning ---------------------------------------------
+    # pool_mb: MonarchRDMA staging pool per torchstore transport proc
+    # (MiB).  The pool lives inside whichever proc calls ts.put / ts.get
+    # — on the trainer side that's rank 0, which shares NPU 0 with
+    # FSDP's model/optim/activation state.  After a rollout, trainer
+    # NPU 0 typically has ~8 GiB free; an 8192 MiB pool sits right on
+    # the edge of OOM there.  6144 MiB gives comfortable headroom for
+    # Qwen3-0.6B (1.4 GiB flat + staging slack).  Bump to 8192 for
+    # bigger models once trainer NPU 0 pressure drops.
     pool_mb: 6144
 
-    # First NPU id to pin storage volumes to on the chosen host.
-    # ``null`` = auto = ``train_world_size`` (right after the trainer's
-    # NPUs when storage is colocated with trainer).  When storage is
-    # on a dedicated host (no trainer on that box), set to 0.
-    storage_npu_base: null
+    # eager_d2h: whether torchstore's transport staging should copy
+    # tensors out to host memory before enqueuing the RDMA op.
+    # ``false`` (recommended) keeps staging on-device and lets HiXL
+    # do the NPU-to-NPU transfer with no host hop.  ``true`` is only
+    # useful when debugging HiXL memory registration issues.
+    eager_d2h: false
+
+    # -- Trainer-side shard-parallel publish --------------------------
+    # shard_publish: when ``true``, every trainer FSDP rank publishes
+    # its own byte-shard of the flat state_dict to its matching
+    # storage volume in parallel (uses all N RoCE NICs).  Measured
+    # agg throughput ~32 GB/s at TP=1 on our 2-node setup.
+    # Incompatible with backend=collective_broadcast (the bcast source
+    # needs the full tensor in one vol).  Default ``false``.
+    shard_publish: false
+
+    # -- collective_broadcast backend tuning --------------------------
+    # These fields only matter when backend=collective_broadcast.
+    bcast:
+      # Which storage vol acts as the HCCL broadcast source.  Must be
+      # in [0, train_world_size).  0 is almost always right.
+      src_vol_idx: 0
+      # TCP port for the HCCL TCPStore rendezvous.  ``null`` = auto-
+      # allocate a free port.  Pin to a fixed port for deterministic
+      # deployments or firewall-restricted environments.
+      master_port: null
+
+    # -- Future: dedicated-PS topology --------------------------------
+    # Number of dedicated parameter-server procs.  0 = disabled.
+    # Requires backend=dedicated_ps (not implemented yet).
+    ps_world: 0

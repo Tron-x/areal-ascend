@@ -52,18 +52,25 @@ launcher:
                           # generator; put goes cross-node, pull stays
                           # intra-host HCCS.
 
+  # Weight-sync block schema is identical to the colocated variant;
+  # see ``launcher_bare_metal_2node.yaml`` for the fully-commented
+  # field catalog.  This file only overrides what actually differs in
+  # the dedicated-PS topology (storage_npu_base).
   weight_sync:
     method: torchstore
     backend: torchstore_multi_vol
     storage_mesh: storage
-    # Same pool budget as the default YAML -- this value is what
-    # actually lands inside the ``MonarchRDMATransportBuffer`` staging
-    # pool on the trainer proc (and, via worker_manager.sh's env
-    # forward, on the storage and generator-worker procs).
+    storage_spawn_mode: driver
     pool_mb: 6144
+    eager_d2h: false
+    shard_publish: false
     # When storage lives on a host that runs *no* trainer ranks, NPU
     # 0 on that host is free.  Setting storage_npu_base: 4 keeps the
     # layout identical to the colocated case for a fair A/B (storage
     # always on NPU 4..7).  Use 0 if you want to compete with vLLM
     # for NPU 0 instead.
     storage_npu_base: 4
+    bcast:
+      src_vol_idx: 0
+      master_port: null
+    ps_world: 0

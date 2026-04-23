@@ -2,30 +2,57 @@
 # =============================================================================
 # Forge — Multi-node GRPO training (hostfile-driven)
 #
-# Manages the full lifecycle: hostname setup → worker start → training → cleanup
+# NOTE (unified-entry refactor, 2026-04-23):
 #
-# Usage:
+#   This script is now a *thin wrapper* around ``python -m forge launch``.
+#   New code paths should call ``python -m forge launch`` directly:
+#
+#       python -m forge launch forge/configs/launcher_bare_metal_2node.yaml \\
+#           --steps 3 --backend titan --model-name qwen3 --model-flavor 0.6B \\
+#           --model /path/to/model -- \\
+#           allocation_mode=vllm:d1p1t1+d4p1t1  gconfig.max_new_tokens=128
+#
+#   The wrapper translates the historical CLI surface of this script
+#   (``--hostfile``, ``--model``, ``--steps``, ``--backend``, ...) and
+#   the pre-refactor FORGE_* env vars (FORGE_WEIGHT_SYNC,
+#   FORGE_SHARD_PUBLISH, ...) into the equivalent ``forge launch``
+#   invocation.  Existing smoke scripts, CI pipelines, and muscle-
+#   memory invocations keep working.
+#
+#   The Python CLI is the authoritative entry point going forward:
+#     * YAML is the single source of truth (launcher.weight_sync.*);
+#     * env vars still work as overrides but now emit deprecation
+#       warnings via ``forge.engines.weight_sync._config_resolver``;
+#     * pre-flight checks, SSH bookkeeping, and cleanup-on-exit all
+#       live in Python and get exercised uniformly by every caller.
+#
+#   See ``forge/docs/env_to_yaml_mapping.md`` for the YAML schema and
+#   ``forge/cli/launch.py`` for the CLI itself.
+#
+# Usage (unchanged):
 #   bash forge/scripts/run_multinode.sh --hostfile forge/configs/hostfile.txt
-#   bash forge/scripts/run_multinode.sh --hostfile forge/configs/hostfile.txt --steps 5
-#   bash forge/scripts/run_multinode.sh --hostfile forge/configs/hostfile.txt --model /path/to/model
+#   bash forge/scripts/run_multinode.sh --hostfile ... --steps 5
+#   bash forge/scripts/run_multinode.sh --hostfile ... --model /path/to/model
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AREAL_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKER_MGR="${SCRIPT_DIR}/worker_manager.sh"
 
 # --------------- defaults ---------------
 HOSTFILE=""
-MODEL_PATH="Qwen/Qwen2.5-1.5B-Instruct"
-TRAIN_STEPS=2
+MODEL_PATH=""
+TRAIN_STEPS=""
 WORKER_PORT=22222
 SSH_PORT=36000
 CANN_HOME="${CANN_HOME:-/usr/local/Ascend/cann-9.0.0-beta.1}"
 BACKEND=""
 MODEL_NAME=""
 MODEL_FLAVOR=""
-EXTRA_ARGS=""
+EXTRA_ARGS=()
+# FORGE_CONFIG overrides the YAML path (backward compat: same env name
+# as the pre-refactor script).
+FORGE_CONFIG_PATH="${FORGE_CONFIG:-forge/configs/launcher_bare_metal_2node.yaml}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,171 +65,52 @@ while [[ $# -gt 0 ]]; do
         --backend)       BACKEND="$2"; shift 2 ;;
         --model-name)    MODEL_NAME="$2"; shift 2 ;;
         --model-flavor)  MODEL_FLAVOR="$2"; shift 2 ;;
-        *)               EXTRA_ARGS="${EXTRA_ARGS} $1"; shift ;;
+        --forge-config)  FORGE_CONFIG_PATH="$2"; shift 2 ;;
+        *)               EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
 
 if [[ -z "$HOSTFILE" ]]; then
-    echo "Error: --hostfile is required"
-    echo "Usage: $0 --hostfile forge/configs/hostfile.txt [--steps N] [--model PATH]"
+    echo "Error: --hostfile is required" >&2
+    echo "Usage: $0 --hostfile forge/configs/hostfile.txt [--steps N] [--model PATH]" >&2
     exit 1
 fi
 
-# Read the driver node (first host with an active worker acts as driver)
-DRIVER_HOST=$(grep -v '^#' "$HOSTFILE" | grep -v '^\s*$' | awk 'NR==2{print $1}')
-if [[ -z "$DRIVER_HOST" ]]; then
-    DRIVER_HOST=$(grep -v '^#' "$HOSTFILE" | grep -v '^\s*$' | awk 'NR==1{print $1}')
-fi
-
-WORKERS=$(bash "$WORKER_MGR" workers-arg --hostfile "$HOSTFILE" --port "$WORKER_PORT" --ssh-port "$SSH_PORT")
-
-echo "============================================="
-echo " Forge: Multi-node GRPO"
-echo " Hostfile: ${HOSTFILE}"
-echo " Driver:   ${DRIVER_HOST}"
-echo " Workers:  ${WORKERS}"
-echo " Model:    ${MODEL_PATH}"
-echo " Backend:  ${BACKEND:-areal}"
-echo " Steps:    ${TRAIN_STEPS}"
-echo "============================================="
-
-# --------------- Step 1: Setup hostnames ---------------
-echo "[1/4] Configuring hostname resolution..."
-bash "$WORKER_MGR" hosts-setup --hostfile "$HOSTFILE" --ssh-port "$SSH_PORT"
-
-# --------------- Step 2: Start workers ---------------
-echo "[2/4] Starting Monarch workers..."
-bash "$WORKER_MGR" stop --hostfile "$HOSTFILE" --port "$WORKER_PORT" --ssh-port "$SSH_PORT" 2>/dev/null || true
-sleep 3
-bash "$WORKER_MGR" start \
-    --hostfile "$HOSTFILE" --port "$WORKER_PORT" --ssh-port "$SSH_PORT" \
-    --cann "$CANN_HOME" --areal-root "$AREAL_ROOT"
-
-# --------------- Step 3: Run training ---------------
-echo "[3/4] Running GRPO training on ${DRIVER_HOST}..."
-
-SSH_CMD="ssh -p ${SSH_PORT} -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-
-# All weight-sync topology is decided by the driver's WeightSyncService +
-# backend (forge/engines/weight_sync/*).  The old TORCHSTORE_STORAGE_NPU env
-# has been retired; the backend picks the storage NPU range (typically right
-# after the trainer's NPUs on the same host, e.g. 4-7 if trainer uses 0-3).
-#
-# Knobs still forwarded from the caller's shell:
-#   FORGE_WEIGHT_SYNC           - sync mode (nccl / checkpoint / hixl / torchstore)
-#   FORGE_WEIGHT_SYNC_BACKEND   - torchstore backend name (default: torchstore_multi_vol)
-#   FORGE_GEN_TP / FORGE_GEN_PP / FORGE_PS_WORLD - layout hints for Service
-#   TORCHSTORE_STORAGE_NPU_BASE - override storage NPU range start (0-based)
-#   TORCHSTORE_MONARCH_RDMA_POOL_MB - HiXL staging pool size per volume
-# FORGE_WEIGHT_SYNC chooses the sync method entirely (nccl/checkpoint
-# /hixl/torchstore); this one keeps a CLI default because the YAML
-# launcher block does not model it -- it's an AReaL / forge engine
-# knob, not a launcher-topology knob.
-FORGE_WEIGHT_SYNC_FWD="${FORGE_WEIGHT_SYNC:-nccl}"
-
-# The following four fields mirror ``launcher.weight_sync`` /
-# ``launcher.meshes`` in YAML.  We intentionally do *not* give them
-# shell-side defaults -- if we did, they would win the
-# "env > YAML > default" precedence battle and make the YAML fields
-# useless.  The caller's shell env still takes precedence (because we
-# forward the value verbatim when set), but an unset caller means
-# "fall through to whatever YAML says".
-FORGE_WEIGHT_SYNC_BACKEND_FWD="${FORGE_WEIGHT_SYNC_BACKEND:-}"
-
-# Experimental: when set to "1", trainer publishes a byte-shard per
-# rank instead of only rank 0 put'ing the whole flat buffer.  Wired
-# through by TrainerActor.publish_weights_flat.  Status tracked in
-# forge/docs/weight_sync.md §7.1 -- currently blocked on the HiXL
-# rankTable assumption, which the CANN/HiXL team is changing at the
-# end of the month, but worth retrying whenever the pool-device fix
-# or any torchstore/monarch-rdma change lands so we can confirm the
-# blocker is still on the HiXL side.
-FORGE_SHARD_PUBLISH_FWD="${FORGE_SHARD_PUBLISH:-}"
-
-# Explicit mesh placement (name -> worker_idx), e.g.
-#   FORGE_MESH_PLACEMENT="trainer=0,generator=1,storage=0"
-FORGE_MESH_PLACEMENT_FWD="${FORGE_MESH_PLACEMENT:-}"
-
-# Name of the mesh whose host runs torchstore's storage volumes.
-# "trainer" => colocated with trainer (legacy); "storage" => its own
-# mesh entry in the YAML; anything else => whatever you named it.
-FORGE_STORAGE_HOST_MESH_FWD="${FORGE_STORAGE_HOST_MESH:-}"
-
-FORGE_STORAGE_NPU_BASE_FWD="${TORCHSTORE_STORAGE_NPU_BASE:-}"
-# torchstore staging pool per proc, in MB.  Default 8192 covers
-# Qwen3-0.6B (1.4 GB flat + headroom).  On boxes where trainer NPU 0
-# already lives close to capacity (activation + optimizer state)
-# setting this to 4096 or 2048 is the usual rescue knob.  The pool
-# size trades ``_pre_put_hook`` staging overhead against how much NPU
-# room the trainer can spare at weight-sync time.
-# Pool size forwarding: only propagate if the caller explicitly set
-# it -- otherwise leave it unset so that the YAML launcher block's
-# ``weight_sync.pool_mb`` can supply the default.  If we eagerly
-# default to 8192 here, we'd always win the "env > YAML > default"
-# precedence and make the YAML field useless.
-TORCHSTORE_POOL_MB_FWD="${TORCHSTORE_MONARCH_RDMA_POOL_MB:-}"
-if [ -n "${TORCHSTORE_POOL_MB_FWD}" ]; then
-    export TORCHSTORE_MONARCH_RDMA_POOL_MB="${TORCHSTORE_POOL_MB_FWD}"
-fi
-# Forge launcher YAML (bare-metal topology, meshes, weight_sync
-# knobs).  Default is the checked-in 2-node config in
-# ``forge/configs/``; callers can point ``FORGE_CONFIG`` elsewhere.
-FORGE_CONFIG_FWD="${FORGE_CONFIG:-forge/configs/launcher_bare_metal_2node.yaml}"
-
-$SSH_CMD root@${DRIVER_HOST} "\
-source ${CANN_HOME}/set_env.sh 2>/dev/null; \
-ASCEND_ROOT=\$(dirname ${CANN_HOME}); \
-[[ -f \"\${ASCEND_ROOT}/nnal/atb/set_env.sh\" ]] && source \"\${ASCEND_ROOT}/nnal/atb/set_env.sh\"; \
-eval \"\$(/root/miniconda3/bin/conda shell.bash hook)\"; \
-conda activate monarch_ascend; \
-export VLLM_USE_MODELSCOPE=true; \
-export HF_ENDPOINT=https://hf-mirror.com; \
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True; \
-export ASCEND_GLOBAL_LOG_LEVEL=\"\${ASCEND_GLOBAL_LOG_LEVEL:-3}\"; \
-export ASCEND_SLOG_PRINT_TO_STDOUT=\"\${ASCEND_SLOG_PRINT_TO_STDOUT:-1}\"; \
-export HCCL_DEBUG=\"\${HCCL_DEBUG:-INFO}\"; \
-export FORGE_WEIGHT_SYNC='${FORGE_WEIGHT_SYNC_FWD}'; \
-[ -n '${FORGE_WEIGHT_SYNC_BACKEND_FWD}' ] && export FORGE_WEIGHT_SYNC_BACKEND='${FORGE_WEIGHT_SYNC_BACKEND_FWD}'; \
-[ -n '${FORGE_MESH_PLACEMENT_FWD}' ] && export FORGE_MESH_PLACEMENT='${FORGE_MESH_PLACEMENT_FWD}'; \
-[ -n '${FORGE_SHARD_PUBLISH_FWD}' ] && export FORGE_SHARD_PUBLISH='${FORGE_SHARD_PUBLISH_FWD}'; \
-[ -n '${FORGE_STORAGE_HOST_MESH_FWD}' ] && export FORGE_STORAGE_HOST_MESH='${FORGE_STORAGE_HOST_MESH_FWD}'; \
-[ -n '${FORGE_STORAGE_NPU_BASE_FWD}' ] && export TORCHSTORE_STORAGE_NPU_BASE='${FORGE_STORAGE_NPU_BASE_FWD}'; \
-export MONARCH_HIXL_TRANSPORT=roce; \
-export HCCL_INTRA_ROCE_ENABLE=1; \
-export HCCL_CONNECT_TIMEOUT=120; \
-export HCCL_NPU_SOCKET_PORT_RANGE=60000-60255; \
-export TORCHSTORE_MONARCH_RDMA_EAGER_D2H=0; \
-export TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:0; \
-[ -n '${TORCHSTORE_POOL_MB_FWD}' ] && export TORCHSTORE_MONARCH_RDMA_POOL_MB='${TORCHSTORE_POOL_MB_FWD}'; \
-cd ${AREAL_ROOT}; \
-BACKEND_ARGS=''; \
-[ -n '${BACKEND}' ] && BACKEND_ARGS=\"--backend ${BACKEND}\"; \
-[ -n '${MODEL_NAME}' ] && BACKEND_ARGS=\"\${BACKEND_ARGS} --model-name ${MODEL_NAME}\"; \
-[ -n '${MODEL_FLAVOR}' ] && BACKEND_ARGS=\"\${BACKEND_ARGS} --model-flavor ${MODEL_FLAVOR}\"; \
-python -m forge.apps.grpo \
-    examples/math/gsm8k_rl.py \
-    --config examples/math/gsm8k_grpo_npu.yaml \
-    --forge-config '${FORGE_CONFIG_FWD}' \
-    'actor.path=${MODEL_PATH}' \
-    '+total_train_steps=${TRAIN_STEPS}' \
-    --bare-metal-workers '${WORKERS}' \
-    --bare-metal-master-addr '${DRIVER_HOST}' \
-    \${BACKEND_ARGS} \
-    ${EXTRA_ARGS} \
-    2>&1 | tee /tmp/forge_multinode.log"
-TRAIN_EXIT=$?
-
-# --------------- Step 4: Cleanup ---------------
-echo "[4/4] Stopping workers..."
-bash "$WORKER_MGR" stop --hostfile "$HOSTFILE" --port "$WORKER_PORT" --ssh-port "$SSH_PORT" 2>/dev/null || true
-
-if [ ${TRAIN_EXIT} -eq 0 ]; then
-    echo "============================================="
-    echo " Multi-node training completed successfully!"
-    echo "============================================="
+# Pick the Python interpreter from the conda env if not already active.
+# ``forge launch`` needs the forge package on sys.path.
+if command -v python >/dev/null 2>&1; then
+    PYBIN="python"
 else
-    echo "============================================="
-    echo " Training FAILED (exit code ${TRAIN_EXIT})"
-    echo "============================================="
-    exit ${TRAIN_EXIT}
+    PYBIN="/root/miniconda3/envs/monarch_ascend/bin/python"
 fi
+
+# Translate the historical CLI surface to ``forge launch`` args.
+LAUNCH_ARGS=(
+    launch
+    "$FORGE_CONFIG_PATH"
+    --hostfile "$HOSTFILE"
+    --worker-port "$WORKER_PORT"
+    --ssh-port "$SSH_PORT"
+    --cann "$CANN_HOME"
+)
+[[ -n "$TRAIN_STEPS" ]] && LAUNCH_ARGS+=(--steps "$TRAIN_STEPS")
+[[ -n "$MODEL_PATH"  ]] && LAUNCH_ARGS+=(--model "$MODEL_PATH")
+[[ -n "$BACKEND"     ]] && LAUNCH_ARGS+=(--backend "$BACKEND")
+[[ -n "$MODEL_NAME"  ]] && LAUNCH_ARGS+=(--model-name "$MODEL_NAME")
+[[ -n "$MODEL_FLAVOR" ]] && LAUNCH_ARGS+=(--model-flavor "$MODEL_FLAVOR")
+
+# Any remaining flags get forwarded to forge.apps.grpo as OmegaConf
+# overrides (e.g. ``allocation_mode=...`` / ``gconfig.max_new_tokens=128``).
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    LAUNCH_ARGS+=(--)
+    LAUNCH_ARGS+=("${EXTRA_ARGS[@]}")
+fi
+
+# Historical env vars still work; ``forge launch`` forwards them to the
+# driver host and ``forge.engines.weight_sync._config_resolver`` picks
+# them up as overrides (with a deprecation warning pointing at the YAML
+# field).  Nothing to do here beyond invoking Python with the same
+# environment we inherited.
+
+cd "$AREAL_ROOT"
+exec "$PYBIN" -m forge "${LAUNCH_ARGS[@]}"
