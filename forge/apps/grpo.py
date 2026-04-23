@@ -139,63 +139,112 @@ async def _spawn_storage_mesh(
 
 
 async def _create_weight_sync_service(forge_cfg, trainer, generator):
-    """New path: WeightSyncService + pluggable backend."""
+    """New path: WeightSyncService + pluggable backend.
+
+    Every user-visible knob flows through the
+    ``launcher.weight_sync`` YAML block (parsed into
+    :class:`~forge.core.types.WeightSyncBlock`).  Legacy ``FORGE_*`` /
+    ``TORCHSTORE_*`` env vars still work as overrides for one release
+    window, driven through
+    ``forge.engines.weight_sync._config_resolver.resolve_*`` which
+    emits a single-line deprecation warning per env var per process.
+
+    Precedence is documented in
+    ``forge/docs/env_to_yaml_mapping.md §3``:
+    ``yaml > env > default``.
+    """
+    from forge.engines.weight_sync._config_resolver import (
+        resolve_bool,
+        resolve_int,
+        resolve_str,
+    )
     from forge.engines.weight_sync.backends import create_backend
     from forge.engines.weight_sync.service import (
         ParallelLayout,
         WeightSyncService,
     )
+    from forge.provisioner import _get_provisioner
 
-    backend_name = os.environ.get("FORGE_WEIGHT_SYNC_BACKEND", "torchstore_multi_vol")
-    # Backend-specific options from env (kept narrow so YAML stays clean).
+    # Pull the resolved WeightSyncBlock off the global provisioner --
+    # ``main()`` has already parsed the YAML and normalized the block
+    # into a dataclass, so here we just read fields.  If the provisioner
+    # hasn't been initialized (local-run case), fall back to an empty
+    # block so every field resolves to its env/default.
+    try:
+        prov = await _get_provisioner()
+        lc = getattr(prov, "launcher_config", None) or getattr(
+            getattr(prov, "config", None), "launcher_config", None
+        )
+        ws = getattr(lc, "weight_sync", None) if lc is not None else None
+    except Exception:
+        ws = None
+    if ws is None:
+        from forge.core.types import WeightSyncBlock
+
+        ws = WeightSyncBlock()
+
+    backend_name = resolve_str(
+        yaml_value=ws.backend,
+        env_name="FORGE_WEIGHT_SYNC_BACKEND",
+        default="torchstore_multi_vol",
+        yaml_field_hint="launcher.weight_sync.backend",
+    )
+
     backend_kwargs: dict = {}
     # Both torchstore_multi_vol and collective_broadcast share the same
     # trainer-side HiXL put path, so they take the same storage-mesh
     # provisioning knobs. The shared block is below; the bcast backend
     # layers its HCCL-group knobs on top.
     if backend_name in ("torchstore_multi_vol", "collective_broadcast"):
-        # Placement knobs: these used to be baked into the backend; now
-        # the driver provisions the storage mesh and hands it in, so the
-        # backend becomes topology-agnostic.  Env vars still take
-        # precedence so we can A/B "same host as trainer" vs
-        # "different host" without touching YAML.
-        #
-        #   FORGE_STORAGE_HOST_MESH   -- name of the host mesh to spawn
-        #                                storage volumes on.  Defaults to
-        #                                the trainer host, which
-        #                                reproduces the legacy colocated
-        #                                layout bit-for-bit.  Setting
-        #                                "generator" (or any other
-        #                                registered host name) moves
-        #                                storage off the trainer.
-        #   TORCHSTORE_STORAGE_NPU_BASE -- first NPU id on that host for
-        #                                the volumes.  Defaults to
-        #                                train_world (right after the
-        #                                trainer's NPUs on the trainer
-        #                                host; for a dedicated storage
-        #                                host 0 is usually correct).
-        #
-        # When ``FORGE_STORAGE_SPAWN_IN_BACKEND=1`` we skip external
-        # spawning entirely and let the backend fall back to its legacy
-        # self-spawn path -- useful for the very first smoke while we
-        # bed this refactor in.
-        npu_base_env = os.environ.get("TORCHSTORE_STORAGE_NPU_BASE")
-        pool_mb_env = os.environ.get("TORCHSTORE_MONARCH_RDMA_POOL_MB")
-        storage_host_name = os.environ.get("FORGE_STORAGE_HOST_MESH", "trainer")
-        spawn_in_backend = os.environ.get("FORGE_STORAGE_SPAWN_IN_BACKEND", "0") == "1"
+        # Common knobs across both backends -- every read goes through
+        # the resolver so the precedence rule is uniform and env usage
+        # gets a deprecation warning once.
+        pool_mb = resolve_int(
+            yaml_value=ws.pool_mb,
+            env_name="TORCHSTORE_MONARCH_RDMA_POOL_MB",
+            default=8192,
+            yaml_field_hint="launcher.weight_sync.pool_mb",
+        )
+        # -1 sentinel = "not set"; we translate to None so backend's
+        # own default ("auto = train_world") kicks in.
+        npu_base_resolved = resolve_int(
+            yaml_value=ws.storage_npu_base,
+            env_name="TORCHSTORE_STORAGE_NPU_BASE",
+            default=-1,
+            yaml_field_hint="launcher.weight_sync.storage_npu_base",
+        )
+        npu_base_val: int | None = (
+            None if npu_base_resolved < 0 else int(npu_base_resolved)
+        )
+        storage_host_name = resolve_str(
+            yaml_value=ws.storage_mesh,
+            env_name="FORGE_STORAGE_HOST_MESH",
+            default="trainer",
+            yaml_field_hint="launcher.weight_sync.storage_mesh",
+        )
+        # Toggling "driver" vs "backend" storage spawn mode.  We model
+        # this as a string enum in YAML but the legacy env var is
+        # boolean ("1" = backend-spawn).  The resolver can't directly
+        # express that mapping, so we do it manually.
+        spawn_mode_yaml = ws.storage_spawn_mode or "driver"
+        spawn_in_backend = resolve_bool(
+            yaml_value=(spawn_mode_yaml == "backend"),
+            env_name="FORGE_STORAGE_SPAWN_IN_BACKEND",
+            default=False,
+            yaml_field_hint='launcher.weight_sync.storage_spawn_mode="backend"',
+        )
 
-        if pool_mb_env is not None:
-            backend_kwargs["pool_mb"] = int(pool_mb_env)
+        backend_kwargs["pool_mb"] = pool_mb
 
         if spawn_in_backend:
-            # Legacy path: backend spawns storage itself on the trainer
-            # host.  Honors TORCHSTORE_STORAGE_NPU_BASE the old way.
-            if npu_base_env is not None:
-                backend_kwargs["storage_npu_base"] = int(npu_base_env)
+            # Legacy path: backend spawns storage itself.
+            if npu_base_val is not None:
+                backend_kwargs["storage_npu_base"] = npu_base_val
         else:
-            # New path: driver spawns storage and injects the mesh.
+            # Driver-spawn path: driver provisions the storage mesh and
+            # hands it to the backend (topology-agnostic backend API).
             num_vols = forge_cfg.train_world_size
-            npu_base = int(npu_base_env) if npu_base_env is not None else num_vols
+            npu_base = npu_base_val if npu_base_val is not None else num_vols
             storage_mesh = await _spawn_storage_mesh(
                 host_mesh_name=storage_host_name,
                 num_vols=num_vols,
@@ -203,15 +252,39 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
             )
             backend_kwargs["storage_mesh"] = storage_mesh
 
-        # Bcast-specific extras: which vol is the src, optional master
-        # port override for the HCCL TCPStore. Defaults are fine.
+        # Bcast-specific extras.  Defaults are fine; pin here for
+        # deterministic deployments or firewall-constrained setups.
         if backend_name == "collective_broadcast":
-            src_env = os.environ.get("FORGE_BCAST_SRC_VOL_IDX")
-            port_env = os.environ.get("FORGE_BCAST_MASTER_PORT")
-            if src_env is not None:
-                backend_kwargs["bcast_src_vol_idx"] = int(src_env)
-            if port_env is not None:
-                backend_kwargs["bcast_master_port"] = int(port_env)
+            src_idx = resolve_int(
+                yaml_value=ws.bcast.src_vol_idx,
+                env_name="FORGE_BCAST_SRC_VOL_IDX",
+                default=0,
+                yaml_field_hint="launcher.weight_sync.bcast.src_vol_idx",
+            )
+            if src_idx != 0:
+                backend_kwargs["bcast_src_vol_idx"] = src_idx
+            port_resolved = resolve_int(
+                yaml_value=ws.bcast.master_port,
+                env_name="FORGE_BCAST_MASTER_PORT",
+                default=-1,
+                yaml_field_hint="launcher.weight_sync.bcast.master_port",
+            )
+            if port_resolved > 0:
+                backend_kwargs["bcast_master_port"] = port_resolved
+
+    # Trainer-side ``FORGE_SHARD_PUBLISH`` is consumed by
+    # ``TrainerActor.publish_weights_flat`` in a different proc, so
+    # after resolving we export the final value back as an env var --
+    # this is a legitimate cross-proc transport for a scalar setting
+    # (unlike YAML-field-read-from-env, which is the anti-pattern we're
+    # replacing).
+    shard_publish = resolve_bool(
+        yaml_value=ws.shard_publish,
+        env_name="FORGE_SHARD_PUBLISH",
+        default=False,
+        yaml_field_hint="launcher.weight_sync.shard_publish",
+    )
+    os.environ["FORGE_SHARD_PUBLISH"] = "1" if shard_publish else "0"
 
     try:
         backend = create_backend(backend_name, **backend_kwargs)
@@ -227,15 +300,35 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
         return None
 
     # Layout comes from ``forge_cfg`` (filled by the config bridge from
-    # ``allocation_mode``).  Env-var overrides are still honored for
-    # ad-hoc experiments, but should not be needed in steady state --
-    # flipping ``allocation_mode`` in YAML is now the canonical knob.
+    # ``allocation_mode``).  TP/PP/PS overrides still honor legacy env
+    # vars for ad-hoc experiments; they emit deprecation warnings
+    # through the resolver so users know to move to YAML
+    # (``allocation_mode`` for TP/PP, ``launcher.weight_sync.ps_world``
+    # for PS).
+    gen_tp = resolve_int(
+        yaml_value=forge_cfg.gen_tp_size,
+        env_name="FORGE_GEN_TP",
+        default=1,
+        yaml_field_hint="allocation_mode (derived)",
+    )
+    gen_pp = resolve_int(
+        yaml_value=forge_cfg.gen_pp_size,
+        env_name="FORGE_GEN_PP",
+        default=1,
+        yaml_field_hint="allocation_mode (derived)",
+    )
+    ps_world = resolve_int(
+        yaml_value=ws.ps_world if ws.ps_world else None,
+        env_name="FORGE_PS_WORLD",
+        default=0,
+        yaml_field_hint="launcher.weight_sync.ps_world",
+    )
     layout = ParallelLayout(
         train_world=forge_cfg.train_world_size,
         gen_world=forge_cfg.gen_world_size,
-        gen_tp=int(os.environ.get("FORGE_GEN_TP") or forge_cfg.gen_tp_size or 1),
-        gen_pp=int(os.environ.get("FORGE_GEN_PP") or forge_cfg.gen_pp_size or 1),
-        ps_world=int(os.environ.get("FORGE_PS_WORLD", "0")),
+        gen_tp=gen_tp or 1,
+        gen_pp=gen_pp or 1,
+        ps_world=ps_world,
         trainer_mesh_name="trainer",
         generator_mesh_name="generator",
         ps_mesh_name="ps",
@@ -926,23 +1019,15 @@ def main():
             elif isinstance(spec, int):
                 mesh_placement[name] = int(spec)
 
-        # weight_sync -> env vars (the downstream readers in
-        # _create_weight_sync_service / _spawn_storage_mesh are still
-        # env-driven after Step 2; pushing YAML into env keeps a
-        # single read path).  Existing env takes precedence so an
-        # operator shell setting still wins over YAML.
-        yaml_ws = yaml_launcher.get("weight_sync") or {}
-        _env_fallback = {
-            "FORGE_WEIGHT_SYNC_BACKEND": yaml_ws.get("backend"),
-            "FORGE_STORAGE_HOST_MESH": yaml_ws.get("storage_mesh"),
-            "TORCHSTORE_MONARCH_RDMA_POOL_MB": yaml_ws.get("pool_mb"),
-            "TORCHSTORE_STORAGE_NPU_BASE": yaml_ws.get("storage_npu_base"),
-        }
-        for env_name, val in _env_fallback.items():
-            if val is None:
-                continue
-            if not os.environ.get(env_name):
-                os.environ[env_name] = str(val)
+        # weight_sync YAML block is passed directly into LauncherConfig
+        # (its __post_init__ normalizes the dict into a WeightSyncBlock
+        # dataclass).  Downstream readers in _create_weight_sync_service
+        # now pull fields off the dataclass via the resolver, which
+        # applies the precedence rule `yaml > env > default` uniformly.
+        # No more "YAML -> env" anti-pattern here.
+        yaml_ws_for_launcher = yaml_launcher.get("weight_sync") or {}
+    else:
+        yaml_ws_for_launcher = {}
 
     if bare_metal_args:
         from forge.types import Launcher, LauncherConfig, ProvisionerConfig
@@ -951,6 +1036,7 @@ def main():
             launcher_config=LauncherConfig(
                 launcher=Launcher.BARE_METAL,
                 meshes=mesh_placement,
+                weight_sync=yaml_ws_for_launcher,
                 **bare_metal_args,
             )
         )

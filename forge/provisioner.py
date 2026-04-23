@@ -578,8 +578,12 @@ class Provisioner:
         self._registered_actors: list = []
         self._registered_services: list = []
         self._cfg = cfg
-
-        launcher_cfg = cfg.launcher_config if cfg else None
+        # Expose the launcher dataclass so downstream modules (e.g.
+        # ``forge.apps.grpo._create_weight_sync_service``) can read
+        # YAML-sourced config (weight_sync block, meshes, etc.)
+        # without duplicating the ProvisionerConfig traversal.
+        self.launcher_config = cfg.launcher_config if cfg else None
+        launcher_cfg = self.launcher_config
         self.launcher: BaseLauncher | None = get_launcher(launcher_cfg)
         if self.launcher:
             logger.info(f"Provisioner using launcher: {type(self.launcher).__name__}")

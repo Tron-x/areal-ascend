@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import TypeVar
 
 logger = logging.getLogger("ConfigResolver")
@@ -72,16 +73,24 @@ def _warn_legacy_env(env_name: str, yaml_field_hint: str, env_value: str) -> Non
     _WARNED_ENVS.add(env_name)
     if _should_suppress_warnings():
         return
-    logger.warning(
-        "[deprecation] env var %s=%r is still honored as an override, "
-        "but the canonical location is the YAML field `%s`. "
-        "Move the setting into YAML; env support will be removed in "
-        "the next major release. Silence this warning with "
-        "FORGE_SUPPRESS_DEPRECATION=1.",
-        env_name,
-        env_value,
-        yaml_field_hint,
+    msg = (
+        f"[forge deprecation] env var {env_name}={env_value!r} is still "
+        f"honored as an override, but the canonical location is the "
+        f"YAML field `{yaml_field_hint}`. Move the setting into YAML; "
+        f"env support will be removed in the next major release. "
+        f"Silence with FORGE_SUPPRESS_DEPRECATION=1."
     )
+    # Write directly to stderr so the warning always reaches the user,
+    # regardless of how the ambient logging chain is configured. forge
+    # tooling installs per-actor colored handlers + multiple named
+    # loggers, and a framework-level ``ConfigResolver`` logger can get
+    # filtered by those handlers before reaching the console. stderr
+    # bypasses that entirely -- exactly matches how Python's own
+    # ``DeprecationWarning`` surfaces to users.
+    print(msg, file=sys.stderr, flush=True)
+    # Still log at WARNING on the named logger so structured log sinks
+    # (file, syslog, monitoring agents) can pick it up too.
+    logger.warning(msg)
 
 
 def resolve(
