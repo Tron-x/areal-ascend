@@ -77,6 +77,12 @@ class Episode:
     completion: Completion | None = None
     reward: float = 0.0
     reward_breakdown: dict[str, float] = field(default_factory=dict)
+    # Phase A3: per-turn rewards.  Aligned with multi-turn
+    # trajectories; ``None`` (default) means this episode is
+    # single-turn and only ``reward`` is meaningful.  When the
+    # reward pipeline runs process-scope rewards, this holds the
+    # aggregated per-turn vector.
+    step_rewards: list[float] | None = None
     advantage: float | None = None
     policy_version: int = -1
     prompt_token_ids: list[int] = field(default_factory=list)
@@ -113,6 +119,8 @@ class Episode:
             d["advantage"] = self.advantage
         if self.reward_breakdown:
             d["reward_breakdown"] = self.reward_breakdown
+        if self.step_rewards is not None:
+            d["step_rewards"] = list(self.step_rewards)
         if self.metadata:
             d["metadata"] = self.metadata
         return d
@@ -135,6 +143,7 @@ class Episode:
             versions=d.get("versions", []),
             advantage=d.get("advantage"),
             reward_breakdown=d.get("reward_breakdown", {}),
+            step_rewards=d.get("step_rewards"),
             metadata=d.get("metadata", {}),
         )
 
@@ -351,11 +360,23 @@ class WeightSyncBlock:
     ``forge.engines.weight_sync.backends.create_backend``."""
 
     # ---- Shared across multi-vol / collective backends --------------
+    storage_role: str | None = None
+    """Name of a ``launcher.roles.*`` entry that hosts storage volumes.
+    Default ``None`` = ``"trainer"`` (colocated with the training role,
+    which is the legacy behavior).  Set to ``"storage"`` or another
+    custom role for dedicated-PS topologies.
+
+    R1.5 renamed this field from ``storage_mesh``.  ``storage_mesh`` is
+    still accepted as an input alias (with a DeprecationWarning) for
+    one release; YAMLs that set both fields to conflicting values get
+    a hard error so "did the rename land?" isn't silent."""
+
     storage_mesh: str | None = None
-    """Name of a ``launcher.meshes.*`` entry to host storage volumes.
-    Default ``None`` = ``"trainer"`` (colocated with the training mesh,
-    which is the legacy behavior).  Set to ``"generator"`` or a custom
-    dedicated host for alternative topologies."""
+    """DEPRECATED alias for :attr:`storage_role`.  Kept for one release
+    so in-flight YAMLs keep working.  The canonical name is
+    ``storage_role`` -- both sides of the reference are roles now, not
+    the legacy flat ``meshes`` dict.  :meth:`LauncherConfig.__post_init__`
+    normalizes this into ``storage_role`` and warns once."""
 
     storage_npu_base: int | None = None
     """First NPU id used by storage volumes on the chosen host.
@@ -399,6 +420,168 @@ class WeightSyncBlock:
     ``dedicated_ps`` backend).  0 = feature disabled."""
 
 
+# Accepted values for :attr:`RoleConfig.hardware`.  Kept narrow on
+# purpose: R1.5 only ships the ``npu`` tier that's verified on our
+# 2-node Ascend cluster.  CPU roles (``replay_buffer`` / ``tool_server``
+# etc.) and ``gpu`` will be added in Phase A2 when we have actual test
+# hardware -- silently accepting them today would let YAMLs pass that
+# have no corresponding launcher path yet.  See
+# ``forge/docs/role_abstraction_design.md`` §4 for the tier roadmap.
+_ROLE_HARDWARE_TIERS: frozenset[str] = frozenset({"npu"})
+
+
+@dataclass
+class RoleConfig:
+    """Resource request for a single logical unit of work.
+
+    Deliberately small: a role is a *resource bucket*, nothing more.
+    Parallelism strategy (FSDP / TP / PP / DP) lives in the actor's
+    own workload config (``allocation_mode`` for the trainer,
+    ``engine_args.tensor_parallel_size`` for the generator, ...).
+    Actor-spawn code reads the workload config, derives
+    ``(procs, gpus_per_proc)``, and asks the provisioner for a
+    proc mesh sized against this role's ``devices`` budget.  The
+    runtime check is::
+
+        procs * gpus_per_proc <= role.devices
+
+    which fails fast at actor init with a clear error if the
+    workload config and the resource budget disagree.
+
+    Fields:
+        devices: Total number of accelerator cards this role needs.
+            The launcher reserves ``devices`` cards across one or
+            more hosts from the cluster pool.  Example: ``devices: 4``
+            + ``hardware: npu`` asks for 4 NPUs on a single host (or
+            spread across hosts with enough free NPUs if the pool
+            doesn't have a 4-card host).  ``0`` is legal for CPU-only
+            roles (tool server, replay buffer, ...).
+        hardware: Device tier.  Currently only ``"npu"`` is accepted;
+            see ``_ROLE_HARDWARE_TIERS`` for the rationale.
+        colocate: Name of another role this one must share host(s)
+            with.  The canonical use is ``storage.colocate: trainer``
+            so torchstore's HiXL put leg stays on-host (HCCS) with
+            the FSDP ranks it's reading from.  Launcher enforces by
+            pinning to the same host(s) chosen for ``colocate``'s
+            role after that role is scheduled.
+        host_idx: Explicit worker index into ``bare_metal.workers[]``.
+            Two legitimate uses:
+              * small clusters where you want explicit pins instead
+                of pool-scheduled placement (2-node dev setups);
+              * legacy ``meshes: {X: host_idx: N}`` YAMLs that the
+                R1.5 bridge auto-migrates.
+            ``None`` (the default) lets the pool scheduler pick.
+        extras: Free-form dict for workload-specific knobs that don't
+            fit in the resource-bucket abstraction (tool-server
+            ``timeout``, replay-buffer ``num_replicas``, ...).  The
+            launcher itself never reads ``extras``; downstream actor
+            code does.  This keeps ``RoleConfig`` small without
+            forcing every A2/A3 feature to bump the dataclass.
+
+    Intentionally *not* first-class fields (pushed to other layers):
+        - ``procs`` / ``gpus_per_proc``: derived from workload config
+          (``allocation_mode`` / ``tensor_parallel_size``) at
+          actor-spawn time, not declared per-role.
+        - ``node_selector`` / ``count`` / ``anti_colocate``: punted to
+          Phase R2 (or never, if the 9-node bare-metal topology
+          doesn't need them).  ``colocate`` is the one placement
+          constraint we actually use today (storage-next-to-trainer),
+          so it lives here.
+        - ``role_type`` / ``agent`` / ``workflow`` / ``tools``: mixed
+          "WHAT to run" with "WHERE to run".  If Phase A2 needs these
+          back they can land in ``extras`` or in a sibling top-level
+          block, but they don't belong in the resource schema.
+    """
+
+    devices: int = 0
+    hardware: str = "npu"
+    colocate: str | None = None
+    host_idx: int | None = None
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.devices < 0:
+            raise ValueError(
+                f"RoleConfig.devices must be >= 0, got {self.devices!r}. "
+                f"Use 0 for CPU-only roles or a positive integer for "
+                f"accelerator roles."
+            )
+        if self.hardware not in _ROLE_HARDWARE_TIERS:
+            accepted = ", ".join(sorted(_ROLE_HARDWARE_TIERS))
+            raise ValueError(
+                f"RoleConfig.hardware={self.hardware!r} is not supported "
+                f"in R1.5 (accepted: {{{accepted}}}).  CPU / GPU tiers "
+                f"arrive in Phase A2 once there's hardware to test them "
+                f"against; silently accepting the value now would let "
+                f"YAMLs pass that have no corresponding launcher path."
+            )
+
+
+_CORE_ROLE_FIELDS: frozenset[str] = frozenset(
+    {"devices", "hardware", "colocate", "host_idx", "extras"}
+)
+
+
+def _normalize_role(raw: Any) -> RoleConfig:
+    """Coerce a YAML-loaded dict (or existing ``RoleConfig``) into a
+    :class:`RoleConfig`.
+
+    Accepts legacy-nested shapes (``{"hardware": {"type": "npu"},
+    "placement": {"host_idx": 0}}``) and transparently flattens them
+    into the new flat schema.  Unknown keys are NOT an error -- they
+    flow into :attr:`RoleConfig.extras` so A2 workload knobs
+    (``num_replicas``, ``timeout``, ``tools``, ...) can be authored
+    alongside resource fields without bumping this dataclass on every
+    new feature.
+    """
+    if isinstance(raw, RoleConfig):
+        return raw
+    if not isinstance(raw, dict):
+        raise TypeError(
+            f"RoleConfig entry must be dict or RoleConfig, got "
+            f"{type(raw).__name__}: {raw!r}"
+        )
+
+    data = dict(raw)
+
+    # Flatten the short-lived nested R1 schema (``hardware`` /
+    # ``placement`` sub-blocks) into the new flat shape.  The nested
+    # schema only ever existed in the working tree; we migrate it
+    # transparently so any stale YAML that still uses it keeps
+    # working.
+    legacy_hw = data.pop("hardware", None)
+    if isinstance(legacy_hw, dict):
+        hw_type = legacy_hw.get("type")
+        if hw_type is not None:
+            data.setdefault("hardware", hw_type)
+    elif legacy_hw is not None:
+        data["hardware"] = legacy_hw
+
+    legacy_placement = data.pop("placement", None)
+    if isinstance(legacy_placement, dict):
+        if "host_idx" in legacy_placement:
+            data.setdefault("host_idx", legacy_placement["host_idx"])
+        if "colocate_with" in legacy_placement and "colocate" not in data:
+            data["colocate"] = legacy_placement["colocate_with"]
+
+    # Everything that's not a core field joins ``extras`` so the
+    # schema stays extensible for A2/A3 workload knobs
+    # (``num_replicas`` / ``timeout`` / ``tools`` / ...).  Caller-
+    # authored ``extras`` (if any) is merged on top so explicit
+    # ``extras.X`` wins over loose ``X`` of the same name.
+    extras: dict[str, Any] = {}
+    for key in list(data):
+        if key == "extras":
+            continue
+        if key not in _CORE_ROLE_FIELDS:
+            extras[key] = data.pop(key)
+    caller_extras = data.pop("extras", None) or {}
+    if isinstance(caller_extras, dict):
+        extras.update(caller_extras)
+
+    return RoleConfig(**data, extras=extras)
+
+
 @dataclass
 class LauncherConfig:
     """Cluster launcher configuration.
@@ -438,7 +621,7 @@ class LauncherConfig:
     # Opt-in during the migration window so existing CI and muscle
     # memory keep working.  Flip the default to ``"ssh_job"`` once a
     # few full training runs have come back clean.  See
-    # ``forge/docs/launcher_impl.md`` for the migration notes.
+    # ``forge/docs/weight_sync.md`` §8 for the migration notes.
     launcher_impl: str = "bash"
 
     # Explicit name -> placement map for launcher.get_host_mesh(name).
@@ -465,6 +648,22 @@ class LauncherConfig:
     # the wired-in default).
     weight_sync: WeightSyncBlock = field(default_factory=WeightSyncBlock)
 
+    # Role-driven placement schema (Phase R1).  When set, each entry
+    # is a :class:`RoleConfig` describing hardware, placement, and
+    # role-type metadata for a logical unit of work (trainer,
+    # generator, agent_runner, tool_server, ...).
+    #
+    # R1 behavior: ``__post_init__`` keeps ``roles`` and ``meshes`` in
+    # sync -- either one can be authored and the other is
+    # auto-populated.  Downstream consumers (``Provisioner``,
+    # ``BareMetalLauncher``) still read ``meshes``; the migration to
+    # reading ``roles`` directly happens in R2 alongside the placement
+    # scheduler.  This keeps R1 a pure schema change with zero runtime
+    # risk.  See ``forge/docs/role_abstraction_design.md`` §2 for the
+    # target schema and ``forge/docs/agentic_rl_architecture.md`` §3
+    # for the agentic-specific role types.
+    roles: dict[str, RoleConfig] = field(default_factory=dict)
+
     def __post_init__(self):
         if isinstance(self.launcher, str):
             self.launcher = Launcher(self.launcher)
@@ -480,6 +679,165 @@ class LauncherConfig:
                 else bcast_raw
             )
             self.weight_sync = WeightSyncBlock(bcast=bcast, **raw)
+
+        # Role normalization + legacy meshes bridge.  Do this after
+        # weight_sync normalization so downstream code can rely on
+        # ``self.roles`` being fully-typed.
+        if self.roles:
+            self.roles = {
+                name: _normalize_role(raw) for name, raw in dict(self.roles).items()
+            }
+        self._sync_roles_and_meshes()
+        self._normalize_weight_sync_role_refs()
+        self._validate_role_refs()
+
+    def _normalize_weight_sync_role_refs(self) -> None:
+        """Collapse the ``storage_mesh`` / ``storage_role`` deprecation
+        alias into a single canonical attribute.
+
+        R1.5 renamed ``storage_mesh`` -> ``storage_role`` because both
+        sides of the reference (the field itself, and the dict it
+        points into) are now ``roles``, not the legacy flat ``meshes``
+        dict.  We accept both names for one release window:
+
+        * ``storage_role`` alone (the new canonical): no-op.
+        * ``storage_mesh`` alone (legacy): copy to ``storage_role``,
+          warn once.
+        * Both set to identical values: copy, warn once (idempotent
+          YAML migration where someone kept both for safety).
+        * Both set to DIFFERENT values: hard error.  Ambiguous input
+          is worse than a broken config -- we'd rather fail at load
+          time than have the user wondering which one took effect.
+        """
+        ws = self.weight_sync
+        if ws is None or not isinstance(ws, WeightSyncBlock):
+            return
+        old, new = ws.storage_mesh, ws.storage_role
+        if old is None:
+            # User only set the new name (or neither).  No migration
+            # warning needed; still mirror new -> old so legacy
+            # readers that peek at ``storage_mesh`` see a value.
+            if new is not None:
+                ws.storage_mesh = new
+            return
+        if new is not None and new != old:
+            raise ValueError(
+                f"weight_sync.storage_mesh={old!r} conflicts with "
+                f"weight_sync.storage_role={new!r}.  Pick one.  "
+                f"(``storage_mesh`` is the deprecated alias; delete it "
+                f"and keep ``storage_role``.)"
+            )
+        # At this point the user authored ``storage_mesh`` (either
+        # alone, or alongside an identical ``storage_role``).  Either
+        # way, the deprecated name is in the YAML and the user
+        # deserves a warning.
+        import warnings
+        warnings.warn(
+            "weight_sync.storage_mesh is deprecated (R1.5); rename to "
+            "weight_sync.storage_role.  Both names point at the same "
+            "``launcher.roles.*`` entry; the rename reflects that the "
+            "dict being referenced is ``roles``, not the legacy "
+            "``meshes`` dict.  ``storage_mesh`` will be removed after "
+            "the next release.",
+            DeprecationWarning,
+            stacklevel=4,
+        )
+        if new is None:
+            ws.storage_role = old
+        # Keep both names pointing at the same value so legacy
+        # readers don't go stale.
+        ws.storage_mesh = ws.storage_role
+
+    def _validate_role_refs(self) -> None:
+        """Fail fast when a string-typed role reference names a role
+        that doesn't exist.
+
+        Today the only such reference is ``weight_sync.storage_role``,
+        but the pattern will recur (``transports:`` blocks in Phase R3,
+        for example), so we keep the validation generic.  We only
+        validate when ``self.roles`` is non-empty -- legacy YAMLs that
+        didn't declare any ``roles:`` block are allowed to use raw
+        ``meshes`` names, which the Provisioner will resolve against
+        ``meshes`` directly.
+        """
+        if not self.roles:
+            return
+        ws = self.weight_sync if isinstance(self.weight_sync, WeightSyncBlock) else None
+        if ws is None or not ws.storage_role:
+            return
+        # "trainer" is a sentinel default that every forge run has,
+        # even without an explicit ``roles.trainer`` entry -- it maps
+        # to the TrainerActor's mesh name and the reverse bridge will
+        # have synthesized it if the user didn't declare it.  So we
+        # only flag refs that name something *not* in ``roles`` and
+        # *not* in the legacy ``meshes`` dict.
+        ref = ws.storage_role
+        if ref not in self.roles and ref not in self.meshes:
+            available = sorted(set(self.roles) | set(self.meshes))
+            raise ValueError(
+                f"weight_sync.storage_role={ref!r} does not match any "
+                f"entry in launcher.roles or launcher.meshes.  "
+                f"Available: {available!r}.  (Check for typos -- this "
+                f"used to be a silent fallback that resolved to a "
+                f"default mesh; we now fail fast to surface config "
+                f"errors at YAML load time.)"
+            )
+
+    def _sync_roles_and_meshes(self) -> None:
+        """Keep ``roles`` and legacy ``meshes`` consistent in BOTH
+        directions, regardless of which side(s) the user authored.
+
+        Migration window contract (R1.5):
+
+        * Forward bridge (``roles`` -> ``meshes``): for any role whose
+          ``host_idx`` is set and whose name is NOT already present in
+          ``meshes``, write ``meshes[name] = {"host_idx": host_idx}``
+          so ``BareMetalLauncher.get_host_mesh(name)`` honors
+          role-authored placement without a second code path.  Roles
+          without ``host_idx`` (the common case once the pool
+          scheduler lands) skip this bridge -- the launcher reads
+          ``devices`` directly instead.
+        * Reverse bridge (``meshes`` -> ``roles``): for every entry in
+          ``meshes`` whose name is NOT already present in ``roles``,
+          synthesize a minimal :class:`RoleConfig(host_idx=N)` so new
+          code that iterates ``launcher.roles`` still sees legacy-only
+          meshes.
+
+        Conflict rule: entries present on BOTH sides are never
+        overwritten.  If the user authored ``roles.trainer.host_idx=0``
+        AND ``meshes.trainer=1``, the ``meshes`` value wins (that's
+        the hot data path for legacy code) and ``roles`` is left
+        alone.  Legitimate use case: a migration where an agent
+        injects ``roles`` entries alongside hand-written ``meshes``;
+        we refuse to guess which wins, we just trust what the user
+        wrote.
+        """
+        # Forward: roles -> meshes.  Only fills names NOT already in
+        # ``meshes``; this preserves the "user intent wins" rule.
+        for name, role in self.roles.items():
+            if name in self.meshes:
+                continue
+            if role.host_idx is None:
+                continue
+            self.meshes[name] = {"host_idx": int(role.host_idx)}
+
+        # Reverse: meshes -> roles.  Synthesize minimal entries so
+        # roles-aware code sees the full picture.
+        for name, placement in self.meshes.items():
+            if name in self.roles:
+                continue
+            host_idx: int | None
+            if isinstance(placement, int):
+                host_idx = placement
+            elif isinstance(placement, dict):
+                raw = placement.get("host_idx")
+                host_idx = int(raw) if raw is not None else None
+            else:
+                # Unknown shape (future launcher-specific dict).
+                # Skip role synthesis; Provisioner will surface any
+                # shape error at use time with a clearer message.
+                continue
+            self.roles[name] = RoleConfig(host_idx=host_idx)
 
 
 @dataclass

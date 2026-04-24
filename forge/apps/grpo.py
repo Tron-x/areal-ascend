@@ -240,11 +240,17 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
         npu_base_val: int | None = (
             None if npu_base_resolved < 0 else int(npu_base_resolved)
         )
+        # Prefer the new ``storage_role`` name; fall back to the
+        # legacy ``storage_mesh`` (LauncherConfig's __post_init__
+        # normalizes these but we still probe both to keep this
+        # codepath robust against in-flight refactors that might
+        # bypass the dataclass).
+        storage_ref = ws.storage_role or ws.storage_mesh
         storage_host_name = resolve_str(
-            yaml_value=ws.storage_mesh,
+            yaml_value=storage_ref,
             env_name="FORGE_STORAGE_HOST_MESH",
             default="trainer",
-            yaml_field_hint="launcher.weight_sync.storage_mesh",
+            yaml_field_hint="launcher.weight_sync.storage_role",
         )
         # Toggling "driver" vs "backend" storage spawn mode.  We model
         # this as a string enum in YAML but the legacy env var is

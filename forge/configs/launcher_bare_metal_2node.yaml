@@ -129,14 +129,17 @@ launcher:
     backend: torchstore_multi_vol
 
     # -- Storage placement --------------------------------------------
-    # storage_mesh: which entry in the ``meshes:`` map above should
-    # host the storage volumes.  "storage" is the conventional name.
+    # storage_role: which entry in the ``roles:`` map above (or legacy
+    # ``meshes:`` map, bridged via the R1.5 reverse sync) should host
+    # the storage volumes.  "storage" is the conventional name.
     # Set to "trainer" to colocate with the trainer host (saves a
     # cross-machine hop but puts torchstore's staging pool on the
-    # same NPU that FSDP is using).
-    storage_mesh: storage
+    # same NPU that FSDP is using).  Renamed from ``storage_mesh`` in
+    # R1.5 -- old name still works for one release window with a
+    # DeprecationWarning.
+    storage_role: storage
 
-    # storage_npu_base: first NPU id on ``storage_mesh``'s host that
+    # storage_npu_base: first NPU id on ``storage_role``'s host that
     # storage volumes bind to.  ``null`` = auto (uses
     # ``train_world_size`` as the offset so storage doesn't collide
     # with trainer's NPUs on a colocated host).  For dedicated

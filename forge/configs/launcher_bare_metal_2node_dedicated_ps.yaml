@@ -59,7 +59,7 @@ launcher:
   weight_sync:
     method: torchstore
     backend: torchstore_multi_vol
-    storage_mesh: storage
+    storage_role: storage
     storage_spawn_mode: driver
     pool_mb: 6144
     eager_d2h: false
