@@ -1,7 +1,12 @@
-# Launcher topology variant: "dedicated PS" on the non-trainer host.
+# Cluster preset: 2-bare-metal-node with storage on the non-trainer host.
 #
-# Difference from ``launcher_bare_metal_2node.yaml`` (the default
-# colocated layout):
+# INFRA-OWNED.  Reference from the algo YAML via
+# ``launcher_preset: 2node_dedicated_ps``.  Same wiring as
+# ``2node_colocated`` except the storage role lives next to the
+# generator instead of next to the trainer.
+#
+# Difference from ``2node_colocated.yaml`` (the default colocated
+# layout):
 #
 #   default: trainer + storage on the driver host (same box)
 #            generator on the non-driver host
@@ -22,6 +27,9 @@
 
 launcher:
   type: bare_metal
+
+  # See ``2node_colocated.yaml`` for the ``launcher_impl`` rationale.
+  launcher_impl: ssh_job
 
   # Cluster pool -- see ``cluster/monarch_2node.yaml`` for the
   # canonical definition.  Inlined here because the plain OmegaConf
@@ -77,9 +85,9 @@ launcher:
       colocate: trainer
 
   # Weight-sync block schema is identical to the colocated variant;
-  # see ``launcher_bare_metal_2node.yaml`` for the fully-commented
-  # field catalog.  This file only overrides what actually differs in
-  # the dedicated-PS topology (storage_npu_base).
+  # see ``2node_colocated.yaml`` for the fully-commented field
+  # catalog.  This file only overrides what actually differs in the
+  # dedicated-PS topology (storage_npu_base).
   weight_sync:
     method: torchstore
     backend: torchstore_multi_vol

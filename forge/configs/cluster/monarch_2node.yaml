@@ -6,10 +6,11 @@
 # (``defaults: [cluster/monarch_2node]``) or by inline copy-paste
 # under ``launcher.pool:`` -- both work.
 #
-# Contrast with experiment YAMLs (e.g. ``launcher_bare_metal_2node.yaml``)
-# which declare *how an algorithm wants to use the hardware*: device
-# counts per role, colocation constraints, parallelism strategy.  The
-# scheduler in ``LauncherConfig.__post_init__`` binds the two together.
+# Contrast with cluster presets (e.g. ``clusters/2node_colocated.yaml``)
+# and algorithm YAMLs (e.g. ``examples/math/gsm8k_grpo_npu.yaml``):
+# presets declare pool + role topology, algo YAMLs declare per-role
+# device counts.  The scheduler in ``LauncherConfig.__post_init__``
+# binds the two together.
 #
 # ``run_multinode.sh`` also reads this file -- the driver host is
 # whichever pool entry has ``role: driver`` (or ``pool[0]`` if none

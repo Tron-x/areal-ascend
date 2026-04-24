@@ -166,7 +166,7 @@ Files that need edits:
    env, for all user-visible knobs.
 1. `forge/scripts/run_multinode.sh` — becomes a thin wrapper that forwards argv to
    `forge launch` internally; eventually deleted once `forge launch` is mature.
-1. `forge/configs/launcher_bare_metal_2node*.yaml` — update example YAMLs to cover the
+1. `forge/configs/clusters/2node_*.yaml` — update example YAMLs to cover the
    full schema, with comments pointing to this doc.
 1. New file: `forge/cli/__init__.py` and `forge/cli/launch.py` (Python CLI) OR
    `forge/scripts/launch.sh` (bash wrapper). Language decision at implementation time

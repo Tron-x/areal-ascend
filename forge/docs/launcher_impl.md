@@ -15,7 +15,7 @@ doesn't use any of it**.
 ## TL;DR
 
 ```yaml
-# forge/configs/launcher_bare_metal_2node.yaml
+# forge/configs/clusters/2node_colocated.yaml
 launcher:
   launcher: bare_metal
   launcher_impl: ssh_job   # or "bash" (default, legacy)
@@ -150,7 +150,7 @@ The same helper is wired into `forge launch` as an opt-in step that
 runs AFTER pre-flight checks and BEFORE worker startup:
 
 ```bash
-python -m forge launch forge/configs/launcher_bare_metal_2node.yaml \
+python -m forge launch examples/math/gsm8k_grpo_npu.yaml \
     --launcher-impl ssh_job --sync
 ```
 

@@ -7,8 +7,7 @@ End-to-end: write this file once, reference it in YAML as
     reward: exact_match
 
     # forge launch:
-    python -m forge launch forge/configs/launcher_bare_metal_2node.yaml \\
-        --hostfile forge/configs/hostfile.txt \\
+    python -m forge launch examples/math/gsm8k_grpo_npu.yaml \\
         -- reward=exact_match  [...other overrides...]
 
 No editing any framework code.  No dotted import paths.  Just a

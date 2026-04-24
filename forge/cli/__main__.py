@@ -38,6 +38,21 @@ def main() -> int:
 
         return list_rewards_main(sub_argv)
 
+    if sub == "list-agents":
+        from forge.cli.list_agents import main as list_agents_main
+
+        return list_agents_main(sub_argv)
+
+    if sub == "list-workflows":
+        from forge.cli.list_workflows import main as list_workflows_main
+
+        return list_workflows_main(sub_argv)
+
+    if sub == "list-tools":
+        from forge.cli.list_tools import main as list_tools_main
+
+        return list_tools_main(sub_argv)
+
     print(f"forge: unknown subcommand {sub!r}", file=sys.stderr)
     _print_usage()
     return 2
@@ -48,9 +63,14 @@ def _print_usage() -> None:
         "Usage: python -m forge <subcommand> [args...]\n"
         "\n"
         "Subcommands:\n"
-        "  launch <config.yaml> [options]  Multi-node GRPO launch\n"
+        "  launch <algo-or-launcher.yaml> [options]\n"
+        "       Multi-node GRPO launch.  Positional YAML is either an\n"
+        "       algo YAML (with launcher_preset:) or a raw launcher YAML.\n"
         "  sync --hostfile HF [--path P ...] Push local source trees to every host\n"
         "  list-rewards                    Show registered reward functions\n"
+        "  list-agents                     Show registered agent classes\n"
+        "  list-workflows                  Show registered rollout workflows\n"
+        "  list-tools                      Show registered tool classes\n"
         "\n"
         "For subcommand options: python -m forge <subcommand> --help",
         file=sys.stderr,

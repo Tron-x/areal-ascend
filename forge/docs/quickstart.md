@@ -30,23 +30,49 @@ connect back to it.
 
 ## Step 2: Pick or customize a launcher YAML
 
-Start from the 2-node sample:
+AReaL uses a **two-layer YAML** split (see
+`forge/cli/presets.py`): infra/ops owns a *cluster preset* under
+`forge/configs/clusters/`, and the algo author sets `launcher_preset:`
++ per-role device counts in their experiment YAML.
+
+Built-in presets:
+
+* `forge/configs/clusters/2node_colocated.yaml` — 2-node NPU setup, storage on
+  the trainer host.
+* `forge/configs/clusters/2node_dedicated_ps.yaml` — 2-node NPU setup, storage
+  on the generator host (A/B topology).
+
+An experiment YAML references a preset with one line:
 
 ```yaml
-# forge/configs/launcher_bare_metal_2node.yaml  (excerpt)
+# examples/math/gsm8k_grpo_npu.yaml  (excerpt)
+launcher_preset: 2node_colocated
+
+roles:
+  trainer:   {devices: 4}
+  generator: {devices: 4}
+  storage:   {devices: 4}
+  reward:    {devices: 0}
+```
+
+The preset file itself holds the infra details (pool, colocate, weight-sync
+fabric):
+
+```yaml
+# forge/configs/clusters/2node_colocated.yaml  (excerpt)
 launcher:
   type: bare_metal
-  bare_metal:
-    workers:
-      - tcp://192.168.0.26:22222
-      - tcp://192.168.0.23:22222
-    master_addr: 192.168.0.23
-    worker_port: 22222
+  launcher_impl: ssh_job
 
-  meshes:
-    trainer:   { host_idx: 1 }   # colocated with the driver
-    generator: { host_idx: 0 }   # 1 NPU vLLM on the non-driver host
-    storage:   { host_idx: 1 }   # torchstore vols on the trainer host
+  pool:
+    - {host: 192.168.0.26, port: 22222, n_devices: 8}
+    - {host: 192.168.0.23, port: 22222, n_devices: 8, role: driver}
+
+  roles:
+    trainer:   {devices: 4, hardware: npu}
+    generator: {devices: 4, hardware: npu}
+    storage:   {devices: 4, hardware: npu, colocate: trainer}
+    reward:    {devices: 0, hardware: npu, colocate: trainer}
 
   weight_sync:
     method: torchstore            # use the WeightSyncService path
@@ -65,8 +91,7 @@ fields and the `yaml > env > default` precedence rule.
 One Python command — no env vars needed:
 
 ```bash
-python -m forge launch forge/configs/launcher_bare_metal_2node.yaml \
-    --hostfile forge/configs/hostfile.txt \
+python -m forge launch examples/math/gsm8k_grpo_npu.yaml \
     --steps 3 \
     --backend titan --model-name qwen3 --model-flavor 0.6B \
     --model /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B \
@@ -75,6 +100,12 @@ python -m forge launch forge/configs/launcher_bare_metal_2node.yaml \
     gconfig.max_new_tokens=128  gconfig.n_samples=2 \
     rollout.consumer_batch_size=8  rollout.max_concurrent_rollouts=8
 ```
+
+The positional arg is the **algorithm YAML** — `forge launch`
+auto-detects the `launcher_preset:` key, resolves the preset, merges
+the algo's role-device overrides, and writes a composed launcher YAML
+to `/tmp/forge_composed_*.yaml` before starting workers.  Pass a raw
+preset (`forge/configs/clusters/*.yaml`) for legacy / bring-up flows.
 
 What happens:
 
@@ -92,7 +123,8 @@ Expected output on success (Qwen3-0.6B, 3 steps, TP=1):
 
 ```
  forge launch: multi-node GRPO
-   launcher config : .../launcher_bare_metal_2node.yaml
+   launcher config : /tmp/forge_composed_*.yaml
+   algo config     : examples/math/gsm8k_grpo_npu.yaml
    driver host     : 192.168.0.23
    workers         : tcp://192.168.0.26:22222,tcp://192.168.0.23:22222
    steps           : 3
@@ -139,13 +171,14 @@ on one vol). Aggregate throughput ~32 GB/s on our 2-node RoCE setup.
 
 ### Dedicated-PS topology (storage on the non-trainer host)
 
-Use the alternate sample YAML:
+Flip the preset reference in your algo YAML:
 
-```bash
-python -m forge launch forge/configs/launcher_bare_metal_2node_dedicated_ps.yaml ...
+```yaml
+launcher_preset: 2node_dedicated_ps
 ```
 
-Same knobs; `storage.host_idx` flipped, `storage_npu_base: 4` set.
+Same role-device fields; the preset flips `storage.colocate` from
+`trainer` to `generator` and sets `storage_npu_base: 4`.
 
 ### Backwards compat: existing shell scripts still work
 

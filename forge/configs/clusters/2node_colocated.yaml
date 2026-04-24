@@ -1,23 +1,31 @@
-# Launcher topology for forge's 2-bare-metal-node GRPO run.
+# Cluster preset: 2-bare-metal-node colocated layout.
 #
-# ALGORITHM-OWNED.  This file declares *how the algorithm wants to
-# use the cluster*: per-role device counts, colocation constraints,
-# weight-sync policy.  The cluster itself (pool of machines) is
-# declared in ``cluster/monarch_2node.yaml`` and composed in via
-# Hydra's ``defaults:``.
+# INFRA-OWNED.  This file is a *cluster preset* referenced by the
+# algorithm YAML via ``launcher_preset: 2node_colocated``.  It
+# declares everything an algorithm engineer shouldn't have to care
+# about: which hosts exist (pool), which role lives next to which
+# (colocate), which worker lifecycle manager to use (launcher_impl),
+# and the weight-sync data-plane tuning.
 #
-# R1.5c mental model:
+# The algorithm YAML overrides ``roles.<name>.devices`` here when it
+# wants a different resource split -- every other field in this file
+# is purely an infra / ops decision.  See
+# ``forge/cli/presets.py::ALGO_OVERRIDE_WHITELIST`` for the exact
+# list of fields the algo YAML may touch.
 #
-#   cluster yaml   "what hardware exists"        -> launcher.pool[]
-#   experiment yaml (this file)  "how I want to use it"  -> launcher.roles[]
-#   scheduler      "bind them"                   -> host_idx per role
+# Two-layer mental model (2026-04 architecture review):
+#
+#   preset (this file)     "what hardware exists + where roles go"
+#   algo yaml              "how many cards each role needs"
+#   scheduler              "bind them"  -> host_idx per role
 #
 # Priority order for every field (highest wins):
 #
 #   1. CLI flags on ``python -m forge.apps.grpo``
 #   2. Environment variables (TORCHSTORE_MONARCH_RDMA_POOL_MB, etc.)
-#   3. YAML ``launcher:`` block below (or the composed cluster YAML)
-#   4. Python dataclass defaults in ``forge/core/types.py``
+#   3. Algo YAML top-level ``roles:`` overrides (devices / extras only)
+#   4. This preset's ``launcher:`` block
+#   5. Python dataclass defaults in ``forge/core/types.py``
 #
 # Legacy ``bare_metal.workers`` + ``meshes.<name>.host_idx`` still
 # work and are respected when authored explicitly -- that's the
@@ -27,6 +35,12 @@
 
 launcher:
   type: bare_metal
+
+  # Worker lifecycle manager.  ``ssh_job`` uses Monarch's native
+  # ForgeSSHJob wrapper (forward-compat with SlurmJob / K8sJob); the
+  # legacy ``bash`` path still works but is slower (60 s TCP poll).
+  # CLI ``--launcher-impl`` overrides this.
+  launcher_impl: ssh_job
 
   # Cluster pool -- infrastructure declaration.  Kept inline so the
   # plain OmegaConf loader in ``_load_yaml_launcher_block`` (no Hydra
@@ -71,9 +85,13 @@ launcher:
       devices: 4
       hardware: npu
 
-    # vLLM generator: TP=1 on 1 NPU on the non-driver host.
+    # vLLM generator: matches the default algo config
+    # ``allocation_mode: vllm:d4p1t1+d4p1t1`` -> 4 replicas x TP=1,
+    # which is 4 NPUs on the non-driver host.  Parallelism
+    # (replicas / TP) lives in the workload config, not here --
+    # this file only declares the device budget.
     generator:
-      devices: 1
+      devices: 4
       hardware: npu
 
     # Torchstore parameter server: 4 volumes on NPUs 4..7 of the
@@ -82,7 +100,7 @@ launcher:
     # ~200 Gb/s per NIC).  4 (trainer) + 4 (storage) = 8 = host
     # capacity; the scheduler will raise if we exceed it.  Flip
     # colocate to "generator" for the dedicated-PS topology
-    # (see ``launcher_bare_metal_2node_dedicated_ps.yaml``).
+    # (see ``2node_dedicated_ps.yaml``).
     storage:
       devices: 4
       hardware: npu

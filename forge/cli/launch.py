@@ -63,28 +63,43 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Extra args after `--` are forwarded verbatim to "
             "`python -m forge.apps.grpo` (OmegaConf overrides, etc.).\n\n"
-            "Example:\n"
+            "Preferred (two-layer YAML, algo author view):\n"
             "  python -m forge launch \\\n"
-            "      forge/configs/launcher_bare_metal_2node.yaml \\\n"
-            "      --steps 3 --model /path/to/model -- actor.path=/override\n"
+            "      examples/math/gsm8k_grpo_npu.yaml \\\n"
+            "      --steps 3 --model /path/to/snapshot\n"
+            "  (the algo YAML selects a cluster preset via\n"
+            "   `launcher_preset:` under forge/configs/clusters/)\n\n"
+            "Legacy one-layer (raw launcher YAML, for infra bring-up):\n"
+            "  python -m forge launch \\\n"
+            "      forge/configs/clusters/2node_colocated.yaml \\\n"
+            "      --algo-config examples/math/gsm8k_grpo_npu.yaml \\\n"
+            "      --steps 3 --model /path/to/snapshot\n"
         ),
     )
     p.add_argument(
         "config",
         help=(
-            "Launcher YAML (with optional top-level `allocation_mode` and "
-            "`launcher:` block). See forge/configs/launcher_*.yaml."
+            "Algorithm YAML with a top-level ``launcher_preset:`` key "
+            "(e.g. examples/math/gsm8k_grpo_npu.yaml) OR a raw launcher "
+            "YAML with a top-level ``launcher:`` block (e.g. "
+            "forge/configs/clusters/2node_colocated.yaml -- used for "
+            "bring-up / debugging a new cluster).  Auto-detected.  The "
+            "algo-YAML path is preferred for production runs because it "
+            "keeps infra-only fields (pool, colocate, ...) out of the "
+            "algorithm author's view."
         ),
     )
     p.add_argument(
         "--algo-config",
-        default=str(DEFAULT_ALGO_YAML),
+        default=None,
         help=(
-            "Algorithm-side YAML (gsm8k_grpo_npu.yaml et al).  Defaults to "
-            "examples/math/gsm8k_grpo_npu.yaml.  This is the file that holds "
-            "`allocation_mode`, rollout / trainer args, etc.  Will be merged "
-            "with --config by grpo.py's `--forge-config` glue until the two "
-            "YAMLs are unified."
+            "Override the algorithm-side YAML path.  In the new two-layer "
+            "mode this is usually unnecessary -- the positional `config` "
+            "is itself the algo YAML.  In legacy mode (positional `config` "
+            "is a raw launcher YAML), defaults to "
+            "examples/math/gsm8k_grpo_npu.yaml.  Always forwarded as "
+            "grpo.py's --config so it still carries allocation_mode / "
+            "reward / trainer settings."
         ),
     )
     p.add_argument(
@@ -332,8 +347,25 @@ def main(argv: list[str]) -> int:
 
     args = parser.parse_args(launch_argv)
 
-    config = Path(args.config).resolve()
-    algo_config = Path(args.algo_config).resolve()
+    positional = Path(args.config).resolve()
+
+    # Two-layer YAML auto-detect (see forge/cli/presets.py):
+    #
+    # - If the positional arg is an *algo* YAML -- it has a top-level
+    #   ``launcher_preset:`` key -- resolve the preset, compose the
+    #   algo's role-device overrides into it, write the result to a
+    #   temp YAML, and use that as the launcher config.  The original
+    #   positional arg doubles as --algo-config.
+    # - If the positional arg already has a ``launcher:`` block, it's
+    #   a raw launcher YAML (legacy / debugging).  Use it verbatim.
+    # - Anything else is an author error -- fail early with a pointer.
+    #
+    # This keeps algo authors off the infra-field surface (pool,
+    # colocate, weight_sync, ...) without breaking any existing
+    # operator / CI invocation that still passes a launcher YAML
+    # directly.
+    config, algo_config = _resolve_configs(positional, algo_override=args.algo_config)
+
     train_script = Path(args.train_script).resolve()
 
     hostfile = (
@@ -784,6 +816,117 @@ class _SSHJobFleet(_WorkerFleet):
             )
 
 
+def _resolve_configs(
+    positional: Path,
+    *,
+    algo_override: str | None,
+) -> tuple[Path, Path]:
+    """Split the positional YAML into ``(launcher_config, algo_config)``.
+
+    Supports three author patterns:
+
+    1. **Two-layer (preferred)**: positional is an algo YAML with a
+       top-level ``launcher_preset:`` key.  We resolve the preset
+       under ``forge/configs/clusters/``, merge the algo YAML's
+       top-level ``roles:`` devices overrides into the preset, write
+       the composed launcher block to a temp YAML, and return
+       ``(temp, positional)``.  ``--algo-config`` is ignored in this
+       mode -- the positional IS the algo config.
+    2. **Legacy one-layer**: positional is a raw launcher YAML with a
+       top-level ``launcher:`` block.  We return
+       ``(positional, --algo-config or DEFAULT_ALGO_YAML)`` so the
+       pre-R1.5 invocation continues to work.
+    3. **Author error**: neither key present -- raise with a pointer
+       to the two-layer doc.
+
+    The composed temp YAML is written to ``/tmp/forge_composed_*.yaml``
+    (deterministic per invocation; not reused across runs).  Leaving
+    it on disk on purpose -- when a run fails mid-start the operator
+    can inspect the exact composed config the launcher saw.
+    """
+    import tempfile
+
+    import yaml
+
+    try:
+        data = yaml.safe_load(positional.read_text()) or {}
+    except Exception as e:
+        print(
+            f"[launch] could not parse positional YAML {positional}: {e}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from e
+
+    # Legacy launcher YAML (debug path) -- positional already has a
+    # launcher: block.  Honor --algo-config if given, else fall back
+    # to the historical default.
+    if isinstance(data, dict) and "launcher" in data:
+        algo = (
+            Path(algo_override).resolve()
+            if algo_override is not None
+            else Path(DEFAULT_ALGO_YAML).resolve()
+        )
+        return positional, algo
+
+    # Two-layer mode -- compose preset + algo overrides into temp file.
+    if isinstance(data, dict) and "launcher_preset" in data:
+        from forge.cli.presets import (
+            PresetError,
+            compose_launcher_yaml,
+            resolve_cluster_preset,
+        )
+
+        preset_name = str(data["launcher_preset"])
+        try:
+            preset_path = resolve_cluster_preset(
+                preset_name, algo_yaml_dir=positional.parent
+            )
+            preset_data = yaml.safe_load(preset_path.read_text()) or {}
+
+            def _warn_escape_hatch(role: str, field: str, value: object) -> None:
+                print(
+                    f"[launch] NOTE: algo YAML overrides roles.{role}.{field}"
+                    f"={value!r} -- this is a placement field owned by the "
+                    f"cluster preset.  Prefer editing the preset directly "
+                    f"if this isn't a one-off experiment.",
+                    file=sys.stderr,
+                )
+
+            composed = compose_launcher_yaml(
+                data, preset_data, on_escape_hatch=_warn_escape_hatch
+            )
+        except PresetError as e:
+            print(f"[launch] preset composition failed: {e}", file=sys.stderr)
+            raise SystemExit(2) from e
+
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="forge_composed_", suffix=".yaml", dir="/tmp"
+        )
+        with os.fdopen(fd, "w") as fh:
+            fh.write(
+                "# Auto-generated by `forge launch` from:\n"
+                f"#   algo YAML : {positional}\n"
+                f"#   preset    : {preset_path}\n"
+                "# This file is overwritten on every launch; do not edit.\n"
+            )
+            yaml.safe_dump(composed, fh, sort_keys=False)
+        print(
+            f"[launch] composed launcher YAML from preset "
+            f"{preset_name!r} -> {tmp_path}",
+            flush=True,
+        )
+        return Path(tmp_path), positional
+
+    print(
+        f"[launch] {positional} has neither a top-level `launcher_preset:` "
+        f"(algo YAML) nor `launcher:` (raw launcher YAML).  See "
+        f"forge/docs/role_abstraction_design.md for the two-layer authoring "
+        f"guide.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
 def _read_launcher_impl_from_yaml(config_path: Path) -> str:
     """Parse ``launcher.launcher_impl`` out of the launcher YAML.
 
@@ -914,6 +1057,13 @@ def _run_driver_training(
         "conda activate monarch_ascend",
         "export VLLM_USE_MODELSCOPE=true",
         "export HF_ENDPOINT=https://hf-mirror.com",
+        # HuggingFace offline defaults (see provisioner_ssh._env_preamble
+        # for the full rationale).  Safe on air-gapped bare-metal
+        # clusters; override with HF_DATASETS_OFFLINE=0 in the operator
+        # shell when cache warmup is needed.
+        'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"',
+        'export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"',
+        'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"',
         "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
         'export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"',
         'export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"',

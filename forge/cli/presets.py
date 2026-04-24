@@ -6,7 +6,7 @@ multi-node GRPO run requires the operator to author two YAMLs:
 
 - **Algorithm YAML** (e.g. ``examples/math/gsm8k_grpo_npu.yaml``): reward
   / workflow / dataset / hyperparams.  Owned by the algorithm engineer.
-- **Launcher YAML** (e.g. ``forge/configs/launcher_bare_metal_2node.yaml``):
+- **Cluster preset** (e.g. ``forge/configs/clusters/2node_colocated.yaml``):
   ``pool`` / ``roles`` / ``weight_sync`` / ``launcher_impl``.  Owned by
   infra / ops.
 
@@ -236,7 +236,7 @@ def compose_launcher_yaml(
     """Build a single launcher YAML dict from algo overrides + preset.
 
     The returned dict is in the same shape as the legacy launcher YAML
-    (``launcher_bare_metal_2node.yaml``): a top-level ``launcher:`` block
+    (``clusters/2node_colocated.yaml``): a top-level ``launcher:`` block
     with ``pool``, ``roles``, ``weight_sync``, ``launcher_impl``, etc.
     This lets the existing :class:`LauncherConfig` consumer stay
     unchanged -- the composition is purely a pre-processing step.

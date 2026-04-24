@@ -7,10 +7,13 @@
 #   This script is now a *thin wrapper* around ``python -m forge launch``.
 #   New code paths should call ``python -m forge launch`` directly:
 #
-#       python -m forge launch forge/configs/launcher_bare_metal_2node.yaml \\
+#       python -m forge launch examples/math/gsm8k_grpo_npu.yaml \\
 #           --steps 3 --backend titan --model-name qwen3 --model-flavor 0.6B \\
 #           --model /path/to/model -- \\
 #           allocation_mode=vllm:d1p1t1+d4p1t1  gconfig.max_new_tokens=128
+#
+#   (the algo YAML picks a cluster preset under
+#   ``forge/configs/clusters/`` via its ``launcher_preset:`` key.)
 #
 #   The wrapper translates the historical CLI surface of this script
 #   (``--hostfile``, ``--model``, ``--steps``, ``--backend``, ...) and
@@ -52,7 +55,7 @@ MODEL_FLAVOR=""
 EXTRA_ARGS=()
 # FORGE_CONFIG overrides the YAML path (backward compat: same env name
 # as the pre-refactor script).
-FORGE_CONFIG_PATH="${FORGE_CONFIG:-forge/configs/launcher_bare_metal_2node.yaml}"
+FORGE_CONFIG_PATH="${FORGE_CONFIG:-forge/configs/clusters/2node_colocated.yaml}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

@@ -16,6 +16,43 @@ cluster:
 
 allocation_mode: vllm:d4p1t1+d4p1t1
 
+# ---------------------------------------------------------------------
+# Two-layer launch config -- see forge/docs/role_abstraction_design.md
+# and forge/cli/presets.py.
+#
+# ``launcher_preset`` picks an infra/ops preset under
+# ``forge/configs/clusters/`` (or a project-local ``clusters/*.yaml``
+# next to this file).  The preset owns: pool, colocation, launcher_impl,
+# weight_sync tuning.  This algo YAML only declares *how many cards*
+# each role wants; placement and fabric choices stay in the preset.
+#
+# To run:
+#   python -m forge launch examples/math/gsm8k_grpo_npu.yaml \
+#       --steps 2 --model /local/snapshot/path
+#
+# To switch topology (e.g. dedicated PS on the non-trainer host):
+#   launcher_preset: 2node_dedicated_ps
+#
+# To run on a different cluster, author a new preset under
+# ``forge/configs/clusters/<name>.yaml`` and point this field at it.
+# ---------------------------------------------------------------------
+launcher_preset: 2node_colocated
+
+# Per-role resource requests.  Only ``devices`` / ``extras`` may be
+# overridden from this file -- placement fields (colocate, host_idx,
+# hardware) belong to the preset and the composer rejects them here.
+# See ``forge/cli/presets.py::ALGO_OVERRIDE_WHITELIST``.
+#
+# The numbers below MUST match what the workload actually consumes:
+# trainer 4 == FSDP dp=4 tp=1 implied by allocation_mode above;
+# generator 4 == vllm:d4p1t1 (4 TP=1 replicas); storage 4 == torchstore
+# volumes per trainer shard; reward 0 == CPU sidecar.
+roles:
+  trainer:   {devices: 4}
+  generator: {devices: 4}
+  storage:   {devices: 4}
+  reward:    {devices: 0}
+
 # Reward function short name (preferred, registered via
 # @register_reward("xxx") in forge.reward.* / areal.reward.*).
 # Empty string falls back to reward_fn_path below.

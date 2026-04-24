@@ -209,7 +209,7 @@ Two YAML layouts tested side-by-side with everything else constant:
 At 1.4 GiB the bottleneck is torchstore/HiXL fixed setup, not the bytes-in-flight leg.
 Larger models (Qwen3-7B = ~15 GiB) should start to show an asymmetry and that's when the
 knob becomes interesting. Flipping layout is one line in
-`forge/configs/launcher_bare_metal_2node[_dedicated_ps].yaml`:
+`forge/configs/clusters/2node_{colocated,dedicated_ps}.yaml`:
 
 ```yaml
 meshes:
@@ -243,7 +243,7 @@ mesh to the backend.
 
 ### 5.3 Launcher YAML (commit `317e5cc5`)
 
-`forge/configs/launcher_bare_metal_2node.yaml` is the canonical topology description:
+`forge/configs/clusters/2node_colocated.yaml` is the canonical topology description:
 
 ```yaml
 launcher:
