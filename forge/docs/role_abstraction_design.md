@@ -1,7 +1,7 @@
 # Role Abstraction — Design Note
 
-**Status**: partially shipped in R1.5 (a/b/c). The aspirational schema in §2 below
-is the long-term north star; §2b records what actually landed.
+**Status**: partially shipped in R1.5 (a/b/c). The aspirational schema in §2 below is
+the long-term north star; §2b records what actually landed.
 
 **Context**: forge today can place `trainer` / `generator` / `storage` on specific hosts
 via `launcher.meshes.<name>.host_idx`. That's enough for the 2-node GRPO smoke and the
@@ -10,29 +10,28 @@ primitive** where arbitrary roles (Reward Model, Experience Buffer, Data Pipelin
 future components) run on arbitrary (possibly heterogeneous) hardware, each
 independently scalable, connected by **explicit transports**.
 
-This doc captures the design we agreed on. The R1.5 shipped subset is documented in
-§2b; the aspirational schema in §2 stays as the direction of travel.
+This doc captures the design we agreed on. The R1.5 shipped subset is documented in §2b;
+the aspirational schema in §2 stays as the direction of travel.
 
 ## R1.5 delta (what actually shipped, 2026-04)
 
 The delivered schema is intentionally flatter than the original §2 sketch. Three
 hand-offs, one per sub-phase:
 
-* **R1.5a** — introduce `RoleConfig { devices, hardware, colocate, host_idx, extras }`
-  as a peer of the legacy `meshes` map; `__post_init__` keeps them in sync (either
-  one can be authored). Renamed `weight_sync.storage_mesh` → `storage_role`; legacy
-  name still works with a `DeprecationWarning`.
-* **R1.5b** — `ForgeActor.launch` defaults `hosts=1` when a remote launcher is active,
+- **R1.5a** — introduce `RoleConfig { devices, hardware, colocate, host_idx, extras }`
+  as a peer of the legacy `meshes` map; `__post_init__` keeps them in sync (either one
+  can be authored). Renamed `weight_sync.storage_mesh` → `storage_role`; legacy name
+  still works with a `DeprecationWarning`.
+- **R1.5b** — `ForgeActor.launch` defaults `hosts=1` when a remote launcher is active,
   so trainer / reward actors go through `get_host_mesh(name)` instead of implicit
   `this_host()`. This decouples driver placement from any specific actor role.
-* **R1.5c** — add `launcher.pool: [PoolHost]` as the infrastructure-owned cluster
-  pool (hosts + port + device count + optional `role: driver` tag). A greedy
-  scheduler inside `LauncherConfig.__post_init__` binds `roles` (device counts,
-  colocate constraints) to `pool` entries, auto-populating `workers` and
-  `meshes.<name>.host_idx`. `forge launch` prefers `launcher.pool` over
-  `--hostfile` when both are authored; in pool-only mode, it materializes a temp
-  hostfile from the pool so the downstream bash fleet / ssh_job fleet keep working
-  unchanged.
+- **R1.5c** — add `launcher.pool: [PoolHost]` as the infrastructure-owned cluster pool
+  (hosts + port + device count + optional `role: driver` tag). A greedy scheduler inside
+  `LauncherConfig.__post_init__` binds `roles` (device counts, colocate constraints) to
+  `pool` entries, auto-populating `workers` and `meshes.<name>.host_idx`. `forge launch`
+  prefers `launcher.pool` over `--hostfile` when both are authored; in pool-only mode,
+  it materializes a temp hostfile from the pool so the downstream bash fleet / ssh_job
+  fleet keep working unchanged.
 
 ### §2b Shipped YAML schema (R1.5c)
 
@@ -55,7 +54,7 @@ launcher:
   # ALGORITHM-OWNED: how this experiment wants to use the cluster.
   roles:
     trainer:
-      devices: 8              # accelerator card count
+      devices: 4              # accelerator cards this role occupies
       hardware: npu
     generator:
       devices: 1
@@ -63,9 +62,9 @@ launcher:
     storage:
       devices: 4
       hardware: npu
-      colocate: trainer       # pin to trainer's host
+      colocate: trainer       # pin host AND debit 4 more from it
     reward:
-      devices: 0              # CPU-only
+      devices: 0              # CPU-only sidecar
       hardware: npu
       colocate: trainer
 
@@ -78,18 +77,45 @@ Parallelism strategy (FSDP dp/tp, vLLM TP) stays in the workload config -- it's
 deliberately NOT part of `roles[]`, since algorithm authors want to swap TP sizes
 independently of resource allocation.
 
+### §2c Device semantics (strict, post-2026-04)
+
+`devices` has exactly one meaning: **the number of accelerator cards this role
+independently occupies on its host**. There is no "shared budget" interpretation.
+
+`colocate: X` pins the host to match `X`'s host *and* debits `devices` from that host's
+free-device budget just like any independent placement. In the YAML above, the trainer's
+host must provide `trainer.devices + storage.devices + reward.devices = 4 + 4 + 0 = 8`
+cards. The scheduler validates this at schedule time and raises `ValueError` with a
+per-host breakdown if any host overflows.
+
+Consequences:
+
+- **No silent oversubscription.** Before R1.5c's strict mode, `trainer.devices: 8`
+  - `storage.devices: 4, colocate: trainer` would land both on an 8-card host and rely
+    on application-level NPU offsets (e.g. `weight_sync.storage_npu_base`) to avoid
+    collisions. That worked in the happy path and broke loudly (OOM / HCCL hang) when it
+    didn't. The strict rule forces the real card split into the YAML where operators can
+    see it.
+- **CPU sidecars** (reward eval, tool server, ...) use `devices: 0` to ride a colocate
+  without spending accelerator budget. The debit becomes a no-op; only `host_idx` is
+  pinned.
+- **Scheduler is anchor-aware.** At pass 1 the scheduler sorts independents by their
+  *effective footprint* (own devices + the sum of every colocate dependent, walking the
+  chain transitively), so a smaller independent can't steal a slot that a bigger
+  colocate stack needs. The full footprint is reserved up front on the chosen host; pass
+  2 then places dependents without re-debiting.
+
 ### Legacy escape hatches still work
 
 Every old YAML keeps working during the migration window:
 
-* `bare_metal.workers` + `meshes.<name>.host_idx` — hand-authored placement.
-  `LauncherConfig.__post_init__` leaves both intact and the scheduler is a no-op
-  when `pool` is empty.
-* `weight_sync.storage_mesh` — alias for `storage_role`; emits
-  `DeprecationWarning`.
-* `--hostfile` in `forge launch` — when no `launcher.pool` exists in the YAML,
-  `forge launch` falls back to the legacy hostfile path with the same
-  "second non-empty line = driver" heuristic.
+- `bare_metal.workers` + `meshes.<name>.host_idx` — hand-authored placement.
+  `LauncherConfig.__post_init__` leaves both intact and the scheduler is a no-op when
+  `pool` is empty.
+- `weight_sync.storage_mesh` — alias for `storage_role`; emits `DeprecationWarning`.
+- `--hostfile` in `forge launch` — when no `launcher.pool` exists in the YAML,
+  `forge launch` falls back to the legacy hostfile path with the same "second non-empty
+  line = driver" heuristic.
 
 ______________________________________________________________________
 

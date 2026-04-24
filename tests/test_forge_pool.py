@@ -131,9 +131,9 @@ class TestGreedyScheduler:
 
     def test_colocate_follows_anchor(self):
         """``storage.colocate: trainer`` lands on the same host as
-        trainer, no extra devices deducted from storage's perspective
-        (colocate is an assertion that the two roles share budget).
-        Generator (8 devices) needs the full non-driver host."""
+        trainer.  Under strict device semantics the colocated role's
+        ``devices`` IS debited from the anchor host's budget
+        (trainer=4 + storage=4 = 8, which fits the 8-NPU host)."""
         pool = self._two_node_8npu_pool()  # host 1 is driver
         roles = {
             "trainer": RoleConfig(devices=4),
@@ -142,11 +142,56 @@ class TestGreedyScheduler:
         }
         assignment = schedule_roles_on_pool(roles, pool)
         # generator (8 devices) goes first and takes the driver host;
-        # trainer (4 devices) then takes the non-driver host; storage
-        # follows trainer.
+        # trainer (4) then takes the non-driver host; storage (4)
+        # follows trainer -- non-driver host ends at 0 free.
         assert assignment["generator"] == 1
         assert assignment["trainer"] == 0
         assert assignment["storage"] == 0
+
+    def test_colocate_cpu_sidecar_skips_debit(self):
+        """``devices: 0`` lets a CPU-only sidecar (reward eval, tool
+        server, ...) ride the colocate without consuming accelerator
+        budget."""
+        pool = self._two_node_8npu_pool()
+        roles = {
+            "trainer": RoleConfig(devices=8),
+            "reward": RoleConfig(devices=0, colocate="trainer"),
+        }
+        assignment = schedule_roles_on_pool(roles, pool)
+        # trainer fills the driver host; reward colocates with 0
+        # debit (otherwise the 8+0 wouldn't overflow anyway, but
+        # this verifies the no-op debit path).
+        assert assignment["trainer"] == assignment["reward"]
+
+    def test_colocate_overflow_raises(self):
+        """Strict semantics: colocate + devices > anchor host free
+        is a hard error, not a silent oversubscription.  The
+        effective-footprint pass (1) catches this at scheduling
+        time, not at dependent-placement time."""
+        pool = self._two_node_8npu_pool()
+        roles = {
+            "trainer": RoleConfig(devices=8),  # alone fills the host
+            "storage": RoleConfig(devices=4, colocate="trainer"),
+        }
+        # trainer's effective footprint is 8+4=12, no 12-device host.
+        with pytest.raises(ValueError, match="needs 12 'npu' device"):
+            schedule_roles_on_pool(roles, pool)
+
+    def test_colocate_pass2_overflow_with_legacy_pin(self):
+        """Legacy ``host_idx`` pinning skips the effective-footprint
+        check at pass 1 because the anchor is pre-placed.  Verify
+        pass 2's own overflow check still fires -- the contract is
+        "no silent oversubscription" regardless of which path the
+        role takes."""
+        pool = self._two_node_8npu_pool()
+        roles = {
+            # Legacy pin: trainer explicitly on host 0, consuming all 8.
+            "trainer": RoleConfig(devices=8, host_idx=0),
+            # Colocate a dependent that can't fit there.
+            "storage": RoleConfig(devices=4, colocate="trainer"),
+        }
+        with pytest.raises(ValueError, match="colocates with 'trainer'"):
+            schedule_roles_on_pool(roles, pool)
 
     def test_legacy_host_idx_is_honored(self):
         """Explicit pins win over greedy.  Budget is debited so
@@ -239,22 +284,24 @@ class TestLauncherConfigPoolIntegration:
     def test_pool_with_roles_populates_meshes(self):
         """End-to-end: declare a pool + roles, the scheduler + bridge
         work together to produce a ``meshes`` dict that the
-        provisioner understands."""
+        provisioner understands.  Under strict device semantics
+        the colocated ``storage`` also consumes accelerator budget
+        on the anchor host, so the YAML must declare real (non-
+        overlapping) card counts."""
         cfg = LauncherConfig(
             pool=[
                 {"host": "h1", "n_devices": 8},
                 {"host": "h2", "n_devices": 8},
             ],
             roles={
-                "trainer": {"devices": 8},
+                "trainer": {"devices": 4},
                 "generator": {"devices": 8},
                 "storage": {"devices": 4, "colocate": "trainer"},
             },
         )
         # No host tagged driver -> defaults to pool[0]=h1.  Driver-
-        # first scan + alphabetical tie-break on 8-device roles puts
-        # generator on h1 (driver) and trainer on h2.  Storage
-        # colocates with trainer on h2.
+        # first scan places generator (8 devices) on h1 first, then
+        # trainer (4) on h2, and storage (4) colocates with trainer.
         assert cfg.meshes["generator"] == {"host_idx": 0}
         assert cfg.meshes["trainer"] == {"host_idx": 1}
         assert cfg.meshes["storage"] == {"host_idx": 1}

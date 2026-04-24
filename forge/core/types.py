@@ -624,9 +624,7 @@ class PoolHost:
         if not self.host:
             raise ValueError("PoolHost.host must be a non-empty string")
         if self.n_devices < 0:
-            raise ValueError(
-                f"PoolHost.n_devices must be >= 0, got {self.n_devices!r}"
-            )
+            raise ValueError(f"PoolHost.n_devices must be >= 0, got {self.n_devices!r}")
         if self.role is not None and self.role not in {"driver"}:
             raise ValueError(
                 f"PoolHost.role={self.role!r} is not a recognized tag "
@@ -646,8 +644,7 @@ def _normalize_pool(raw: Any) -> list[PoolHost]:
         return []
     if not isinstance(raw, (list, tuple)):
         raise TypeError(
-            f"launcher.pool must be a list of hosts, got "
-            f"{type(raw).__name__}: {raw!r}"
+            f"launcher.pool must be a list of hosts, got {type(raw).__name__}: {raw!r}"
         )
     out: list[PoolHost] = []
     for i, entry in enumerate(raw):
@@ -680,13 +677,13 @@ def schedule_roles_on_pool(
     3. Walk the sorted list.  For each role, scan the pool in order
        and pick the first host with ``free_devices >= role.devices``.
        Decrement ``free_devices`` on that host by ``role.devices``.
-    4. Place colocate dependents onto their anchor's host (without
-       further device checks -- colocation is the user's assertion
-       that the two roles can share the host; we trust it).  The
-       canonical use is ``storage.colocate: trainer``, where storage
-       binds to the trainer's spare NPUs rather than requesting its
-       own cards on top.  Honoring it as a raw alias keeps the
-       scheduler from double-counting shared device budgets.
+    4. Place colocate dependents onto their anchor's host.  Device
+       budget is ALSO debited from the anchor host -- ``devices``
+       always means "cards this role independently occupies".  For
+       CPU-only sidecars (reward eval, tool servers, ...) set
+       ``devices: 0`` to skip the debit while still pinning to the
+       anchor's host.  The scheduler raises if the anchor host
+       can't fit the dependent's request.
     5. Any role whose ``host_idx`` is already set (legacy pin) is
        preserved; the scheduler respects existing assignments and
        deducts from the target host's free budget accordingly.
@@ -695,6 +692,14 @@ def schedule_roles_on_pool(
     includes which role, what it wanted, and what capacity remained
     across the pool, so operators can edit either the ``roles`` or
     ``pool`` YAML and try again.
+
+    **Semantic contract**: ``devices`` is the count of accelerator
+    cards the role INDEPENDENTLY occupies.  ``colocate`` only affects
+    host placement -- the device budget is always accounted for.
+    This is stricter than the pre-R1.5c behavior (which treated
+    colocate as "share the host AND the device budget"); the strict
+    semantics prevent silent NPU oversubscription and force
+    operators to write the real card split in YAML.
     """
     if not pool:
         return {}
@@ -702,7 +707,13 @@ def schedule_roles_on_pool(
     free_by_host: list[int] = [h.n_devices for h in pool]
     assignment: dict[str, int] = {}
 
-    # Pass 0: legacy explicit pins win.  Debit their budget up front.
+    # Pass 0: legacy explicit pins win.  Debit only the role's OWN
+    # devices here -- dependents (roles with ``colocate`` pointing
+    # at this one) haven't been processed yet, and pass 2 does its
+    # own debit+check for them.  This is the only asymmetry with
+    # pass 1 (which reserves the full effective footprint) and is
+    # why pass 2 keeps a live capacity check for legacy-pinned
+    # anchors.
     for name, role in roles.items():
         if role.host_idx is None:
             continue
@@ -721,13 +732,49 @@ def schedule_roles_on_pool(
         free_by_host[idx] -= role.devices
         assignment[name] = idx
 
-    # Pass 1: independents, largest first.
+    # Track which anchors had their full effective footprint
+    # reserved in pass 1 (vs. pass-0-pinned anchors where we still
+    # need to debit per-dependent in pass 2).
+    reserved_anchors: set[str] = set()
+
+    # Effective footprint: each independent role's own devices plus
+    # every colocate dependent (transitive) that will land on the
+    # same host.  The scheduler sorts by this larger number so an
+    # anchor that will have dependents stacked on it gets first
+    # pick on a host that can fit the whole stack.  Without this,
+    # independent placement is myopic: ``trainer.devices=4`` would
+    # pick the driver host even if ``storage.devices=4,
+    # colocate: trainer`` is about to overflow it.
+    def _walk_to_root(name: str) -> str | None:
+        """Follow colocate chain up to the independent root."""
+        seen: set[str] = set()
+        cur = name
+        while cur in roles and roles[cur].colocate is not None:
+            if cur in seen:
+                return None  # Cycle; pass 2 will report it.
+            seen.add(cur)
+            cur = roles[cur].colocate  # type: ignore[assignment]
+        return cur if cur in roles else None
+
+    effective: dict[str, int] = {
+        name: role.devices
+        for name, role in roles.items()
+        if role.colocate is None and role.host_idx is None
+    }
+    for name, role in roles.items():
+        if role.colocate is None or role.host_idx is not None:
+            continue
+        root = _walk_to_root(name)
+        if root is not None and root in effective:
+            effective[root] += role.devices
+
+    # Pass 1: independents, largest effective footprint first.
     independents = [
         (name, role)
         for name, role in roles.items()
         if role.colocate is None and role.host_idx is None
     ]
-    independents.sort(key=lambda kv: (-kv[1].devices, kv[0]))
+    independents.sort(key=lambda kv: (-effective[kv[0]], kv[0]))
 
     # Scan order prefers the driver host -- RL convention places the
     # "primary" consumer (usually the trainer) on the same host as
@@ -741,30 +788,39 @@ def schedule_roles_on_pool(
         driver_first_order.append(drv)
     except ValueError:
         drv = None  # Empty pool was handled above; this path is
-                    # unreachable but kept for defensive clarity.
+        # unreachable but kept for defensive clarity.
     for idx in range(len(pool)):
         if idx != drv:
             driver_first_order.append(idx)
 
     for name, role in independents:
+        needed = effective[name]  # own + colocate dependents
         chosen: int | None = None
         for idx in driver_first_order:
             host = pool[idx]
             if host.hardware != role.hardware:
                 continue
-            if free_by_host[idx] < role.devices:
+            if free_by_host[idx] < needed:
                 continue
             chosen = idx
             break
         if chosen is None:
             raise ValueError(
-                f"role {name!r} asks for {role.devices} {role.hardware!r} "
-                f"device(s) but no pool host has that much free.  "
-                f"Free devices per host: "
+                f"role {name!r} needs {needed} {role.hardware!r} "
+                f"device(s) (own={role.devices}, colocate dependents="
+                f"{needed - role.devices}) but no pool host has that "
+                f"much free.  Free devices per host: "
                 f"{list(zip([h.host for h in pool], free_by_host))}"
             )
-        free_by_host[chosen] -= role.devices
+        # Reserve the full effective footprint up-front so a smaller
+        # independent placed next can't steal budget earmarked for
+        # this role's colocate chain.  Pass 2 therefore does NOT
+        # re-debit for dependents whose root anchor is in
+        # ``reserved_anchors`` -- the budget is already accounted
+        # for here.
+        free_by_host[chosen] -= needed
         assignment[name] = chosen
+        reserved_anchors.add(name)
 
     # Pass 2: colocate dependents.
     dependents = [
@@ -772,10 +828,24 @@ def schedule_roles_on_pool(
         for name, role in roles.items()
         if role.colocate is not None and name not in assignment
     ]
+
     # Resolve in topologically-safe order: if A colocates with B and
     # B colocates with C, A waits until B is placed.  A single pass
     # with a fixed-point check is enough for the small graphs we
     # support (<= 10 roles in practice).
+    # Walk the colocate chain from ``name`` up to find the
+    # independent root anchor.  Used to decide whether pass 1
+    # already reserved the dependent's devices.
+    def _chain_root(name: str) -> str | None:
+        seen: set[str] = set()
+        cur: str | None = name
+        while cur is not None and cur in roles and roles[cur].colocate is not None:
+            if cur in seen:
+                return None
+            seen.add(cur)
+            cur = roles[cur].colocate
+        return cur
+
     progress = True
     while dependents and progress:
         progress = False
@@ -784,7 +854,28 @@ def schedule_roles_on_pool(
             anchor = role.colocate
             if anchor not in assignment:
                 continue
-            assignment[name] = assignment[anchor]
+            anchor_host = assignment[anchor]
+            # If the chain's root was placed in pass 1 we already
+            # reserved the full footprint there; skip the debit to
+            # avoid double-counting.  Legacy-pinned anchors (pass 0)
+            # only debited their own cards so dependents still need
+            # a live check + debit.
+            root = _chain_root(name)
+            already_reserved = root is not None and root in reserved_anchors
+            if not already_reserved:
+                if role.devices > free_by_host[anchor_host]:
+                    raise ValueError(
+                        f"role {name!r} colocates with {anchor!r} on host "
+                        f"{anchor_host} ({pool[anchor_host].host}) and asks "
+                        f"for {role.devices} {role.hardware!r} device(s), "
+                        f"but only {free_by_host[anchor_host]} remain free "
+                        f"on that host after placing {anchor!r}.  Either "
+                        f"lower devices on one of the colocated roles, "
+                        f"drop the colocate, or move to a pool host with "
+                        f"more accelerator cards."
+                    )
+                free_by_host[anchor_host] -= role.devices
+            assignment[name] = anchor_host
             dependents.remove(pair)
             progress = True
     if dependents:
@@ -978,6 +1069,7 @@ class LauncherConfig:
             return
         if len(self.workers) != len(self.pool):
             import warnings
+
             warnings.warn(
                 f"launcher.workers ({len(self.workers)} entries) and "
                 f"launcher.pool ({len(self.pool)} entries) disagree; "
@@ -1068,6 +1160,7 @@ class LauncherConfig:
         # way, the deprecated name is in the YAML and the user
         # deserves a warning.
         import warnings
+
         warnings.warn(
             "weight_sync.storage_mesh is deprecated (R1.5); rename to "
             "weight_sync.storage_role.  Both names point at the same "

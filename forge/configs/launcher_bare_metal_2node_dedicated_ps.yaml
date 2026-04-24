@@ -41,9 +41,21 @@ launcher:
   # Same role declarations as the colocated variant, except
   # ``storage.colocate`` flips from ``trainer`` to ``generator`` --
   # that's the entire topology difference.
+  #
+  # Scheduler (greedy, biggest-effective-footprint first):
+  #   generator+storage = 1+4 = 5 effective -> driver host first
+  #   trainer+reward    = 4+0 = 4 effective -> non-driver host
+  #
+  # Net layout (both hosts have n_devices=8; scheduler validates):
+  #   driver host: generator(1) + storage(4) = 5
+  #   non-driver:  trainer(4)   + reward(0)  = 4
+  # ``put``  (trainer -> storage) crosses RoCE (~200 Gb/s per NIC).
+  # ``pull`` (storage -> generator) stays intra-host on HCCS.
+  # This flips the traffic pattern of the colocated variant -- pick
+  # whichever side (put vs pull) you want on the fast fabric.
   roles:
     trainer:
-      devices: 8
+      devices: 4
       hardware: npu
 
     generator:
@@ -52,7 +64,8 @@ launcher:
 
     # The only meaningful change vs the colocated YAML: storage
     # colocates with generator instead of trainer, so the PS lands
-    # on the non-trainer host.
+    # on the non-trainer host.  ``put`` now crosses RoCE; ``pull``
+    # stays intra-host HCCS.
     storage:
       devices: 4
       hardware: npu

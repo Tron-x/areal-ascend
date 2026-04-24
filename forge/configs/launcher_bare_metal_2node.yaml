@@ -57,31 +57,40 @@ launcher:
   #   host_idx  : legacy escape hatch -- override scheduler with an
   #               explicit pool index.  Prefer ``colocate:``.
   roles:
-    # FSDP trainer: uses all 8 NPUs on its host (dp=8, tp=1).
+    # Semantic contract: ``devices`` is the accelerator count THIS
+    # role independently occupies on its host.  ``colocate`` pins the
+    # host but does NOT share device budget -- colocated roles stack
+    # their devices on the anchor's host, and the scheduler
+    # validates the sum against ``pool[i].n_devices``.
+
+    # FSDP trainer: uses 4 NPUs (0..3 by default) for dp=4 tp=1.
+    # Parallelism strategy (dp/tp) lives in the workload config,
+    # but the resource count here MUST match what the workload
+    # actually consumes -- the scheduler uses it for budgeting.
     trainer:
-      devices: 8
+      devices: 4
       hardware: npu
 
-    # vLLM generator: TP=1 on 1 NPU on the other host.  Parallelism
-    # strategy (TP size, num_replicas, ...) is set in the workload
-    # YAML, not here.
+    # vLLM generator: TP=1 on 1 NPU on the non-driver host.
     generator:
       devices: 1
       hardware: npu
 
-    # Torchstore parameter server: 4 volumes colocated on the trainer
-    # host.  ``put`` traffic stays intra-host (HCCS), ``pull`` goes
-    # cross-machine (RoCE, ~200 Gb/s per NIC).  Flip colocate to
-    # "generator" for the "dedicated PS on generator host" topology
+    # Torchstore parameter server: 4 volumes on NPUs 4..7 of the
+    # trainer's host, colocated so ``put`` traffic stays intra-host
+    # (HCCS) and only ``pull`` crosses the network (RoCE,
+    # ~200 Gb/s per NIC).  4 (trainer) + 4 (storage) = 8 = host
+    # capacity; the scheduler will raise if we exceed it.  Flip
+    # colocate to "generator" for the dedicated-PS topology
     # (see ``launcher_bare_metal_2node_dedicated_ps.yaml``).
     storage:
       devices: 4
       hardware: npu
       colocate: trainer
 
-    # Reward evaluator: 1 CPU proc pinned next to the trainer so it
-    # doesn't contend with generator's NPUs.  ``devices: 0`` keeps
-    # it off the accelerator.
+    # Reward evaluator: CPU-only sidecar, pinned next to trainer
+    # for cheap local RPC.  ``devices: 0`` skips the budget debit
+    # but still binds host_idx to trainer's host.
     reward:
       devices: 0
       hardware: npu
