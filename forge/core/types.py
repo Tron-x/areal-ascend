@@ -421,6 +421,26 @@ class LauncherConfig:
     workers: list[str] = field(default_factory=list)
     worker_port: int = 22222
 
+    # Which machinery manages the remote worker lifecycle for bare-metal
+    # (``launcher == Launcher.BARE_METAL``) deployments.
+    #
+    # - ``"bash"`` (default, legacy): ``forge launch`` shells out to
+    #   ``forge/scripts/worker_manager.sh start/stop``.  This is the
+    #   300-line bash path that has been battle-tested on the 2-node
+    #   NPU cluster since the first multi-node run.
+    # - ``"ssh_job"``: ``forge launch`` uses Monarch's native
+    #   :class:`SSHJob` (via our :class:`forge.provisioner_ssh.ForgeSSHJob`
+    #   subclass) -- same SSH command, same ``run_worker_loop_forever``,
+    #   but lifecycle managed by Monarch's ``JobTrait`` protocol.  This
+    #   is the forward-compat path that lines up with ``SlurmJob`` /
+    #   ``KubernetesJob`` for future migrations.
+    #
+    # Opt-in during the migration window so existing CI and muscle
+    # memory keep working.  Flip the default to ``"ssh_job"`` once a
+    # few full training runs have come back clean.  See
+    # ``forge/docs/launcher_impl.md`` for the migration notes.
+    launcher_impl: str = "bash"
+
     # Explicit name -> placement map for launcher.get_host_mesh(name).
     #
     # Today (bare-metal) each value is the integer index into `workers`,

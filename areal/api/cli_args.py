@@ -2274,6 +2274,40 @@ class BaseExperimentConfig:
         metadata={"help": "Path to the tokenizer."},
     )
 
+    # Reward-function selectors.  These are *schema placeholders*: areal's
+    # own training loop does not read them (each workflow constructs its
+    # own reward callable).  They are declared here so YAMLs that embed a
+    # reward-function name/dotted-path for external consumers (notably
+    # forge's ``AReaLConfigBridge``, which reads ``cfg.get("reward")`` /
+    # ``cfg.get("reward_fn")`` to populate ``ForgeConfig.reward`` and
+    # ``ForgeConfig.reward_fn_path``) survive ``OmegaConf.merge`` against
+    # the structured schema instead of failing with
+    # ``ConfigKeyError: Key 'reward' not in 'GRPOConfig'``.
+    # New code that needs a reward function inside areal should continue
+    # to wire it per-workflow (see ``areal/workflow/rlvr.py`` etc.), not
+    # reach for these fields.
+    reward: str = field(
+        default="",
+        metadata={
+            "help": (
+                "Short name of the reward function, registered via "
+                "``@register_reward('xxx')``. Consumed by forge's config "
+                "bridge; ignored by areal-side training code."
+            )
+        },
+    )
+    reward_fn: str = field(
+        default="",
+        metadata={
+            "help": (
+                "Dotted import path of the reward function (legacy). Used "
+                "as a backward-compat fallback when ``reward`` is empty. "
+                "Consumed by forge's config bridge; ignored by areal-side "
+                "training code."
+            )
+        },
+    )
+
     train_dataset: TrainDatasetConfig = field(default_factory=TrainDatasetConfig)
     valid_dataset: ValidDatasetConfig | None = field(default=None)
 

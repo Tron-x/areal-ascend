@@ -149,6 +149,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip pre-flight connectivity / YAML-parse checks.",
     )
     p.add_argument(
+        "--launcher-impl",
+        default=None,
+        choices=("bash", "ssh_job"),
+        help=(
+            "Which worker lifecycle manager to use.  'bash' = legacy "
+            "worker_manager.sh path (default).  'ssh_job' = Monarch-"
+            "native ForgeSSHJob (forward-compat with SlurmJob / K8sJob).  "
+            "If omitted, read from YAML ``launcher.launcher_impl`` "
+            "(itself defaulting to 'bash')."
+        ),
+    )
+    p.add_argument(
         "--keep-workers",
         action="store_true",
         help=(
@@ -295,6 +307,12 @@ def main(argv: list[str]) -> int:
         else (FORGE_ROOT / "forge" / "configs" / "hostfile.txt")
     )
 
+    # Resolve launcher_impl: CLI flag > YAML launcher.launcher_impl >
+    # default "bash".  Keeping the precedence identical to other
+    # fields (CLI > YAML > default) avoids a second rule users have
+    # to remember.
+    launcher_impl = args.launcher_impl or _read_launcher_impl_from_yaml(config)
+
     # --- Pre-flight ----------------------------------------------------
     if not args.skip_preflight:
         errs = _preflight_checks(
@@ -333,19 +351,46 @@ def main(argv: list[str]) -> int:
     print(f"  hostfile        : {hostfile}")
     print(f"  driver host     : {driver}")
     print(f"  workers         : {workers_arg}")
+    print(f"  launcher_impl   : {launcher_impl}")
     print(
         f"  steps           : {args.steps if args.steps is not None else '(YAML default)'}"
     )
     print("=" * 64, flush=True)
 
     # --- Start workers -------------------------------------------------
-    rc = _run_worker_mgr(
-        "start",
-        hostfile=hostfile,
-        worker_port=args.worker_port,
-        ssh_port=args.ssh_port,
-        cann=args.cann,
-    )
+    # Two interchangeable paths:
+    #
+    # - ``bash``   : legacy worker_manager.sh start/stop.  Battle-tested,
+    #               kept as default during the migration window.
+    # - ``ssh_job``: Monarch-native ForgeSSHJob.apply() / _kill().  Same
+    #               SSH commands, same env, same worker process -- just
+    #               managed inside the Python CLI instead of a 300-line
+    #               shell script.  Forward-compatible with SlurmJob /
+    #               KubernetesJob down the line.
+    worker_fleet: _WorkerFleet
+    if launcher_impl == "ssh_job":
+        worker_fleet = _SSHJobFleet(
+            hostfile=hostfile,
+            worker_port=args.worker_port,
+            ssh_port=args.ssh_port,
+            cann=args.cann,
+        )
+    elif launcher_impl == "bash":
+        worker_fleet = _BashFleet(
+            hostfile=hostfile,
+            worker_port=args.worker_port,
+            ssh_port=args.ssh_port,
+            cann=args.cann,
+        )
+    else:
+        print(
+            f"[launch] unknown launcher_impl={launcher_impl!r} "
+            f"(expected 'bash' or 'ssh_job')",
+            file=sys.stderr,
+        )
+        return 2
+
+    rc = worker_fleet.start()
     if rc != 0:
         print(
             f"[launch] worker start failed (rc={rc}).  Aborting.",
@@ -357,9 +402,7 @@ def main(argv: list[str]) -> int:
     # any exit path, including Ctrl+C and crashes.
     try:
         _install_cleanup_handlers(
-            hostfile=hostfile,
-            worker_port=args.worker_port,
-            ssh_port=args.ssh_port,
+            worker_fleet=worker_fleet,
             keep_workers=args.keep_workers,
         )
 
@@ -376,11 +419,7 @@ def main(argv: list[str]) -> int:
         )
     finally:
         if not args.keep_workers:
-            _stop_workers(
-                hostfile=hostfile,
-                worker_port=args.worker_port,
-                ssh_port=args.ssh_port,
-            )
+            worker_fleet.stop()
 
     return train_rc
 
@@ -433,12 +472,10 @@ def _stop_workers(*, hostfile: Path, worker_port: int, ssh_port: int) -> None:
 
 def _install_cleanup_handlers(
     *,
-    hostfile: Path,
-    worker_port: int,
-    ssh_port: int,
+    worker_fleet: _WorkerFleet,
     keep_workers: bool,
 ) -> None:
-    """Route SIGINT / SIGTERM to a cleanup path.
+    """Route SIGINT / SIGTERM to ``worker_fleet.stop()``.
 
     We don't rely on just ``finally`` because a raw Ctrl+C during a
     long-running ssh call can produce a partial teardown.  Explicit
@@ -453,15 +490,206 @@ def _install_cleanup_handlers(
             file=sys.stderr,
             flush=True,
         )
-        _stop_workers(
-            hostfile=hostfile,
-            worker_port=worker_port,
-            ssh_port=ssh_port,
-        )
+        worker_fleet.stop()
         sys.exit(130)
 
     signal.signal(signal.SIGINT, _handler)
     signal.signal(signal.SIGTERM, _handler)
+
+
+# --- worker lifecycle backends ----------------------------------------
+
+
+class _WorkerFleet:
+    """Minimal protocol: ``start`` and ``stop``.
+
+    Concrete backends (:class:`_BashFleet`, :class:`_SSHJobFleet`) share
+    the same constructor signature so the CLI can pick one based on the
+    ``launcher_impl`` setting.  No real ABC on purpose -- the surface
+    is two methods and the indirection is internal to this file.
+    """
+
+    def start(self) -> int:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def stop(self) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class _BashFleet(_WorkerFleet):
+    """Legacy ``worker_manager.sh start/stop`` path.
+
+    Kept as default during the migration window.  Exact behavior as
+    the pre-refactor CLI: shell out to bash, rely on its per-host
+    TCP-probe loop (up to 60s) to decide readiness.
+    """
+
+    def __init__(
+        self,
+        *,
+        hostfile: Path,
+        worker_port: int,
+        ssh_port: int,
+        cann: str,
+    ) -> None:
+        self._hostfile = hostfile
+        self._worker_port = worker_port
+        self._ssh_port = ssh_port
+        self._cann = cann
+
+    def start(self) -> int:
+        return _run_worker_mgr(
+            "start",
+            hostfile=self._hostfile,
+            worker_port=self._worker_port,
+            ssh_port=self._ssh_port,
+            cann=self._cann,
+        )
+
+    def stop(self) -> None:
+        _stop_workers(
+            hostfile=self._hostfile,
+            worker_port=self._worker_port,
+            ssh_port=self._ssh_port,
+        )
+
+
+class _SSHJobFleet(_WorkerFleet):
+    """Monarch-native :class:`ForgeSSHJob` lifecycle.
+
+    Drop-in replacement for :class:`_BashFleet`: starts the same
+    ``run_worker_loop_forever`` workers via the same SSH command,
+    just managed by Monarch's ``JobTrait`` protocol so the API
+    lines up with ``SlurmJob`` / ``KubernetesJob`` for future
+    migrations.
+
+    Also faster: the POC measured ~4-12s per host vs the bash path's
+    60s ceiling, because we attach immediately after apply() returns
+    instead of polling each host's TCP port in sequence.
+    """
+
+    def __init__(
+        self,
+        *,
+        hostfile: Path,
+        worker_port: int,
+        ssh_port: int,
+        cann: str,
+        conda_env: str = "monarch_ascend",
+        conda_bin: str = "/root/miniconda3/bin/conda",
+    ) -> None:
+        self._hostfile = hostfile
+        self._worker_port = worker_port
+        self._ssh_port = ssh_port
+        self._cann = cann
+        self._conda_env = conda_env
+        self._conda_bin = conda_bin
+        self._job = None  # type: ignore[assignment]
+
+    def start(self) -> int:
+        # Import lazily so ``forge launch --help`` works without a
+        # Monarch install (useful in CI unit tests).
+        try:
+            from forge.provisioner_ssh import ForgeSSHJob
+        except ImportError as e:
+            print(
+                f"[launch] launcher_impl=ssh_job needs Monarch importable: {e!r}",
+                file=sys.stderr,
+            )
+            return 2
+
+        hosts = _read_hosts(self._hostfile)
+        if not hosts:
+            print("[launch] ssh_job: empty hostfile", file=sys.stderr)
+            return 2
+
+        ssh_args = [
+            "-p",
+            str(self._ssh_port),
+            "-o",
+            "StrictHostKeyChecking=no",
+        ]
+        job = ForgeSSHJob(
+            cann_home=self._cann,
+            conda_env=self._conda_env,
+            conda_bin=self._conda_bin,
+            areal_root=str(FORGE_ROOT),
+            python_exe="python",
+            ssh_args=ssh_args,
+            monarch_port=self._worker_port,
+        )
+        # The mesh name here is ONLY used internally by the Job for
+        # grouping; it does not surface to BareMetalLauncher, which
+        # attaches independently via attach_to_workers.
+        job.add_mesh("forge_bare_metal", hosts)
+        try:
+            job.apply(client_script=None)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[launch] ssh_job: apply() failed: {e!r}",
+                file=sys.stderr,
+            )
+            return 10
+        self._job = job
+
+        # Wait for each worker to listen on its port (same readiness
+        # criterion the bash path uses, but parallel instead of serial).
+        # TCP reachable == ``run_worker_loop_forever`` has progressed
+        # past address bind.
+        deadline = time.time() + 60
+        remaining = {h: self._worker_port for h in hosts}
+        while remaining and time.time() < deadline:
+            ready_now = [
+                h
+                for h in remaining
+                if _ssh_reachable(h, self._worker_port, timeout_s=2)
+            ]
+            for h in ready_now:
+                del remaining[h]
+            if remaining:
+                time.sleep(1)
+        if remaining:
+            print(
+                f"[launch] ssh_job: workers never listening: {list(remaining)}",
+                file=sys.stderr,
+            )
+            return 11
+        return 0
+
+    def stop(self) -> None:
+        if self._job is None:
+            return
+        print("[launch] ssh_job: stopping workers ...", flush=True)
+        try:
+            self._job._kill()
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[launch] ssh_job: _kill raised {e!r}; "
+                f"some remote procs may still be live",
+                file=sys.stderr,
+            )
+
+
+def _read_launcher_impl_from_yaml(config_path: Path) -> str:
+    """Parse ``launcher.launcher_impl`` out of the launcher YAML.
+
+    Falls back to ``"bash"`` on any read/parse error: the launcher
+    YAML is read a second time here (first time is pre-flight's
+    parse check) on purpose, so a malformed YAML doesn't silently
+    flip us onto the ssh_job path.  Default-bash matches
+    :class:`LauncherConfig.launcher_impl`.
+    """
+    try:
+        import yaml
+
+        data = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return "bash"
+    launcher_block = data.get("launcher") or {}
+    if not isinstance(launcher_block, dict):
+        return "bash"
+    val = launcher_block.get("launcher_impl", "bash")
+    return str(val) if val else "bash"
 
 
 def _run_driver_training(
