@@ -86,9 +86,12 @@ launcher:
   # "dedicated PS on generator's host" topology.
   meshes:
     trainer:
-      host_idx: 1         # monarch1 (driver host via this_host()).  Value
-                          # is ignored by the launcher today but kept
-                          # here for completeness.
+      host_idx: 1         # monarch1 -- trainer host.  After R1.5b
+                          # ForgeActor.launch auto-routes every actor
+                          # through ``get_host_mesh(mesh_name)`` when a
+                          # remote launcher is active, so this value IS
+                          # now honored (previously documentation-only
+                          # because TrainerActor fell back to this_host()).
     generator:
       host_idx: 0         # monarch2 -- 1 NPU (0) for vLLM
     storage:
@@ -96,6 +99,14 @@ launcher:
                           # to relocate storage to monarch2 ("dedicated
                           # PS") -- put traffic becomes cross-machine
                           # RoCE, pull stays intra-host HCCS.
+    reward:
+      host_idx: 1         # monarch1 -- pinned next to trainer so the 1
+                          # CPU proc (or GPU proc, if reward_mode=model)
+                          # doesn't contend with generator's NPUs on
+                          # monarch2.  Pre-R1.5b this actor fell back to
+                          # this_host() implicitly; R1.5b routes it
+                          # through the launcher so the placement must
+                          # be declared.
 
   # Weight-sync data-plane configuration.  Authoritative: every field
   # below is read by ``forge.apps.grpo`` via

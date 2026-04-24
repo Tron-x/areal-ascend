@@ -44,13 +44,22 @@ launcher:
   # is documentation-only.
   meshes:
     trainer:
-      host_idx: 1         # monarch1 (driver / TrainerActor via this_host)
+      host_idx: 1         # monarch1 -- trainer host.  R1.5b routes the
+                          # TrainerActor through ``get_host_mesh("trainer")``
+                          # instead of this_host(), so this value IS now
+                          # honored.
     generator:
       host_idx: 0         # monarch2 -- 1 NPU (0) for vLLM
     storage:
       host_idx: 0         # monarch2 -- dedicated PS colocated with the
                           # generator; put goes cross-node, pull stays
                           # intra-host HCCS.
+    reward:
+      host_idx: 1         # monarch1 -- pinned next to trainer so reward
+                          # procs don't contend with generator/storage
+                          # on monarch2.  Required after R1.5b because
+                          # the reward actor now goes through the launcher
+                          # rather than falling back to this_host().
 
   # Weight-sync block schema is identical to the colocated variant;
   # see ``launcher_bare_metal_2node.yaml`` for the fully-commented

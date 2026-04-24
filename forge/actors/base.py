@@ -157,16 +157,52 @@ class ForgeActor(Actor):
         pass
 
     @classmethod
+    async def _resolve_hosts(cls) -> int | None:
+        """Decide the ``hosts`` argument for this actor's ProcessConfig.
+
+        R1.5b placement semantics:
+            * ``cls.hosts`` is a concrete int (0, 1, ...) -- honor the
+              caller's explicit choice verbatim.  ``0`` is the escape
+              hatch for callers who want ``this_host()`` even when a
+              remote launcher is active.
+            * ``cls.hosts`` is ``None`` (the options() default) AND a
+              remote launcher is active -- auto-default to ``hosts=1``
+              so the actor goes through the launcher's
+              ``get_host_mesh(mesh_name)`` path, exactly like
+              Generator already does.  This unifies Trainer / Reward /
+              Storage / Generator placement under one mechanism and
+              decouples the driver's physical location from any
+              specific actor's role.
+            * ``cls.hosts`` is ``None`` and no launcher is configured
+              (pure local run) -- keep ``None`` so the provisioner
+              falls back to ``this_host()``.
+
+        Factored out of :meth:`launch` so tests can validate the
+        three-way decision without spinning up a real ProcMesh.
+        """
+        if cls.hosts is not None:
+            return cls.hosts
+        # Lazy import to avoid a cycle: forge.provisioner imports
+        # forge.actors.*, so we can't import at module load.
+        from forge.provisioner import _get_provisioner
+
+        provisioner = await _get_provisioner()
+        return 1 if provisioner.launcher is not None else None
+
+    @classmethod
     async def launch(cls, *args, **kwargs) -> ActorMesh:
         """Provision a ProcMesh and deploy the actor.
 
         Override this in subclasses that need custom launch logic
         (e.g., Generator spawns WorkerRegistry + GPU procs separately).
+        See :meth:`_resolve_hosts` for the placement contract.
         """
+        hosts = await cls._resolve_hosts()
+
         cfg = ProcessConfig(
             procs=cls.procs,
             gpus_per_proc=cls.gpus_per_proc,
-            hosts=cls.hosts,
+            hosts=hosts,
             with_gpus=cls.with_gpus,
             mesh_name=cls.mesh_name,
         )
