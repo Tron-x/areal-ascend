@@ -1,112 +1,91 @@
 # Launcher topology for forge's 2-bare-metal-node GRPO run.
 #
-# This file is consumed by ``forge/apps/grpo.py::main()`` as the
-# source of truth for multi-node placement.  Only the ``launcher:``
-# block is read by forge; the rest of the AReaL experiment YAML
-# (dataset / rollout / gconfig / ...) continues to be composed by
-# AReaL's Hydra+OmegaConf pipeline as before.  To use it, add this
-# block to whichever AReaL experiment YAML you're running -- either
-# inline copy it, or use Hydra's composition (``defaults: [...]``).
+# ALGORITHM-OWNED.  This file declares *how the algorithm wants to
+# use the cluster*: per-role device counts, colocation constraints,
+# weight-sync policy.  The cluster itself (pool of machines) is
+# declared in ``cluster/monarch_2node.yaml`` and composed in via
+# Hydra's ``defaults:``.
 #
-# Priority order for every field below (highest wins):
+# R1.5c mental model:
+#
+#   cluster yaml   "what hardware exists"        -> launcher.pool[]
+#   experiment yaml (this file)  "how I want to use it"  -> launcher.roles[]
+#   scheduler      "bind them"                   -> host_idx per role
+#
+# Priority order for every field (highest wins):
 #
 #   1. CLI flags on ``python -m forge.apps.grpo``
-#        (``--bare-metal-workers``, ``--mesh-placement``, ...)
-#   2. Environment variables
-#        (``FORGE_MESH_PLACEMENT``, ``FORGE_STORAGE_HOST_MESH``,
-#         ``TORCHSTORE_MONARCH_RDMA_POOL_MB``, ...)
-#   3. YAML ``launcher:`` block below
-#   4. Python dataclass defaults (``forge/core/types.py::LauncherConfig``)
+#   2. Environment variables (TORCHSTORE_MONARCH_RDMA_POOL_MB, etc.)
+#   3. YAML ``launcher:`` block below (or the composed cluster YAML)
+#   4. Python dataclass defaults in ``forge/core/types.py``
 #
-# ``run_multinode.sh`` injects a hostfile-derived workers list via CLI,
-# so this YAML's ``workers:`` field is a documentation/fallback only --
-# it matters when somebody launches ``python -m forge.apps.grpo`` by
-# hand without going through the wrapper script.
+# Legacy ``bare_metal.workers`` + ``meshes.<name>.host_idx`` still
+# work and are respected when authored explicitly -- that's the
+# escape hatch for "I want THIS role on THAT host, screw the
+# scheduler".  Default path (below) lets the scheduler place
+# everything based on device requests.
 
 launcher:
-  # Launcher kind.  Today we only ship ``bare_metal``; slurm / k8s
-  # are delegated to monarch's native launchers and will land here
-  # as ``type: slurm`` + their own sub-block when we wire those up.
   type: bare_metal
 
-  # Bare-metal specifics.  Other launcher types add their own sibling
-  # sub-block (``slurm:``, ``k8s:``, ...) that the matching launcher
-  # class picks up.  Unknown keys are ignored, so migrations are easy.
-  bare_metal:
-    # Monarch worker URIs, in the exact order they populate the
-    # launcher's ``workers`` array.  ``host_idx: N`` in ``meshes:``
-    # below refers to the N-th entry here.
-    #
-    # Note: ``run_multinode.sh`` builds the effective workers list from
-    # ``forge/configs/hostfile.txt`` at runtime and passes it via
-    # ``--bare-metal-workers``, which takes precedence over whatever's
-    # written here (CLI > env > YAML).  So this field is a documented
-    # fallback for direct ``python -m forge.apps.grpo`` invocations.
-    # Keep the ordering identical to hostfile.txt to avoid confusion.
-    workers:
-      - tcp://192.168.0.26:22222
-      - tcp://192.168.0.23:22222
-    # The "driver" address (where ``run_multinode.sh`` fires
-    # ``python -m forge.apps.grpo`` from).  Auto-detected if empty.
-    # With the hostfile above, the driver is monarch1 (0.23).
-    master_addr: 192.168.0.23
-    worker_port: 22222
+  # Cluster pool -- infrastructure declaration.  Kept inline so the
+  # plain OmegaConf loader in ``_load_yaml_launcher_block`` (no Hydra
+  # compose) can read it directly.  This block is a copy of
+  # ``cluster/monarch_2node.yaml`` -- keep the two in sync until we
+  # switch the launcher loader to Hydra composition.
+  pool:
+    - host: 192.168.0.26
+      port: 22222
+      hardware: npu
+      n_devices: 8
+    - host: 192.168.0.23
+      port: 22222
+      hardware: npu
+      n_devices: 8
+      role: driver
 
-  # Named mesh placements.  ``BareMetalLauncher.get_host_mesh(name)``
-  # consults this map first and falls back to round-robin only for
-  # names not listed.  Explicit placement is strongly preferred --
-  # round-robin is a usability crutch that breaks silently when new
-  # mesh names enter the code base.
+  # Role-centric resource declaration.  Each entry asks for a fixed
+  # count of accelerator devices; the scheduler picks a host from
+  # ``launcher.pool`` that has enough free.  Parallelism strategy
+  # (FSDP dp/tp, vLLM TP, ...) is independent and lives in the
+  # workload YAML (actor / service configs), NOT here.
   #
-  # host_idx is an integer index into bare_metal.workers[].  The dict
-  # form is used (rather than a bare int) so future launcher types
-  # can add sibling keys next to host_idx without a schema break --
-  # for slurm this becomes ``{slurm_mesh_name: trainer}``; for k8s,
-  # ``{node_selector: {role: trainer}}``.
-  # NB: ``workers:`` above is an *ordered* array -- host_idx is an
-  # integer index into it.  For a 2-node job launched by
-  # ``run_multinode.sh``, the DRIVER_HOST is picked from the *second*
-  # line of the hostfile (so actors with ``hosts=None`` that fall back
-  # to ``this_host()`` end up there).  In the default ``hostfile.txt``
-  # layout ("192.168.0.26\n192.168.0.23"), this means:
-  #
-  #   workers[0] -> 192.168.0.26 = monarch2 (non-driver node)
-  #   workers[1] -> 192.168.0.23 = monarch1 (driver, where the
-  #                                python -m forge.apps.grpo process
-  #                                runs, and therefore where
-  #                                ``this_host()`` resolves to)
-  #
-  # Forge's TrainerActor is spawned with ``hosts=None`` so it rides
-  # ``this_host()`` directly; YAML-declared trainer placement is
-  # documentation-only.  Generator and storage go through
-  # ``launcher.get_host_mesh(name)`` and are actually controlled by
-  # host_idx.  The default layout below keeps trainer & storage
-  # colocated (both on monarch1 = driver) and pins generator to the
-  # other node (monarch2).  Flip storage.host_idx -> 0 to run the
-  # "dedicated PS on generator's host" topology.
-  meshes:
+  # Field reference (see ``forge/docs/role_abstraction_design.md``):
+  #   devices   : accelerator card count this role needs.
+  #   hardware  : accelerator tier (today: "npu" only).
+  #   colocate  : pin this role to the same host as another role.
+  #   host_idx  : legacy escape hatch -- override scheduler with an
+  #               explicit pool index.  Prefer ``colocate:``.
+  roles:
+    # FSDP trainer: uses all 8 NPUs on its host (dp=8, tp=1).
     trainer:
-      host_idx: 1         # monarch1 -- trainer host.  After R1.5b
-                          # ForgeActor.launch auto-routes every actor
-                          # through ``get_host_mesh(mesh_name)`` when a
-                          # remote launcher is active, so this value IS
-                          # now honored (previously documentation-only
-                          # because TrainerActor fell back to this_host()).
+      devices: 8
+      hardware: npu
+
+    # vLLM generator: TP=1 on 1 NPU on the other host.  Parallelism
+    # strategy (TP size, num_replicas, ...) is set in the workload
+    # YAML, not here.
     generator:
-      host_idx: 0         # monarch2 -- 1 NPU (0) for vLLM
+      devices: 1
+      hardware: npu
+
+    # Torchstore parameter server: 4 volumes colocated on the trainer
+    # host.  ``put`` traffic stays intra-host (HCCS), ``pull`` goes
+    # cross-machine (RoCE, ~200 Gb/s per NIC).  Flip colocate to
+    # "generator" for the "dedicated PS on generator host" topology
+    # (see ``launcher_bare_metal_2node_dedicated_ps.yaml``).
     storage:
-      host_idx: 1         # monarch1, colocated with trainer.  Set to 0
-                          # to relocate storage to monarch2 ("dedicated
-                          # PS") -- put traffic becomes cross-machine
-                          # RoCE, pull stays intra-host HCCS.
+      devices: 4
+      hardware: npu
+      colocate: trainer
+
+    # Reward evaluator: 1 CPU proc pinned next to the trainer so it
+    # doesn't contend with generator's NPUs.  ``devices: 0`` keeps
+    # it off the accelerator.
     reward:
-      host_idx: 1         # monarch1 -- pinned next to trainer so the 1
-                          # CPU proc (or GPU proc, if reward_mode=model)
-                          # doesn't contend with generator's NPUs on
-                          # monarch2.  Pre-R1.5b this actor fell back to
-                          # this_host() implicitly; R1.5b routes it
-                          # through the launcher so the placement must
-                          # be declared.
+      devices: 0
+      hardware: npu
+      colocate: trainer
 
   # Weight-sync data-plane configuration.  Authoritative: every field
   # below is read by ``forge.apps.grpo`` via
@@ -140,21 +119,17 @@ launcher:
     backend: torchstore_multi_vol
 
     # -- Storage placement --------------------------------------------
-    # storage_role: which entry in the ``roles:`` map above (or legacy
-    # ``meshes:`` map, bridged via the R1.5 reverse sync) should host
-    # the storage volumes.  "storage" is the conventional name.
-    # Set to "trainer" to colocate with the trainer host (saves a
-    # cross-machine hop but puts torchstore's staging pool on the
-    # same NPU that FSDP is using).  Renamed from ``storage_mesh`` in
-    # R1.5 -- old name still works for one release window with a
-    # DeprecationWarning.
+    # storage_role: which entry in ``roles:`` hosts the storage
+    # volumes.  Must match a role name above.  Renamed from
+    # ``storage_mesh`` in R1.5 -- old name still works for one
+    # release window with a DeprecationWarning.
     storage_role: storage
 
-    # storage_npu_base: first NPU id on ``storage_role``'s host that
-    # storage volumes bind to.  ``null`` = auto (uses
-    # ``train_world_size`` as the offset so storage doesn't collide
-    # with trainer's NPUs on a colocated host).  For dedicated
-    # storage hosts (no trainer on that box) set to 0.
+    # storage_npu_base: first NPU id on the storage host that storage
+    # volumes bind to.  ``null`` = auto (uses ``train_world_size`` as
+    # the offset so storage doesn't collide with trainer NPUs on a
+    # colocated host).  For dedicated storage hosts (no trainer on
+    # that box) set to 0.
     storage_npu_base: null
 
     # storage_spawn_mode: who provisions the storage ProcMesh.

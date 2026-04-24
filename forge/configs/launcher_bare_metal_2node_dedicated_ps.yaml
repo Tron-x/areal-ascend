@@ -3,13 +3,13 @@
 # Difference from ``launcher_bare_metal_2node.yaml`` (the default
 # colocated layout):
 #
-#   default: trainer + storage on monarch1 (same host)
-#            generator on monarch2
+#   default: trainer + storage on the driver host (same box)
+#            generator on the non-driver host
 #            put  traffic: same-host HCCS    (trainer -> storage)
 #            pull traffic: cross-node RoCE   (storage -> worker)
 #
-#   this:    trainer on monarch1
-#            storage + generator on monarch2 (same host)
+#   this:    trainer on the driver host
+#            storage + generator on the non-driver host
 #            put  traffic: cross-node RoCE   (trainer -> storage)
 #            pull traffic: same-host HCCS    (storage -> worker)
 #
@@ -23,43 +23,45 @@
 launcher:
   type: bare_metal
 
-  bare_metal:
-    # Match hostfile.txt order (run_multinode.sh overrides via CLI).
-    workers:
-      - tcp://192.168.0.26:22222
-      - tcp://192.168.0.23:22222
-    master_addr: 192.168.0.23
-    worker_port: 22222
+  # Cluster pool -- see ``cluster/monarch_2node.yaml`` for the
+  # canonical definition.  Inlined here because the plain OmegaConf
+  # loader in ``_load_yaml_launcher_block`` doesn't resolve Hydra
+  # ``defaults:`` lists.
+  pool:
+    - host: 192.168.0.26
+      port: 22222
+      hardware: npu
+      n_devices: 8
+    - host: 192.168.0.23
+      port: 22222
+      hardware: npu
+      n_devices: 8
+      role: driver
 
-  # host_idx is an ordered index into bare_metal.workers[].  With
-  # hostfile.txt listing 192.168.0.26 first and 192.168.0.23 second,
-  # run_multinode.sh's generated workers list ends up
-  # [monarch2, monarch1]; the driver is picked from the hostfile's
-  # *second* entry, so TrainerActor (via ``this_host()``) lands on
-  # monarch1 = workers[1].
-  #
-  # The only meaningful change vs the colocated YAML is the storage
-  # placement: host_idx: 0 pins it to monarch2, which is generator's
-  # host.  The trainer still uses this_host() so its nominal host_idx
-  # is documentation-only.
-  meshes:
+  # Same role declarations as the colocated variant, except
+  # ``storage.colocate`` flips from ``trainer`` to ``generator`` --
+  # that's the entire topology difference.
+  roles:
     trainer:
-      host_idx: 1         # monarch1 -- trainer host.  R1.5b routes the
-                          # TrainerActor through ``get_host_mesh("trainer")``
-                          # instead of this_host(), so this value IS now
-                          # honored.
+      devices: 8
+      hardware: npu
+
     generator:
-      host_idx: 0         # monarch2 -- 1 NPU (0) for vLLM
+      devices: 1
+      hardware: npu
+
+    # The only meaningful change vs the colocated YAML: storage
+    # colocates with generator instead of trainer, so the PS lands
+    # on the non-trainer host.
     storage:
-      host_idx: 0         # monarch2 -- dedicated PS colocated with the
-                          # generator; put goes cross-node, pull stays
-                          # intra-host HCCS.
+      devices: 4
+      hardware: npu
+      colocate: generator
+
     reward:
-      host_idx: 1         # monarch1 -- pinned next to trainer so reward
-                          # procs don't contend with generator/storage
-                          # on monarch2.  Required after R1.5b because
-                          # the reward actor now goes through the launcher
-                          # rather than falling back to this_host().
+      devices: 0
+      hardware: npu
+      colocate: trainer
 
   # Weight-sync block schema is identical to the colocated variant;
   # see ``launcher_bare_metal_2node.yaml`` for the fully-commented

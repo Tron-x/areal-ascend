@@ -1050,6 +1050,15 @@ def main():
     #         storage_mesh: storage     # -> meshes.storage above
     #         pool_mb: 8192
     #         storage_npu_base: null    # null = auto (train_world_size)
+    # R1.5c: new ``pool:`` + ``roles:`` schema -- infrastructure-owned
+    # pool (cluster YAML) + algorithm-owned roles (experiment YAML).
+    # LauncherConfig.__post_init__ handles the scheduling and derives
+    # ``workers`` / ``meshes`` automatically.  Legacy ``bare_metal.workers``
+    # + ``meshes.<name>.host_idx`` still work and take precedence when
+    # co-authored -- the two schemas are interchangeable during the
+    # migration window.
+    yaml_pool: list[dict] = []
+    yaml_roles: dict = {}
     if yaml_launcher:
         yaml_bare_metal = yaml_launcher.get("bare_metal") or {}
         if not bare_metal_args.get("workers") and yaml_bare_metal.get("workers"):
@@ -1073,6 +1082,11 @@ def main():
             elif isinstance(spec, int):
                 mesh_placement[name] = int(spec)
 
+        # R1.5c schema passthrough.  These are normalized + validated
+        # by LauncherConfig.__post_init__ (see forge/core/types.py).
+        yaml_pool = list(yaml_launcher.get("pool") or [])
+        yaml_roles = dict(yaml_launcher.get("roles") or {})
+
         # weight_sync YAML block is passed directly into LauncherConfig
         # (its __post_init__ normalizes the dict into a WeightSyncBlock
         # dataclass).  Downstream readers in _create_weight_sync_service
@@ -1083,7 +1097,14 @@ def main():
     else:
         yaml_ws_for_launcher = {}
 
-    if bare_metal_args:
+    # A pool-only YAML (no explicit ``bare_metal.workers``) still needs
+    # the bare-metal launcher to fire -- detect that by checking whether
+    # we found *any* placement hints in the YAML.
+    has_placement_hints = (
+        bool(bare_metal_args) or bool(yaml_pool) or bool(yaml_roles)
+    )
+
+    if has_placement_hints:
         from forge.types import Launcher, LauncherConfig, ProvisionerConfig
 
         provisioner_config = ProvisionerConfig(
@@ -1091,6 +1112,8 @@ def main():
                 launcher=Launcher.BARE_METAL,
                 meshes=mesh_placement,
                 weight_sync=yaml_ws_for_launcher,
+                pool=yaml_pool,
+                roles=yaml_roles,
                 **bare_metal_args,
             )
         )

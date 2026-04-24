@@ -206,30 +206,40 @@ def _preflight_checks(
     algo_config: Path,
     ssh_port: int,
     worker_port: int,
+    hosts_override: list[str] | None = None,
 ) -> list[str]:
     """Return a list of error strings; empty list means all green.
 
     Each check is independent so the user sees every broken thing at
     once rather than one-at-a-time.
+
+    ``hosts_override`` lets callers bypass the hostfile read and
+    supply a pre-derived host list (e.g. from ``launcher.pool`` in
+    the YAML).  When set, the hostfile-existence check is skipped.
     """
     errs: list[str] = []
 
-    # Hostfile exists & has at least one host.
-    if not hostfile.is_file():
+    # Host list: prefer override, else read from hostfile.
+    hosts: list[str] = []
+    if hosts_override is not None:
+        hosts = hosts_override
+        if not hosts:
+            errs.append("launcher.pool parsed empty (no valid host entries)")
+    elif not hostfile.is_file():
         errs.append(f"hostfile not found: {hostfile}")
     else:
         hosts = _read_hosts(hostfile)
         if not hosts:
             errs.append(f"hostfile has no non-comment hosts: {hostfile}")
-        else:
-            # SSH reachability probe on each host.  ~1s budget per host;
-            # bail out of the loop if we accumulate too many errs.
-            for host in hosts:
-                if not _ssh_reachable(host, ssh_port, timeout_s=3):
-                    errs.append(
-                        f"ssh to {host}:{ssh_port} unreachable — "
-                        f"check --ssh-port, SSH daemon, and key-based login"
-                    )
+
+    # SSH reachability probe on each host.  ~1s budget per host;
+    # bail out of the loop if we accumulate too many errs.
+    for host in hosts:
+        if not _ssh_reachable(host, ssh_port, timeout_s=3):
+            errs.append(
+                f"ssh to {host}:{ssh_port} unreachable — "
+                f"check --ssh-port, SSH daemon, and key-based login"
+            )
 
     # YAML files exist & parse.
     for label, p in (("--config", config), ("--algo-config", algo_config)):
@@ -338,14 +348,27 @@ def main(argv: list[str]) -> int:
     # to remember.
     launcher_impl = args.launcher_impl or _read_launcher_impl_from_yaml(config)
 
+    # R1.5c: prefer ``launcher.pool`` from the YAML over the hostfile
+    # when both are available.  The pool is the authoritative cluster
+    # description (ports + driver tag + hardware tier); the hostfile
+    # is the legacy flat list.  When both are authored and disagree
+    # we warn and trust the pool -- the hostfile's most likely explanation
+    # is "operator edited the pool and forgot to re-export hostfile.txt".
+    pool_hosts, pool_driver, pool_worker_port = _read_pool_from_yaml(config)
+    using_pool = bool(pool_hosts)
+
     # --- Pre-flight ----------------------------------------------------
     if not args.skip_preflight:
+        # With a pool, hostfile is optional -- pre-flight still runs
+        # against the pool-derived host list so SSH reachability is
+        # verified the same way.
         errs = _preflight_checks(
             hostfile=hostfile,
             config=config,
             algo_config=algo_config,
             ssh_port=args.ssh_port,
             worker_port=args.worker_port,
+            hosts_override=pool_hosts if using_pool else None,
         )
         if errs:
             print("=" * 64, file=sys.stderr)
@@ -360,10 +383,41 @@ def main(argv: list[str]) -> int:
             )
             return 2
 
-    # Resolve driver host: second non-empty line of hostfile, fallback
-    # first.  Matches run_multinode.sh behavior for backward compat.
-    hosts = _read_hosts(hostfile)
-    driver = hosts[1] if len(hosts) >= 2 else hosts[0]
+    # Resolve driver + worker list.  Pool first (explicit driver tag);
+    # hostfile second (legacy "second non-empty line is driver"
+    # heuristic).  We continue to populate ``hosts`` for the
+    # downstream ssh-fleet / sync paths -- they still read one list.
+    if using_pool:
+        hosts = pool_hosts
+        driver = pool_driver or hosts[0]
+        if pool_worker_port is not None and pool_worker_port != args.worker_port:
+            # CLI --worker-port wins (historical default) but mention
+            # the divergence so users notice stale overrides.
+            print(
+                f"[launch] NOTE: pool declares worker_port="
+                f"{pool_worker_port}; CLI --worker-port="
+                f"{args.worker_port} takes precedence.",
+                flush=True,
+            )
+
+        # ``_BashFleet`` / ``_SSHJobFleet`` / ``_run_driver_training`` /
+        # ``_stop_workers`` all take a ``hostfile: Path`` and call
+        # ``worker_manager.sh --hostfile ...`` on the remote.  In
+        # pool-only mode the user might not have a hostfile on disk,
+        # so materialize one next to the YAML.  File is deterministic
+        # (``<config>.pool.hostfile``) so re-runs reuse it and stale
+        # entries are visible to the operator.
+        pool_hostfile = config.with_suffix(config.suffix + ".pool.hostfile")
+        pool_hostfile.write_text(
+            "# Auto-generated by `forge launch` from launcher.pool\n"
+            "# Source: " + str(config) + "\n"
+            + "\n".join(f"{h} slots=8" for h in hosts)
+            + "\n"
+        )
+        hostfile = pool_hostfile
+    else:
+        hosts = _read_hosts(hostfile)
+        driver = hosts[1] if len(hosts) >= 2 else hosts[0]
 
     # Pre-build the workers string for grpo.py's --bare-metal-workers arg.
     workers_arg = ",".join(f"tcp://{h}:{args.worker_port}" for h in hosts)
@@ -373,6 +427,7 @@ def main(argv: list[str]) -> int:
     print("=" * 64)
     print(f"  launcher config : {config}")
     print(f"  algo config     : {algo_config}")
+    print(f"  host source     : {'pool (yaml)' if using_pool else 'hostfile'}")
     print(f"  hostfile        : {hostfile}")
     print(f"  driver host     : {driver}")
     print(f"  workers         : {workers_arg}")
@@ -749,6 +804,63 @@ def _read_launcher_impl_from_yaml(config_path: Path) -> str:
         return "bash"
     val = launcher_block.get("launcher_impl", "bash")
     return str(val) if val else "bash"
+
+
+def _read_pool_from_yaml(
+    config_path: Path,
+) -> tuple[list[str], str | None, int | None]:
+    """Parse ``launcher.pool`` out of the launcher YAML.
+
+    Returns ``(hosts, driver, worker_port)`` where:
+
+    * ``hosts`` is the ordered list of worker IPs / hostnames (empty
+      if the YAML has no pool -- caller falls back to the hostfile).
+    * ``driver`` is the IP of the pool entry tagged ``role: driver``,
+      or ``None`` when no entry is tagged (caller applies the legacy
+      "second line of hostfile" heuristic).
+    * ``worker_port`` is the port of the first pool entry, or
+      ``None`` when the pool is empty.  The scheduler assumes every
+      entry uses the same port (mirrors what
+      ``LauncherConfig.__post_init__`` does) -- if someone mixes
+      ports we honor the first and emit a warning from the
+      launcher side.
+
+    Any parse / schema error degrades to ``([], None, None)`` so
+    malformed YAML can't silently break legacy hostfile flows.
+    """
+    try:
+        import yaml
+
+        data = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return [], None, None
+    launcher_block = data.get("launcher") or {}
+    if not isinstance(launcher_block, dict):
+        return [], None, None
+    raw_pool = launcher_block.get("pool") or []
+    if not isinstance(raw_pool, list) or not raw_pool:
+        return [], None, None
+
+    hosts: list[str] = []
+    driver: str | None = None
+    worker_port: int | None = None
+    for entry in raw_pool:
+        if not isinstance(entry, dict):
+            continue
+        host = entry.get("host")
+        if not host:
+            continue
+        hosts.append(str(host))
+        if worker_port is None:
+            port = entry.get("port")
+            if port is not None:
+                try:
+                    worker_port = int(port)
+                except (TypeError, ValueError):
+                    worker_port = None
+        if entry.get("role") == "driver" and driver is None:
+            driver = str(host)
+    return hosts, driver, worker_port
 
 
 def _run_driver_training(

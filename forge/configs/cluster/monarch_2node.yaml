@@ -1,0 +1,41 @@
+# Cluster resource pool for the 2-node monarch NPU lab.
+#
+# INFRASTRUCTURE-OWNED.  This file declares *what hardware exists*
+# and is maintained by whoever owns the machines (not the algorithm
+# author).  Experiment YAMLs reference it by composition
+# (``defaults: [cluster/monarch_2node]``) or by inline copy-paste
+# under ``launcher.pool:`` -- both work.
+#
+# Contrast with experiment YAMLs (e.g. ``launcher_bare_metal_2node.yaml``)
+# which declare *how an algorithm wants to use the hardware*: device
+# counts per role, colocation constraints, parallelism strategy.  The
+# scheduler in ``LauncherConfig.__post_init__`` binds the two together.
+#
+# ``run_multinode.sh`` also reads this file -- the driver host is
+# whichever pool entry has ``role: driver`` (or ``pool[0]`` if none
+# is tagged), and all other entries are worker hosts.
+
+launcher:
+  type: bare_metal
+
+  # The pool is an ordered list -- order only matters as a tie-breaker
+  # for legacy ``host_idx`` references; the scheduler places roles by
+  # their ``devices:`` request, not by pool position.
+  pool:
+    # monarch2: 8 NPUs (910B), 22222 is monarch worker port.
+    - host: 192.168.0.26
+      port: 22222
+      hardware: npu
+      n_devices: 8
+
+    # monarch1: 8 NPUs, tagged as driver -- this is where
+    # ``run_multinode.sh`` fires ``python -m forge.apps.grpo`` from,
+    # and where actors with ``hosts=None`` fall back via
+    # ``this_host()``.  With R1.5b unified placement this fallback
+    # path is only taken for the local-launcher case; remote
+    # launchers route every actor through ``get_host_mesh(name)``.
+    - host: 192.168.0.23
+      port: 22222
+      hardware: npu
+      n_devices: 8
+      role: driver

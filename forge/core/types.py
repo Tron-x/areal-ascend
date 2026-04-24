@@ -582,6 +582,242 @@ def _normalize_role(raw: Any) -> RoleConfig:
     return RoleConfig(**data, extras=extras)
 
 
+# ======================================================================
+# R1.5c: cluster pool -- infrastructure-owned resource definition
+# ======================================================================
+
+
+@dataclass
+class PoolHost:
+    """One entry in the cluster ``pool``.
+
+    Represents a single machine (bare-metal host, k8s node, slurm node)
+    with its network address, hardware tier, and a declared device
+    capacity.  The launcher is the only consumer; downstream code sees
+    it through the scheduler's output (``meshes.<role>.host_idx``).
+
+    Fields:
+        host: IP address or hostname reachable from the driver.  Used
+            verbatim in the ``tcp://{host}:{port}`` worker URL.
+        port: Monarch worker TCP port.  Defaults to the project-wide
+            22222 convention.
+        hardware: Device tier on this host (``"npu"`` today; GPU / CPU
+            tiers arrive in Phase A2).
+        n_devices: Number of accelerator cards on this host.  The
+            greedy scheduler uses this as the per-host capacity and
+            refuses to place a role with ``devices > n_devices``
+            unless the role is allowed to span hosts.
+        role: Optional tag, currently only ``"driver"`` is meaningful.
+            Exactly one host in the pool MAY be marked as the driver;
+            if none is marked, ``pool[0]`` is used by default (with a
+            log line but no error, so small 2-node dev clusters don't
+            have to author the tag).
+    """
+
+    host: str = ""
+    port: int = 22222
+    hardware: str = "npu"
+    n_devices: int = 0
+    role: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.host:
+            raise ValueError("PoolHost.host must be a non-empty string")
+        if self.n_devices < 0:
+            raise ValueError(
+                f"PoolHost.n_devices must be >= 0, got {self.n_devices!r}"
+            )
+        if self.role is not None and self.role not in {"driver"}:
+            raise ValueError(
+                f"PoolHost.role={self.role!r} is not a recognized tag "
+                f"(accepted: 'driver' | None)"
+            )
+
+
+def _normalize_pool(raw: Any) -> list[PoolHost]:
+    """Coerce YAML-loaded pool entries (list of dicts) into
+    :class:`PoolHost` instances.
+
+    Accepts an already-normalized list of ``PoolHost`` unchanged so
+    programmatic construction keeps working.  Anything else raises a
+    clear TypeError at YAML load time rather than at scheduling time.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise TypeError(
+            f"launcher.pool must be a list of hosts, got "
+            f"{type(raw).__name__}: {raw!r}"
+        )
+    out: list[PoolHost] = []
+    for i, entry in enumerate(raw):
+        if isinstance(entry, PoolHost):
+            out.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            raise TypeError(
+                f"launcher.pool[{i}] must be dict or PoolHost, got "
+                f"{type(entry).__name__}: {entry!r}"
+            )
+        out.append(PoolHost(**dict(entry)))
+    return out
+
+
+def schedule_roles_on_pool(
+    roles: dict[str, RoleConfig],
+    pool: list[PoolHost],
+) -> dict[str, int]:
+    """Greedy devices-based placement.  Returns ``{role_name: host_idx}``.
+
+    Algorithm (intentionally simple so operators can reason about it
+    from the log output):
+
+    1. Partition roles into (a) independently placed and (b) colocate
+       dependents.  (b) waits for its anchor's decision.
+    2. Sort independents by ``devices`` descending, ties broken by
+       name for determinism.  Larger resource consumers get first
+       pick so small roles don't lock out big ones.
+    3. Walk the sorted list.  For each role, scan the pool in order
+       and pick the first host with ``free_devices >= role.devices``.
+       Decrement ``free_devices`` on that host by ``role.devices``.
+    4. Place colocate dependents onto their anchor's host (without
+       further device checks -- colocation is the user's assertion
+       that the two roles can share the host; we trust it).  The
+       canonical use is ``storage.colocate: trainer``, where storage
+       binds to the trainer's spare NPUs rather than requesting its
+       own cards on top.  Honoring it as a raw alias keeps the
+       scheduler from double-counting shared device budgets.
+    5. Any role whose ``host_idx`` is already set (legacy pin) is
+       preserved; the scheduler respects existing assignments and
+       deducts from the target host's free budget accordingly.
+
+    Raises ``ValueError`` when a role can't be placed -- message
+    includes which role, what it wanted, and what capacity remained
+    across the pool, so operators can edit either the ``roles`` or
+    ``pool`` YAML and try again.
+    """
+    if not pool:
+        return {}
+
+    free_by_host: list[int] = [h.n_devices for h in pool]
+    assignment: dict[str, int] = {}
+
+    # Pass 0: legacy explicit pins win.  Debit their budget up front.
+    for name, role in roles.items():
+        if role.host_idx is None:
+            continue
+        idx = role.host_idx
+        if not (0 <= idx < len(pool)):
+            raise ValueError(
+                f"role {name!r} has host_idx={idx} which is out of range "
+                f"for the pool (has {len(pool)} hosts)"
+            )
+        if role.devices > free_by_host[idx]:
+            raise ValueError(
+                f"role {name!r} pinned to host {idx} ({pool[idx].host}) "
+                f"asks for {role.devices} devices but only "
+                f"{free_by_host[idx]} remain free on that host"
+            )
+        free_by_host[idx] -= role.devices
+        assignment[name] = idx
+
+    # Pass 1: independents, largest first.
+    independents = [
+        (name, role)
+        for name, role in roles.items()
+        if role.colocate is None and role.host_idx is None
+    ]
+    independents.sort(key=lambda kv: (-kv[1].devices, kv[0]))
+
+    # Scan order prefers the driver host -- RL convention places the
+    # "primary" consumer (usually the trainer) on the same host as
+    # the Python driver process, so the first-pick scan looks there
+    # first.  Subsequent roles spill to the remaining hosts in pool
+    # order, which preserves a reader-friendly "driver, then
+    # non-driver" layout in the meshes log.
+    driver_first_order: list[int] = []
+    try:
+        drv = pool_driver_idx(pool)
+        driver_first_order.append(drv)
+    except ValueError:
+        drv = None  # Empty pool was handled above; this path is
+                    # unreachable but kept for defensive clarity.
+    for idx in range(len(pool)):
+        if idx != drv:
+            driver_first_order.append(idx)
+
+    for name, role in independents:
+        chosen: int | None = None
+        for idx in driver_first_order:
+            host = pool[idx]
+            if host.hardware != role.hardware:
+                continue
+            if free_by_host[idx] < role.devices:
+                continue
+            chosen = idx
+            break
+        if chosen is None:
+            raise ValueError(
+                f"role {name!r} asks for {role.devices} {role.hardware!r} "
+                f"device(s) but no pool host has that much free.  "
+                f"Free devices per host: "
+                f"{list(zip([h.host for h in pool], free_by_host))}"
+            )
+        free_by_host[chosen] -= role.devices
+        assignment[name] = chosen
+
+    # Pass 2: colocate dependents.
+    dependents = [
+        (name, role)
+        for name, role in roles.items()
+        if role.colocate is not None and name not in assignment
+    ]
+    # Resolve in topologically-safe order: if A colocates with B and
+    # B colocates with C, A waits until B is placed.  A single pass
+    # with a fixed-point check is enough for the small graphs we
+    # support (<= 10 roles in practice).
+    progress = True
+    while dependents and progress:
+        progress = False
+        for pair in list(dependents):
+            name, role = pair
+            anchor = role.colocate
+            if anchor not in assignment:
+                continue
+            assignment[name] = assignment[anchor]
+            dependents.remove(pair)
+            progress = True
+    if dependents:
+        raise ValueError(
+            f"colocate chain could not be resolved for roles "
+            f"{[name for name, _ in dependents]!r}.  Check that every "
+            f"``colocate:`` target exists and that there are no cycles."
+        )
+
+    return assignment
+
+
+def pool_driver_idx(pool: list[PoolHost]) -> int:
+    """Return the pool index of the host tagged ``role: driver``.
+
+    Falls back to ``0`` when no host is tagged -- logged at call sites
+    that care (the launcher), not here, so this helper stays pure and
+    testable.  Raises ``ValueError`` when more than one host is
+    tagged, since that's unambiguously user error.
+    """
+    if not pool:
+        raise ValueError("pool is empty -- cannot pick a driver")
+    tagged = [i for i, h in enumerate(pool) if h.role == "driver"]
+    if len(tagged) > 1:
+        raise ValueError(
+            f"pool has multiple hosts tagged role: driver (indices "
+            f"{tagged!r}).  Only one host may be the driver."
+        )
+    if tagged:
+        return tagged[0]
+    return 0
+
+
 @dataclass
 class LauncherConfig:
     """Cluster launcher configuration.
@@ -664,6 +900,17 @@ class LauncherConfig:
     # for the agentic-specific role types.
     roles: dict[str, RoleConfig] = field(default_factory=dict)
 
+    # R1.5c: Cluster resource pool -- infrastructure-owned declaration
+    # of available machines.  Authored in ``cluster/*.yaml`` (separate
+    # from the algorithm-owned experiment YAML) and composed in via
+    # Hydra / OmegaConf ``defaults:`` or included directly under
+    # ``launcher.pool:``.  When non-empty, the scheduler uses it to
+    # assign roles to hosts based on their ``devices`` request, and
+    # auto-populates ``meshes`` + ``bare_metal.workers`` so legacy
+    # code paths keep working.  Empty = legacy mode (user authors
+    # ``workers`` and ``meshes`` by hand).
+    pool: list[PoolHost] = field(default_factory=list)
+
     def __post_init__(self):
         if isinstance(self.launcher, str):
             self.launcher = Launcher(self.launcher)
@@ -687,9 +934,98 @@ class LauncherConfig:
             self.roles = {
                 name: _normalize_role(raw) for name, raw in dict(self.roles).items()
             }
+
+        # R1.5c: pool normalization + greedy scheduler.  Order matters:
+        # (a) normalize the pool list first,
+        # (b) derive ``workers``/``worker_port`` from it if the user
+        #     didn't author them explicitly (the launcher and
+        #     ``run_multinode.sh`` both read ``workers``),
+        # (c) run the scheduler to fill ``roles.<name>.host_idx`` /
+        #     ``meshes.<name>`` for roles that don't already have a
+        #     pinned placement.
+        if self.pool:
+            self.pool = _normalize_pool(self.pool)
+        self._sync_pool_and_workers()
+        self._schedule_roles_on_pool()
+
         self._sync_roles_and_meshes()
         self._normalize_weight_sync_role_refs()
         self._validate_role_refs()
+
+    def _sync_pool_and_workers(self) -> None:
+        """Derive ``workers`` + ``worker_port`` from the pool when
+        the user only authored one or the other.
+
+        Legacy YAMLs author ``bare_metal.workers`` (now normalized
+        onto ``LauncherConfig.workers``) directly; R1.5c YAMLs
+        author ``pool`` instead and expect the launcher to fill in
+        ``workers``.  The two are intentionally redundant during the
+        migration window.  Conflict rule: if both are authored,
+        trust ``workers`` (hot data path) and log a warning when the
+        lengths disagree -- that's usually a stale hand-written
+        ``workers`` list that never got refreshed when the pool
+        changed.
+        """
+        if not self.pool:
+            return
+        derived = [f"tcp://{h.host}:{h.port}" for h in self.pool]
+        if not self.workers:
+            self.workers = list(derived)
+            # Align ``worker_port`` with the first pool entry so
+            # legacy readers (``run_multinode.sh``) that don't know
+            # about the pool still get the right port.
+            self.worker_port = self.pool[0].port
+            return
+        if len(self.workers) != len(self.pool):
+            import warnings
+            warnings.warn(
+                f"launcher.workers ({len(self.workers)} entries) and "
+                f"launcher.pool ({len(self.pool)} entries) disagree; "
+                f"trusting the hand-written ``workers`` list.  This "
+                f"likely means your cluster YAML changed but the "
+                f"experiment YAML still has a stale ``workers`` "
+                f"override -- delete the override to pick up the new "
+                f"pool.",
+                UserWarning,
+                stacklevel=4,
+            )
+
+    def _schedule_roles_on_pool(self) -> None:
+        """Run the greedy scheduler and write its decisions back into
+        ``roles.<name>.host_idx`` so the existing roles<->meshes
+        bridge (unchanged from R1.5a) publishes them to the
+        launcher via ``meshes``.
+
+        No-op when ``pool`` is empty -- pre-R1.5c YAMLs keep the
+        legacy path where ``host_idx`` is either hand-authored or
+        left ``None`` (falling back to round-robin in
+        ``BareMetalLauncher.get_host_mesh``).
+        """
+        if not self.pool or not self.roles:
+            return
+        try:
+            assignment = schedule_roles_on_pool(self.roles, self.pool)
+        except ValueError as exc:
+            # Re-raise with a YAML-pointing hint so operators can
+            # find the file to edit.  The scheduler itself is library
+            # code and shouldn't know about the YAML layer.
+            raise ValueError(
+                f"{exc}  (Edit ``launcher.pool`` in your cluster YAML "
+                f"or ``launcher.roles.*.devices`` in your experiment "
+                f"YAML and try again.)"
+            ) from exc
+
+        for name, host_idx in assignment.items():
+            role = self.roles[name]
+            if role.host_idx is None:
+                role.host_idx = host_idx
+
+    def driver_host_idx(self) -> int:
+        """Return the pool index of the driver host, or ``0`` when no
+        pool is declared (legacy path keeps working)."""
+        if not self.pool:
+            return 0
+        return pool_driver_idx(self.pool)
 
     def _normalize_weight_sync_role_refs(self) -> None:
         """Collapse the ``storage_mesh`` / ``storage_role`` deprecation

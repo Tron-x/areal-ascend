@@ -72,8 +72,20 @@ Everything under "Bare-metal dev adapter" exists to paper over the
 fact that the cluster has no native way to broadcast code changes or
 manage process lifecycle. Concretely:
 
-- **`hostfile.txt`**: replaces what a SLURM `sbatch` / k8s `PodSpec`
-  would encode (which machines, how many slots).
+- **`launcher.pool:` in the YAML** (preferred, R1.5c+): cluster
+  description lives in `launcher.pool` inside the launcher YAML --
+  an ordered list of `{host, port, hardware, n_devices, role?}`
+  entries. The optional `role: driver` tag selects which host the
+  Python driver process runs on (default: `pool[0]`). `forge launch`
+  prefers `launcher.pool` over `--hostfile` when both are
+  authored, and the greedy scheduler in
+  `LauncherConfig.__post_init__` maps `roles[]` onto pool entries
+  by device count + colocate constraints. See
+  `role_abstraction_design.md` §2b for the full schema.
+- **`hostfile.txt`** (legacy): replaces what a SLURM `sbatch` / k8s
+  `PodSpec` would encode (which machines, how many slots). Still
+  works when `launcher.pool` is absent; `forge launch` falls back
+  to the "second non-empty line = driver" heuristic.
 - **`launcher_impl=ssh_job` -> `ForgeSSHJob`**: replaces what
   `SlurmJob._create()` / `KubernetesJob._create()` will eventually
   provide (remote process spawn + lifecycle + cleanup).

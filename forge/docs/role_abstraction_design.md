@@ -1,7 +1,7 @@
 # Role Abstraction — Design Note
 
-**Status**: design draft, no code yet. Writing this down so the next working session
-starts from a shared basis instead of rediscovering the problem.
+**Status**: partially shipped in R1.5 (a/b/c). The aspirational schema in §2 below
+is the long-term north star; §2b records what actually landed.
 
 **Context**: forge today can place `trainer` / `generator` / `storage` on specific hosts
 via `launcher.meshes.<name>.host_idx`. That's enough for the 2-node GRPO smoke and the
@@ -10,8 +10,86 @@ primitive** where arbitrary roles (Reward Model, Experience Buffer, Data Pipelin
 future components) run on arbitrary (possibly heterogeneous) hardware, each
 independently scalable, connected by **explicit transports**.
 
-This doc captures the design we agreed on. It does not prescribe the implementation
-order — that's a separate discussion.
+This doc captures the design we agreed on. The R1.5 shipped subset is documented in
+§2b; the aspirational schema in §2 stays as the direction of travel.
+
+## R1.5 delta (what actually shipped, 2026-04)
+
+The delivered schema is intentionally flatter than the original §2 sketch. Three
+hand-offs, one per sub-phase:
+
+* **R1.5a** — introduce `RoleConfig { devices, hardware, colocate, host_idx, extras }`
+  as a peer of the legacy `meshes` map; `__post_init__` keeps them in sync (either
+  one can be authored). Renamed `weight_sync.storage_mesh` → `storage_role`; legacy
+  name still works with a `DeprecationWarning`.
+* **R1.5b** — `ForgeActor.launch` defaults `hosts=1` when a remote launcher is active,
+  so trainer / reward actors go through `get_host_mesh(name)` instead of implicit
+  `this_host()`. This decouples driver placement from any specific actor role.
+* **R1.5c** — add `launcher.pool: [PoolHost]` as the infrastructure-owned cluster
+  pool (hosts + port + device count + optional `role: driver` tag). A greedy
+  scheduler inside `LauncherConfig.__post_init__` binds `roles` (device counts,
+  colocate constraints) to `pool` entries, auto-populating `workers` and
+  `meshes.<name>.host_idx`. `forge launch` prefers `launcher.pool` over
+  `--hostfile` when both are authored; in pool-only mode, it materializes a temp
+  hostfile from the pool so the downstream bash fleet / ssh_job fleet keep working
+  unchanged.
+
+### §2b Shipped YAML schema (R1.5c)
+
+```yaml
+launcher:
+  type: bare_metal
+
+  # INFRASTRUCTURE-OWNED: what hardware exists.
+  pool:
+    - host: 192.168.0.26
+      port: 22222
+      hardware: npu
+      n_devices: 8
+    - host: 192.168.0.23
+      port: 22222
+      hardware: npu
+      n_devices: 8
+      role: driver      # optional; defaults to pool[0]
+
+  # ALGORITHM-OWNED: how this experiment wants to use the cluster.
+  roles:
+    trainer:
+      devices: 8              # accelerator card count
+      hardware: npu
+    generator:
+      devices: 1
+      hardware: npu
+    storage:
+      devices: 4
+      hardware: npu
+      colocate: trainer       # pin to trainer's host
+    reward:
+      devices: 0              # CPU-only
+      hardware: npu
+      colocate: trainer
+
+  weight_sync:
+    storage_role: storage     # must match a key in roles[]
+    # ... rest unchanged
+```
+
+Parallelism strategy (FSDP dp/tp, vLLM TP) stays in the workload config -- it's
+deliberately NOT part of `roles[]`, since algorithm authors want to swap TP sizes
+independently of resource allocation.
+
+### Legacy escape hatches still work
+
+Every old YAML keeps working during the migration window:
+
+* `bare_metal.workers` + `meshes.<name>.host_idx` — hand-authored placement.
+  `LauncherConfig.__post_init__` leaves both intact and the scheduler is a no-op
+  when `pool` is empty.
+* `weight_sync.storage_mesh` — alias for `storage_role`; emits
+  `DeprecationWarning`.
+* `--hostfile` in `forge launch` — when no `launcher.pool` exists in the YAML,
+  `forge launch` falls back to the legacy hostfile path with the same
+  "second non-empty line = driver" heuristic.
 
 ______________________________________________________________________
 
