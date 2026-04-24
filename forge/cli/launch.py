@@ -149,6 +149,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip pre-flight connectivity / YAML-parse checks.",
     )
     p.add_argument(
+        "--sync",
+        action="store_true",
+        help=(
+            "Before starting workers, push local source trees to every "
+            "host listed in --hostfile via `forge sync`.  Safeguards "
+            "against stale code on the driver (the cause of the "
+            "`ConfigKeyError: Key 'reward' not in 'GRPOConfig'` class of "
+            "failures).  Defaults to syncing `forge` + `areal`; override "
+            "with --sync-path.  Honors --ssh-port."
+        ),
+    )
+    p.add_argument(
+        "--sync-path",
+        action="append",
+        default=None,
+        dest="sync_paths",
+        help=(
+            "Extra path to include in `--sync` (relative to FORGE_ROOT or "
+            "absolute).  Repeatable.  Implies --sync.  If any --sync-path "
+            "is given the defaults are replaced, not extended -- pass "
+            "`--sync-path forge --sync-path areal --sync-path examples` to "
+            "keep the built-ins plus `examples`."
+        ),
+    )
+    p.add_argument(
         "--launcher-impl",
         default=None,
         choices=("bash", "ssh_job"),
@@ -356,6 +381,40 @@ def main(argv: list[str]) -> int:
         f"  steps           : {args.steps if args.steps is not None else '(YAML default)'}"
     )
     print("=" * 64, flush=True)
+
+    # --- Optional source sync ------------------------------------------
+    # Before starting workers, optionally push local source trees to
+    # every host so the driver + workers all run identical code.  The
+    # canonical failure this prevents is the driver's
+    # ``areal/api/cli_args.py`` being one schema-change behind the
+    # local checkout and blowing up mid-init with a ``ConfigKeyError``
+    # -- we lost two full reruns to this class of drift before
+    # introducing ``--sync``.
+    #
+    # --sync-path implies --sync (users typically only pass the paths
+    # list, which would otherwise be silently ignored).
+    if args.sync or args.sync_paths:
+        from forge.cli.sync import sync_paths_to_hosts
+
+        print("[launch] --sync: pushing source trees to all hosts ...")
+        sync_results = sync_paths_to_hosts(
+            hosts,
+            paths=args.sync_paths,
+            ssh_port=args.ssh_port,
+            parallel=max(2, len(hosts)),
+        )
+        failed = [r for r in sync_results if not r.ok]
+        for r in sync_results:
+            tag = "ok  " if r.ok else "FAIL"
+            print(f"  [{tag}] {r.host:<20} {r.elapsed_s:5.1f}s")
+            if not r.ok and r.error:
+                print(f"         -> {r.error}")
+        if failed:
+            print(
+                f"[launch] --sync: {len(failed)} host(s) failed; aborting.",
+                file=sys.stderr,
+            )
+            return 2
 
     # --- Start workers -------------------------------------------------
     # Two interchangeable paths:

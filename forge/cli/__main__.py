@@ -28,6 +28,11 @@ def main() -> int:
 
         return launch_main(sub_argv)
 
+    if sub == "sync":
+        from forge.cli.sync import main as sync_main
+
+        return sync_main(sub_argv)
+
     if sub == "list-rewards":
         from forge.cli.list_rewards import main as list_rewards_main
 
@@ -44,6 +49,7 @@ def _print_usage() -> None:
         "\n"
         "Subcommands:\n"
         "  launch <config.yaml> [options]  Multi-node GRPO launch\n"
+        "  sync --hostfile HF [--path P ...] Push local source trees to every host\n"
         "  list-rewards                    Show registered reward functions\n"
         "\n"
         "For subcommand options: python -m forge <subcommand> --help",

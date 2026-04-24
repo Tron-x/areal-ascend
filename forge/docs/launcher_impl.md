@@ -99,3 +99,70 @@ only mode until then.
 | `forge/core/types.py` | `LauncherConfig.launcher_impl` field |
 | `forge/scripts/poc_ssh_job.py` | Standalone POC harness; runs all 3 invariants against a live cluster |
 | `tests/test_forge_ssh_job.py` | 19 unit tests covering preamble, `_start_host`, `_kill`, YAML reader |
+
+## Companion: `forge sync` (code sync to all hosts)
+
+Bare-metal multi-node assumes the repository checkout under
+`FORGE_ROOT` is byte-identical on every host. Before we had a first-
+class sync command, two full `forge launch` reruns were lost to
+driver-side `ConfigKeyError: Key 'reward' not in 'GRPOConfig'` --
+literally because the driver's `areal/api/cli_args.py` lagged the
+local checkout by one schema change.
+
+### CLI
+
+```bash
+# Push default paths (forge/, areal/) to every host in the hostfile.
+python -m forge sync --hostfile forge/configs/hostfile.txt --ssh-port 36000
+
+# Explicit path set (defaults replaced, not extended).
+python -m forge sync \
+    --hostfile forge/configs/hostfile.txt \
+    --ssh-port 36000 \
+    --path forge --path areal --path examples
+
+# Dry-run prints the tar | ssh argv per host without executing.
+python -m forge sync --hostfile ... --dry-run
+```
+
+### `forge launch --sync`
+
+The same helper is wired into `forge launch` as an opt-in step that
+runs AFTER pre-flight checks and BEFORE worker startup:
+
+```bash
+python -m forge launch forge/configs/launcher_bare_metal_2node.yaml \
+    --launcher-impl ssh_job --sync
+```
+
+`--sync-path` implies `--sync` and replaces the default path set
+(pass `--sync-path forge --sync-path areal --sync-path examples` to
+keep the built-ins plus `examples/`).
+
+### Why `tar | ssh` instead of `rsync`?
+
+`rsync` is the obvious choice for delta transfer but requires the
+binary on BOTH sides. Our NPU container images frequently ship
+minimal and lack it (we hit this exact wall in the same session that
+motivated this module). `tar | ssh` only needs `tar` + `ssh`, which
+are guaranteed. The trade-off is that we ship the full path set every
+call (no delta), which is acceptable -- relevant source is tens of
+MB and sync is a launch prelude, not a hot loop.
+
+### Safety rails
+
+- Default path set is narrow (`forge`, `areal`). Everything else is
+  opt-in via `--path`. No surprise `scp` of a 40 GB checkpoint dir.
+- Default excludes (`__pycache__`, `*.pyc`, `.git`, `.venv`,
+  `node_modules`, ...) filter out the usual junk.
+- We NEVER delete remote-only files; the command is strictly
+  additive / overwriting. If rsync `--delete` semantics are needed,
+  open a follow-up.
+
+### Related code
+
+| File | Purpose |
+|------|---------|
+| `forge/cli/sync.py` | `sync_paths_to_hosts()` helper + `forge sync` CLI |
+| `forge/cli/launch.py` | `--sync` / `--sync-path` flags (wires into `sync_paths_to_hosts`) |
+| `tests/test_forge_sync.py` | 25 unit tests for argv composition, parallelism, error aggregation |
