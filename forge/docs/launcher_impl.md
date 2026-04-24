@@ -3,6 +3,15 @@
 **Audience**: anyone running multi-node `forge launch` on the 2-node
 NPU cluster (or a future equivalent).
 
+**Scope**: this doc covers the **bare-metal dev** adapter only --
+`launcher_impl`, `ForgeSSHJob`, `worker_manager.sh`, and the companion
+`forge sync` subcommand. For the bigger picture (why this adapter
+exists, how it maps to a future `KubernetesJob` / `SlurmJob` path,
+and when you should stop reading this doc and use an image instead),
+see `forge/docs/deployment_modes.md`. Short version: **everything on
+this page is bare-metal-dev-only scaffolding; containerized prod
+doesn't use any of it**.
+
 ## TL;DR
 
 ```yaml
@@ -79,6 +88,8 @@ before reaping the actual worker.
 
 ## Migration plan
 
+Inside the bare-metal dev adapter (the `bash` -> `ssh_job` transition):
+
 1. **Today** (landed): `ssh_job` is opt-in via YAML or CLI. Default
    stays `bash` so CI / muscle memory keep working.
 2. **After a few clean runs** with `ssh_job`: flip the default in
@@ -87,8 +98,16 @@ before reaping the actual worker.
    and the `_BashFleet` class; remove the switch entirely.
 
 Step 3 should only happen when there's NO remaining user with
-`launcher_impl: bash` in pinned configs. Keep the bash path in read-
-only mode until then.
+`launcher_impl: bash` in pinned configs. Keep the bash path in
+read-only mode until then.
+
+Outside the adapter (the bare-metal-dev -> containerized-prod
+transition): this page stops applying entirely. When
+`LauncherConfig.launcher` flips from `bare_metal` to `kubernetes` /
+`slurm`, Monarch dispatches via `KubernetesJob` / `SlurmJob`, and
+`launcher_impl`, `hostfile`, `worker_manager.sh`, `ForgeSSHJob`, and
+`forge sync` all become no-ops or validation errors. See
+`deployment_modes.md` for that migration.
 
 ## Related code
 
@@ -158,6 +177,25 @@ MB and sync is a launch prelude, not a hot loop.
 - We NEVER delete remote-only files; the command is strictly
   additive / overwriting. If rsync `--delete` semantics are needed,
   open a follow-up.
+
+### When NOT to use `forge sync`
+
+`forge sync` makes sense precisely in the bare-metal dev scenario
+where every host holds an independent local checkout. If any of the
+following are true, you should not be running it:
+
+- You're on k8s / SLURM with a baked container image. The image is
+  the source of truth; `forge sync` would at best be redundant, at
+  worst silently overwrite the image and drift back on the next pod
+  restart.
+- You're on a shared filesystem (NFS / Lustre / GPFS) where
+  `/root/AReaL` is the same mount on every host. One writer, all
+  readers see it; sync is meaningless.
+- You want rsync's `--delete` semantics (removing stale remote
+  files). `forge sync` is strictly additive by design.
+
+See `forge/docs/deployment_modes.md` for the full per-scenario
+breakdown.
 
 ### Related code
 
