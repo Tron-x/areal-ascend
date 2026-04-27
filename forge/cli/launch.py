@@ -1483,6 +1483,184 @@ def _stage_tmp_yamls_on_driver(
     return config, algo_config
 
 
+# ---------------------------------------------------------------------------
+# Driver dispatch
+# ---------------------------------------------------------------------------
+#
+# All three driver entrypoints (grpo / titan-pretrain / inference-bench)
+# share the same machinery: SSH into the driver host with a bash
+# preamble that sources CANN, activates the conda env, exports a few
+# dozen runtime knobs, ``cd`` into the source root (FUSE mount or
+# local checkout), and pipes ``python -m forge.apps.X ...`` through
+# ``tee`` for an on-disk log.  Before the extraction below this was
+# 240 lines of nearly-identical bash composition spread across three
+# functions, with subtle drift (one missed ``set -o pipefail`` for
+# almost a full session).
+#
+# The split is now:
+#
+# * :func:`_driver_base_env_lines` -- env block every mode needs
+#   (CANN, conda, ASCEND/HCCL knobs, HF offline trio).  Stable
+#   across modes; changes here apply uniformly.
+# * :func:`_run_driver_via_ssh` -- the bash composition + SSH wrap +
+#   timed status print.  Single owner of the ugly shell parts; mode
+#   builders just hand it ``argv``, ``env_extras``, and a log path.
+# * :func:`_run_driver_training` / :func:`_run_driver_titan_pretrain`
+#   / :func:`_run_driver_inference_bench` -- thin builders that
+#   compose the per-mode argv + env extras, then call the helper.
+#
+# Future direction: replace SSH+tee with a Monarch ``BashActor``
+# spawned on the driver host's worker proc, using
+# ``start()`` / ``poll_output()`` for live log forwarding.  Deferred
+# until the streaming-stdout story on top of Monarch is mature
+# enough to drop tee without losing live progress visibility.
+# ---------------------------------------------------------------------------
+
+
+# Forge / torchstore env vars forwarded from the operator's shell to
+# the driver process so ``forge.engines.weight_sync._config_resolver``
+# can pick them up as overrides.  Vars not set in the operator's shell
+# are left unset, letting the YAML value win.  Currently only used
+# by the GRPO mode (titan / inference don't run weight_sync), but
+# kept module-level so a single audit point covers the forwarding
+# contract.
+_GRPO_FORWARDED_ENV: tuple[str, ...] = (
+    "FORGE_WEIGHT_SYNC",
+    "FORGE_WEIGHT_SYNC_BACKEND",
+    "FORGE_SHARD_PUBLISH",
+    "FORGE_MESH_PLACEMENT",
+    "FORGE_STORAGE_HOST_MESH",
+    "FORGE_BCAST_SRC_VOL_IDX",
+    "FORGE_BCAST_MASTER_PORT",
+    "FORGE_SUPPRESS_DEPRECATION",
+    "TORCHSTORE_STORAGE_NPU_BASE",
+    "TORCHSTORE_MONARCH_RDMA_POOL_MB",
+)
+
+
+def _driver_base_env_lines(cann: str) -> list[str]:
+    """Return the env preamble lines every driver mode needs.
+
+    These are deliberately mode-agnostic: CANN sourcing, the
+    ``monarch_ascend`` conda activation, the universally-safe
+    ASCEND/HCCL knobs, and the HuggingFace offline trio.  Mode-
+    specific env (HiXL/torchstore for GRPO, PYTHONPATH for
+    titan/inference, etc.) goes in the ``env_extras`` parameter
+    of :func:`_run_driver_via_ssh`.
+
+    The HF offline trio (``HF_DATASETS_OFFLINE`` / ``TRANSFORMERS_OFFLINE``
+    / ``HF_HUB_OFFLINE``) is here even though TT loads from
+    ``c4_test`` fixtures and inference-bench loads from local
+    snapshots: any helper module either driver imports may
+    indirectly pull in ``transformers``, which will block on
+    ``huggingface.co`` if the firewall is in front.  The
+    ``${VAR:-1}`` form lets operators override with
+    ``HF_DATASETS_OFFLINE=0 forge launch ...`` when warming the
+    cache on a one-off basis.
+    """
+    return [
+        f"source {cann}/set_env.sh 2>/dev/null",
+        f"ASCEND_ROOT=$(dirname {cann})",
+        '[[ -f "$ASCEND_ROOT/nnal/atb/set_env.sh" ]] && '
+        'source "$ASCEND_ROOT/nnal/atb/set_env.sh"',
+        'eval "$(/root/miniconda3/bin/conda shell.bash hook)"',
+        "conda activate monarch_ascend",
+        "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        'export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"',
+        'export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"',
+        'export HCCL_DEBUG="${HCCL_DEBUG:-INFO}"',
+        "export HCCL_CONNECT_TIMEOUT=120",
+        'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"',
+        'export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"',
+        'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"',
+    ]
+
+
+def _run_driver_via_ssh(
+    *,
+    mode_label: str,
+    driver: str,
+    ssh_port: int,
+    cann: str,
+    code_root: str,
+    argv: list[str],
+    env_extras: list[str],
+    log_path: str,
+    show_error_hint: bool = False,
+) -> int:
+    """Single owner of the SSH + bash + tee driver dispatch path.
+
+    ``mode_label`` is purely cosmetic, used in the start/finish
+    print lines (``[launch] training on ...`` vs ``titan-pretrain``
+    vs ``inference-bench``).
+
+    ``code_root`` is the worker-visible source path -- typically
+    ``/root/AReaL_remote`` (FUSE mount, the default when
+    ``mount_code=True``) or ``/root/AReaL`` (local checkout).  The
+    ``mkdir -p`` before ``cd`` is defensive: when ``code_root`` is
+    a FUSE mountpoint and the mount activation hasn't reached this
+    host yet, ``cd`` would fail with ENOENT.
+
+    ``env_extras`` are appended after the base env block so a mode
+    can override base defaults (e.g.\\ titan re-exports a fuller
+    PYTHONPATH for explicit ``/root/monarch/python`` access).
+
+    ``log_path`` is on the driver host's filesystem (we still tee
+    to ``/tmp/forge_*.log`` for post-hoc inspection); separate per
+    mode so concurrent smokes don't clobber each other.
+
+    ``set -o pipefail`` is universal: without it, ``python ... | tee``
+    returns tee's exit status (always 0) and silently masks driver
+    failures.  We lost a debugging session to a missing pipefail in
+    the titan path before this was extracted; centralising it here
+    is the easiest way to ensure it's never forgotten on a future
+    mode addition.
+
+    ``show_error_hint`` controls whether :func:`_error_hint` is
+    printed on non-zero rc.  Currently only the GRPO mode opts in
+    -- titan/inference failures are typically argparse / config
+    errors that don't benefit from the weight_sync-flavoured hint
+    text.
+    """
+    base_env = _driver_base_env_lines(cann)
+    remote_cmd_parts = [
+        "set -o pipefail",
+        *base_env,
+        *env_extras,
+        f"mkdir -p {shlex.quote(code_root)}",
+        f"cd {shlex.quote(code_root)}",
+        _shellify(argv) + f" 2>&1 | tee {shlex.quote(log_path)}",
+    ]
+    remote_cmd = "; ".join(remote_cmd_parts)
+
+    ssh_cmd = [
+        "ssh",
+        "-p",
+        str(ssh_port),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=10",
+        f"root@{driver}",
+        remote_cmd,
+    ]
+
+    start = time.time()
+    print(f"[launch] {mode_label} on {driver} (started at {time.strftime('%H:%M:%S')})")
+    rc = subprocess.call(ssh_cmd)
+    elapsed = time.time() - start
+
+    print("=" * 64)
+    if rc == 0:
+        print(f" forge launch: {mode_label} OK ({elapsed:.0f}s)")
+    else:
+        print(f" forge launch: {mode_label} FAILED rc={rc} ({elapsed:.0f}s)")
+        if show_error_hint:
+            print(_error_hint(rc, log_path=log_path))
+    print("=" * 64)
+    return rc
+
+
 def _run_driver_training(
     *,
     args: argparse.Namespace,
@@ -1497,9 +1675,15 @@ def _run_driver_training(
 ) -> int:
     """SSH into the driver host and run ``python -m forge.apps.grpo``.
 
-    ``code_root`` overrides the worker-visible ``cd``/``PYTHONPATH``
-    target.  Default :data:`FORGE_ROOT` keeps the legacy behaviour
-    (driver reads its own local ``/root/AReaL`` checkout); pass
+    Composes the GRPO-specific argv + env extras (HiXL/torchstore
+    transport vars, ModelScope/HF mirror plumbing for in-process
+    weight pulls, plus operator-forwarded ``FORGE_*`` overrides),
+    then hands off to :func:`_run_driver_via_ssh` for the bash +
+    SSH wrapping.
+
+    ``code_root`` overrides the worker-visible ``cd`` target.
+    Default :data:`FORGE_ROOT` keeps the legacy behaviour (driver
+    reads its own local ``/root/AReaL`` checkout); pass
     :attr:`_SSHJobFleet.code_root` (typically ``/root/AReaL_remote``)
     when ``mount_code=True`` so the driver sees the same FUSE-mounted
     source view as the workers it orchestrates -- no more local-disk
@@ -1519,7 +1703,6 @@ def _run_driver_training(
         ssh_port=args.ssh_port,
     )
 
-    # Build the forge.apps.grpo command line.
     grpo_argv = [
         "python",
         "-m",
@@ -1546,90 +1729,36 @@ def _run_driver_training(
         grpo_argv += [f"+total_train_steps={args.steps}"]
     grpo_argv += extra_argv
 
-    # Compose the remote bash one-liner.  These env exports match the
-    # production run_multinode.sh block; keeping parity is essential
-    # for the smoke-regression guarantee across the two entrypoints.
-    env_lines = [
-        f"source {args.cann}/set_env.sh 2>/dev/null",
-        f"ASCEND_ROOT=$(dirname {args.cann})",
-        '[[ -f "$ASCEND_ROOT/nnal/atb/set_env.sh" ]] && '
-        'source "$ASCEND_ROOT/nnal/atb/set_env.sh"',
-        'eval "$(/root/miniconda3/bin/conda shell.bash hook)"',
-        "conda activate monarch_ascend",
+    # GRPO env extras: HiXL/torchstore transport (weight sync runs in
+    # the driver proc itself for the colocated mesh), VLLM/HF mirror
+    # for vLLM-side model fetching, and operator-forwarded FORGE_*
+    # vars (so ``FORGE_WEIGHT_SYNC=ascend forge launch ...`` reaches
+    # _config_resolver and trips the deprecation warning).
+    env_extras = [
         "export VLLM_USE_MODELSCOPE=true",
         "export HF_ENDPOINT=https://hf-mirror.com",
-        # HuggingFace offline defaults (see provisioner_ssh._env_preamble
-        # for the full rationale).  Safe on air-gapped bare-metal
-        # clusters; override with HF_DATASETS_OFFLINE=0 in the operator
-        # shell when cache warmup is needed.
-        'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"',
-        'export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"',
-        'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"',
-        "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
-        'export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"',
-        'export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"',
-        'export HCCL_DEBUG="${HCCL_DEBUG:-INFO}"',
         "export MONARCH_HIXL_TRANSPORT=roce",
         "export HCCL_INTRA_ROCE_ENABLE=1",
-        "export HCCL_CONNECT_TIMEOUT=120",
         "export HCCL_NPU_SOCKET_PORT_RANGE=60000-60255",
         "export TORCHSTORE_MONARCH_RDMA_EAGER_D2H=0",
         "export TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:0",
     ]
-
-    # Forward user-set forge/torchstore env vars so
-    # forge.engines.weight_sync._config_resolver can pick them up as
-    # overrides (and emit the deprecation warning).  Vars unset in the
-    # caller's shell are left unset, letting the YAML value win.
-    for var in (
-        "FORGE_WEIGHT_SYNC",
-        "FORGE_WEIGHT_SYNC_BACKEND",
-        "FORGE_SHARD_PUBLISH",
-        "FORGE_MESH_PLACEMENT",
-        "FORGE_STORAGE_HOST_MESH",
-        "FORGE_BCAST_SRC_VOL_IDX",
-        "FORGE_BCAST_MASTER_PORT",
-        "FORGE_SUPPRESS_DEPRECATION",
-        "TORCHSTORE_STORAGE_NPU_BASE",
-        "TORCHSTORE_MONARCH_RDMA_POOL_MB",
-    ):
+    for var in _GRPO_FORWARDED_ENV:
         v = os.environ.get(var)
         if v is not None:
-            env_lines.append(f"export {var}={shlex.quote(v)}")
+            env_extras.append(f"export {var}={shlex.quote(v)}")
 
-    remote_cmd_parts = [
-        *env_lines,
-        f"mkdir -p {shlex.quote(code_root)}",
-        f"cd {shlex.quote(code_root)}",
-        _shellify(grpo_argv) + " 2>&1 | tee /tmp/forge_multinode.log",
-    ]
-    remote_cmd = "; ".join(remote_cmd_parts)
-
-    ssh_cmd = [
-        "ssh",
-        "-p",
-        str(args.ssh_port),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=10",
-        f"root@{driver}",
-        remote_cmd,
-    ]
-
-    start = time.time()
-    print(f"[launch] training on {driver} (started at {time.strftime('%H:%M:%S')})")
-    rc = subprocess.call(ssh_cmd)
-    elapsed = time.time() - start
-
-    print("=" * 64)
-    if rc == 0:
-        print(f" forge launch: training OK ({elapsed:.0f}s)")
-    else:
-        print(f" forge launch: training FAILED rc={rc} ({elapsed:.0f}s)")
-        print(_error_hint(rc))
-    print("=" * 64)
-    return rc
+    return _run_driver_via_ssh(
+        mode_label="training",
+        driver=driver,
+        ssh_port=args.ssh_port,
+        cann=args.cann,
+        code_root=code_root,
+        argv=grpo_argv,
+        env_extras=env_extras,
+        log_path="/tmp/forge_multinode.log",
+        show_error_hint=True,
+    )
 
 
 def _run_driver_titan_pretrain(
@@ -1642,26 +1771,16 @@ def _run_driver_titan_pretrain(
 ) -> int:
     """SSH into the driver host and run ``python -m forge.apps.titan_pretrain``.
 
-    The titan-pretrain mode needs a much smaller env block than
-    GRPO -- no HiXL, no torchstore, no ModelScope/HF mirror plumbing
-    (TT loads its own datasets via the ``c4_test`` fixture path).
-    Keeping this function separate from :func:`_run_driver_training`
-    avoids an "if mode == 'titan-pretrain': skip these 12 exports"
-    fork inside the GRPO path.
-
-    ``code_root`` overrides the worker-visible ``cd``/``PYTHONPATH``
-    target (see :func:`_run_driver_training` for rationale).  Default
-    :data:`FORGE_ROOT`; pass :attr:`_SSHJobFleet.code_root` to read
-    source through the FUSE mount instead of the driver's local
-    checkout.
+    The titan-pretrain mode runs with the slim ``pure-training``
+    profile env: no HiXL, no torchstore, no ModelScope/HF mirror
+    plumbing.  TT itself loads bundled ``c4_test`` fixtures, so the
+    only mode-specific extra is the explicit PYTHONPATH (so
+    ``import monarch`` / ``import torchstore`` resolve through the
+    out-of-tree checkouts at ``/root/monarch/python`` and
+    ``/root/torchstore``, which aren't installed into the conda env).
     """
     if code_root is None:
         code_root = str(FORGE_ROOT)
-    # Stage the algo YAML on the driver if it lives under /tmp
-    # (auto-generated by ``_resolve_configs``); otherwise it's a
-    # checked-in file the driver can read from its own checkout.
-    # Pass the algo_config twice so _stage_tmp_yamls_on_driver doesn't
-    # have to grow a new signature for the single-file case.
     _, algo_config = _stage_tmp_yamls_on_driver(
         config=algo_config,
         algo_config=algo_config,
@@ -1669,9 +1788,6 @@ def _run_driver_titan_pretrain(
         ssh_port=args.ssh_port,
     )
 
-    # Build the forge.apps.titan_pretrain command line.  Mirror the
-    # flags the app's argparse accepts (see
-    # forge/apps/titan_pretrain.py::_build_parser).
     pretrain_argv = [
         "python",
         "-m",
@@ -1684,74 +1800,20 @@ def _run_driver_titan_pretrain(
     if args.steps is not None:
         pretrain_argv += ["--steps", str(args.steps)]
 
-    # Slim env block: pure-training profile parity.  Match the
-    # ``common_env_block`` of worker_manager.sh so the driver proc
-    # has the same CANN + HCCL_DEBUG knobs as the workers it
-    # orchestrates.  Crucially, NO HiXL / torchstore / HCCL port
-    # range exports -- those would re-introduce the HCCS->RoCE
-    # downgrade we explicitly avoided by selecting profile=
-    # pure-training in the first place.
-    env_lines = [
-        f"source {args.cann}/set_env.sh 2>/dev/null",
-        f"ASCEND_ROOT=$(dirname {args.cann})",
-        '[[ -f "$ASCEND_ROOT/nnal/atb/set_env.sh" ]] && '
-        'source "$ASCEND_ROOT/nnal/atb/set_env.sh"',
-        'eval "$(/root/miniconda3/bin/conda shell.bash hook)"',
-        "conda activate monarch_ascend",
+    env_extras = [
         f'export PYTHONPATH={shlex.quote(code_root)}":/root/torchstore:/root/monarch/python:${{PYTHONPATH:-}}"',
-        "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
-        'export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"',
-        'export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"',
-        'export HCCL_DEBUG="${HCCL_DEBUG:-INFO}"',
-        "export HCCL_CONNECT_TIMEOUT=120",
-        # HF offline trio: TT itself uses bundled c4_test fixtures and
-        # doesn't load anything from HuggingFace, but if any helper
-        # the driver imports pulls in ``transformers`` it will try to
-        # contact huggingface.co and hang on the firewall.  Mirror
-        # inference-bench's defaults so the env is coherent.
-        'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"',
-        'export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"',
-        'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"',
     ]
 
-    # ``set -o pipefail`` is critical: without it, ``python ... | tee``
-    # returns ``tee``'s exit status (always 0), masking titan_pretrain
-    # failures and turning every smoke run into a false-positive "OK".
-    remote_cmd_parts = [
-        "set -o pipefail",
-        *env_lines,
-        f"mkdir -p {shlex.quote(code_root)}",
-        f"cd {shlex.quote(code_root)}",
-        _shellify(pretrain_argv) + " 2>&1 | tee /tmp/forge_titan_pretrain.log",
-    ]
-    remote_cmd = "; ".join(remote_cmd_parts)
-
-    ssh_cmd = [
-        "ssh",
-        "-p",
-        str(args.ssh_port),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=10",
-        f"root@{driver}",
-        remote_cmd,
-    ]
-
-    start = time.time()
-    print(
-        f"[launch] titan-pretrain on {driver} (started at {time.strftime('%H:%M:%S')})"
+    return _run_driver_via_ssh(
+        mode_label="titan-pretrain",
+        driver=driver,
+        ssh_port=args.ssh_port,
+        cann=args.cann,
+        code_root=code_root,
+        argv=pretrain_argv,
+        env_extras=env_extras,
+        log_path="/tmp/forge_titan_pretrain.log",
     )
-    rc = subprocess.call(ssh_cmd)
-    elapsed = time.time() - start
-
-    print("=" * 64)
-    if rc == 0:
-        print(f" forge launch: titan-pretrain OK ({elapsed:.0f}s)")
-    else:
-        print(f" forge launch: titan-pretrain FAILED rc={rc} ({elapsed:.0f}s)")
-    print("=" * 64)
-    return rc
 
 
 def _run_driver_inference_bench(
@@ -1764,24 +1826,11 @@ def _run_driver_inference_bench(
 ) -> int:
     """SSH into the driver host and run ``python -m forge.apps.inference_bench``.
 
-    Near-clone of :func:`_run_driver_titan_pretrain`: same slim
-    pure-training env, same algo-YAML staging, same SSH wrapper.
-    The only differences are (a) the driver module name, (b) the
-    ``--duration`` convenience override, and (c) the log file name
-    (so concurrent titan + inference smokes don't clobber each
-    other's logs).
-
-    Why duplicate instead of factoring?  Both functions are ~80
-    lines of straight-line code and duplication makes each easy to
-    read in isolation.  When a third backend appears and the
-    duplication actually starts to drift, that's the signal to
-    factor; until then keep them parallel and audit them side-by-
-    side whenever either changes.
-
-    ``code_root``: see :func:`_run_driver_titan_pretrain` for the
-    same rationale -- worker-visible source path, defaults to
-    :data:`FORGE_ROOT` (legacy local checkout) and gets pointed at
-    the FUSE mountpoint when ``mount_code=True``.
+    Same slim pure-training env as titan-pretrain, plus a
+    ``--duration`` knob unique to the bench harness.  The driver
+    itself doesn't load the model (orchestration only); the vLLM
+    replicas it spawns on each worker do, and they have their own
+    HF cache via the worker profile env.
     """
     if code_root is None:
         code_root = str(FORGE_ROOT)
@@ -1802,92 +1851,42 @@ def _run_driver_inference_bench(
         workers_arg,
     ]
     # ``args.steps`` is the GRPO/titan-pretrain training-step knob;
-    # for inference we surface ``--duration`` instead via a
-    # dedicated CLI flag.  Both flags are forwarded only when the
-    # user actually set them so the YAML's value is honoured by
-    # default.
+    # for inference we surface ``--duration`` instead.  Forwarded
+    # only when the user actually set it so the YAML value wins
+    # otherwise.
     duration = getattr(args, "duration", None)
     if duration is not None:
         bench_argv += ["--duration", str(duration)]
 
-    env_lines = [
-        f"source {args.cann}/set_env.sh 2>/dev/null",
-        f"ASCEND_ROOT=$(dirname {args.cann})",
-        '[[ -f "$ASCEND_ROOT/nnal/atb/set_env.sh" ]] && '
-        'source "$ASCEND_ROOT/nnal/atb/set_env.sh"',
-        'eval "$(/root/miniconda3/bin/conda shell.bash hook)"',
-        "conda activate monarch_ascend",
+    env_extras = [
         f'export PYTHONPATH={shlex.quote(code_root)}":/root/torchstore:/root/monarch/python:${{PYTHONPATH:-}}"',
-        "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
-        'export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"',
-        'export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"',
-        'export HCCL_DEBUG="${HCCL_DEBUG:-INFO}"',
-        "export HCCL_CONNECT_TIMEOUT=120",
-        # vLLM + HF cache: workers in pure-training profile already
-        # set HF_HUB_OFFLINE so the model load reuses local snapshots.
-        # The driver itself doesn't load the model (orchestration only)
-        # but mirroring keeps the env coherent if any helper imports
-        # transformers and tries to phone home.
-        'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"',
-        'export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"',
-        'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"',
     ]
 
-    # ``set -o pipefail`` is critical: without it, ``python ... | tee``
-    # returns ``tee``'s exit status (always 0), masking inference_bench
-    # failures and turning every smoke run into a false-positive "OK".
-    remote_cmd_parts = [
-        "set -o pipefail",
-        *env_lines,
-        f"mkdir -p {shlex.quote(code_root)}",
-        f"cd {shlex.quote(code_root)}",
-        _shellify(bench_argv) + " 2>&1 | tee /tmp/forge_inference_bench.log",
-    ]
-    remote_cmd = "; ".join(remote_cmd_parts)
-
-    ssh_cmd = [
-        "ssh",
-        "-p",
-        str(args.ssh_port),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "ConnectTimeout=10",
-        f"root@{driver}",
-        remote_cmd,
-    ]
-
-    start = time.time()
-    print(
-        f"[launch] inference-bench on {driver} (started at {time.strftime('%H:%M:%S')})"
+    return _run_driver_via_ssh(
+        mode_label="inference-bench",
+        driver=driver,
+        ssh_port=args.ssh_port,
+        cann=args.cann,
+        code_root=code_root,
+        argv=bench_argv,
+        env_extras=env_extras,
+        log_path="/tmp/forge_inference_bench.log",
     )
-    rc = subprocess.call(ssh_cmd)
-    elapsed = time.time() - start
-
-    print("=" * 64)
-    if rc == 0:
-        print(f" forge launch: inference-bench OK ({elapsed:.0f}s)")
-    else:
-        print(f" forge launch: inference-bench FAILED rc={rc} ({elapsed:.0f}s)")
-    print("=" * 64)
-    return rc
 
 
 def _shellify(argv: list[str]) -> str:
-    import shlex
-
     return " ".join(shlex.quote(a) for a in argv)
 
 
-def _error_hint(rc: int) -> str:
+def _error_hint(rc: int, *, log_path: str = "/tmp/forge_multinode.log") -> str:
     """Best-effort error code translation.
 
-    Pulled from ``forge_multinode.log`` post-hoc would be ideal, but
-    for now we give a generic pointer to the doc.  Wire in keyword
-    grepping of the log if this turns out to be useful.
+    Generic pointer to the post-mortem log + the documented
+    failure-mode ledger.  Wire in keyword grepping of ``log_path``
+    if the static text turns out to be insufficient.
     """
     return (
-        f"  Hint: rc={rc}. Inspect /tmp/forge_multinode.log on the driver host.\n"
+        f"  Hint: rc={rc}. Inspect {log_path} on the driver host.\n"
         f"  Common failure modes are documented in\n"
         f"    forge/docs/weight_sync.md §7 (known-pain ledger)\n"
         f"  with each CANN/HCCL/HiXL error code mapped to a root cause."
