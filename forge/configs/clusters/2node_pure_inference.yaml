@@ -1,0 +1,56 @@
+# Cluster preset: 2-bare-metal-node pure-inference layout.
+#
+# INFRA-OWNED.  Sister preset of ``2node_pure_training.yaml`` -- same
+# physical machines, same env profile, but a different role taxonomy
+# expressing "the algo wants generator capacity, not trainer capacity".
+#
+# Used by the ``--mode inference-bench`` (and future ``inference-serve``)
+# entries of ``forge launch``: 2 independent vLLM TP=8 replicas, one
+# per host, no cross-host process group, no weight sync.
+#
+# Why a separate preset (and not just a role rename in the training
+# preset)?  Algo-layer YAML declares its requirement against a role
+# *name* (e.g. ``roles.generator.devices``).  The preset must publish
+# that name in its ``roles:`` block, otherwise the scheduler can't
+# bind the role to hosts.  Keeping training and inference presets
+# separate also leaves room for future divergence (e.g. inference
+# might one day want a different memory-overcommit profile).
+
+launcher:
+  type: bare_metal
+
+  # Profile-aware ssh_job: same ForgeSSHJob preamble as the training
+  # preset, no HiXL/torchstore env (pure-training profile below).
+  # See ``forge/provisioner_ssh.py::_profile_env_parts``.
+  launcher_impl: ssh_job
+
+  # ``pure-training`` is the right profile for standalone inference
+  # too -- there is no HiXL/torchstore in this workload, and we want
+  # HCCL to auto-select HCCS for any intra-host collectives that vLLM
+  # uses (TP=8 lives entirely inside one host).  The profile name
+  # ("pure-training") predates the inference use case; treat it as
+  # "pure-compute, no weight-sync overlay" semantically.
+  profile: pure-training
+
+  # Same physical pool as the training preset.  Driver tag picks the
+  # host that runs ``forge.apps.inference_bench`` -- CPU-only orchestrator
+  # that fan-outs the run_benchmark RPC to both replicas.
+  pool:
+    - host: 192.168.0.26
+      port: 22222
+      hardware: npu
+      n_devices: 8
+    - host: 192.168.0.23
+      port: 22222
+      hardware: npu
+      n_devices: 8
+      role: driver
+
+  # Single-role layout.  ``devices`` here is the *aggregate* NPU
+  # count across the whole cluster; the inference-bench driver spreads
+  # it evenly as one TP=8 vLLM replica per host (devices / len(pool)).
+  # The algo YAML overrides this to express its actual NPU budget.
+  roles:
+    generator:
+      devices: 8
+      hardware: npu

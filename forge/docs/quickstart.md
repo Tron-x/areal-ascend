@@ -30,17 +30,18 @@ connect back to it.
 
 ## Step 2: Pick or customize a launcher YAML
 
-AReaL uses a **two-layer YAML** split (see
-`forge/cli/presets.py`): infra/ops owns a *cluster preset* under
-`forge/configs/clusters/`, and the algo author sets `launcher_preset:`
-+ per-role device counts in their experiment YAML.
+AReaL uses a **two-layer YAML** split (see `forge/cli/presets.py`): infra/ops owns a
+*cluster preset* under `forge/configs/clusters/`, and the algo author sets
+`launcher_preset:`
+
+- per-role device counts in their experiment YAML.
 
 Built-in presets:
 
-* `forge/configs/clusters/2node_colocated.yaml` — 2-node NPU setup, storage on
-  the trainer host.
-* `forge/configs/clusters/2node_dedicated_ps.yaml` — 2-node NPU setup, storage
-  on the generator host (A/B topology).
+- `forge/configs/clusters/2node_colocated.yaml` — 2-node NPU setup, storage on the
+  trainer host.
+- `forge/configs/clusters/2node_dedicated_ps.yaml` — 2-node NPU setup, storage on the
+  generator host (A/B topology).
 
 An experiment YAML references a preset with one line:
 
@@ -55,8 +56,7 @@ roles:
   reward:    {devices: 0}
 ```
 
-The preset file itself holds the infra details (pool, colocate, weight-sync
-fabric):
+The preset file itself holds the infra details (pool, colocate, weight-sync fabric):
 
 ```yaml
 # forge/configs/clusters/2node_colocated.yaml  (excerpt)
@@ -101,18 +101,21 @@ python -m forge launch examples/math/gsm8k_grpo_npu.yaml \
     rollout.consumer_batch_size=8  rollout.max_concurrent_rollouts=8
 ```
 
-The positional arg is the **algorithm YAML** — `forge launch`
-auto-detects the `launcher_preset:` key, resolves the preset, merges
-the algo's role-device overrides, and writes a composed launcher YAML
-to `/tmp/forge_composed_*.yaml` before starting workers.  Pass a raw
-preset (`forge/configs/clusters/*.yaml`) for legacy / bring-up flows.
+The positional arg is the **algorithm YAML** — `forge launch` auto-detects the
+`launcher_preset:` key, resolves the preset, merges the algo's role-device overrides,
+and writes a composed launcher YAML to `/tmp/forge_composed_*.yaml` before starting
+workers. Pass a raw preset (`forge/configs/clusters/*.yaml`) for legacy / bring-up
+flows.
 
 What happens:
 
 1. **Pre-flight**: hostfile existence, per-host SSH reachability, YAML parseability.
    Fails fast with a concrete error list.
-1. **Worker start**: `worker_manager.sh start` spawns Monarch workers on every host in
-   the hostfile.
+1. **Worker start**: `worker_manager.sh start --profile hixl-coexist` spawns Monarch
+   workers on every host in the hostfile. The `hixl-coexist` profile is required by GRPO
+   because weight sync co-locates HCCL collectives with HiXL/torchstore RDMA in the same
+   process; pure-training workloads (B-mini, SFT, pretrain) should instead use
+   `--profile pure-training` for the optimal HCCS-intra + RoCE-inter transport.
 1. **Training**: SSHs to the driver host, activates the conda env, exports NPU/HiXL
    runtime env, runs `python -m forge.apps.grpo`.
 1. **Cleanup (guaranteed)**: on success, failure, or Ctrl+C, all Monarch workers are
@@ -177,8 +180,8 @@ Flip the preset reference in your algo YAML:
 launcher_preset: 2node_dedicated_ps
 ```
 
-Same role-device fields; the preset flips `storage.colocate` from
-`trainer` to `generator` and sets `storage_npu_base: 4`.
+Same role-device fields; the preset flips `storage.colocate` from `trainer` to
+`generator` and sets `storage_npu_base: 4`.
 
 ### Backwards compat: existing shell scripts still work
 

@@ -1,0 +1,80 @@
+# Cluster preset: 2-bare-metal-node pure-training layout.
+#
+# INFRA-OWNED.  This preset targets workloads that DO NOT mix HiXL or
+# torchstore weight-sync into the trainer process: TorchTitan
+# pretraining, SFT, eval, and the B-full ``--mode titan-pretrain``
+# entry of ``forge launch``.
+#
+# Differences vs. ``2node_colocated.yaml`` (the GRPO preset):
+#
+#   * ``launcher.profile: pure-training`` -- propagates to
+#     ``worker_manager.sh start --profile pure-training`` so HCCL
+#     auto-selects HCCS for intra-host pairs (no forced RoCE).  The
+#     GRPO preset uses ``hixl-coexist`` which forces intra-host RoCE
+#     to keep HiXL Connect alive.  ~10x intra-host bandwidth at
+#     stake.  (See ``forge/scripts/worker_manager.sh::profile_env_block``
+#     for the full env diff.)
+#   * No ``generator`` / ``storage`` / ``reward`` roles -- pure
+#     pretraining is single-role.  Just ``trainer``.
+#   * No ``weight_sync:`` block -- there is no sync step in pure
+#     pretraining (model weights stay in-memory inside the TT trainer
+#     for the whole run).
+#   * ``trainer.devices`` defaults to 8 (the whole 4+4 layout) but
+#     the algo YAML SHOULD override it to express its actual NPU
+#     budget.  Set to 0 to skip device debiting if you only want host
+#     scheduling.
+#
+# Two-layer mental model still applies:
+#
+#   preset (this file)     "what hardware exists + which env profile"
+#   algo yaml              "how many NPUs trainer wants + TT config"
+#   scheduler              "bind them" -> host_idx per role
+#
+# The algo YAML may override ``roles.trainer.devices`` only.  Every
+# other field here is an infra/ops decision -- changing them belongs
+# in this file, not the algo YAML.
+
+launcher:
+  type: bare_metal
+
+  # Worker lifecycle manager.  ``ssh_job`` uses Monarch's native
+  # ForgeSSHJob wrapper, which is now profile-aware (see
+  # ``forge/provisioner_ssh.py::_profile_env_parts``) so it honours
+  # ``profile: pure-training`` below correctly -- the worker boots
+  # without HiXL/torchstore env, exactly like worker_manager.sh's
+  # pure-training profile.  Use ``bash`` if you need the legacy
+  # worker_manager.sh path for debugging.
+  launcher_impl: ssh_job
+
+  # Worker env preset.  Read by ``forge.cli.launch`` and forwarded to
+  # ``worker_manager.sh start --profile <value>``.  ``pure-training``
+  # is the right default for this preset; never set to
+  # ``hixl-coexist`` here -- if you need HiXL, use 2node_colocated
+  # which is set up for it end-to-end.
+  profile: pure-training
+
+  # Cluster pool -- infrastructure declaration.  Identical layout to
+  # 2node_colocated; same physical machines, just used for a
+  # different workload class.  Driver tag picks which host runs the
+  # ``forge.apps.titan_pretrain`` orchestration loop -- it CPU-only
+  # for titan-pretrain (the actor mesh occupies the NPUs, the driver
+  # itself doesn't need an accelerator).
+  pool:
+    - host: 192.168.0.26
+      port: 22222
+      hardware: npu
+      n_devices: 8
+    - host: 192.168.0.23
+      port: 22222
+      hardware: npu
+      n_devices: 8
+      role: driver
+
+  # Single-role layout.  ``devices`` here is the *aggregate* NPU
+  # count across the whole cluster; the titan-pretrain app spreads
+  # it evenly via per-host = devices / len(pool).  The algo YAML
+  # overrides this to e.g. devices: 4 for a smaller smoke run.
+  roles:
+    trainer:
+      devices: 8
+      hardware: npu

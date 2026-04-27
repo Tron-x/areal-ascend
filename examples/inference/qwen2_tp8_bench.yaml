@@ -1,0 +1,126 @@
+# 2-node inference benchmark -- algorithm-author view.
+#
+# Spins up 2 independent vLLM replicas (one per host), each owning
+# its host's NPUs internally via vLLM's MP executor.  No cross-host
+# communication, no weight sync, no HiXL.  Self-contained smoke
+# that validates the ``forge launch`` pattern carries inference
+# workloads exactly the same way it carries titan-pretrain.
+#
+# Note: filename retains the historical "tp8" tag from the original
+# design intent -- actual TP value is set by ``tensor_parallel_size``
+# below and constrained by the model's attention head count.  See
+# the comment on ``tensor_parallel_size`` for the constraint.
+#
+# Run::
+#
+#     python -m forge launch examples/inference/qwen2_tp8_bench.yaml
+#
+# Optional CLI overrides (all map to the ``inference.benchmark`` block
+# below)::
+#
+#     --duration 60         # bench longer
+#
+# Output (driver host stdout)::
+#
+#     [inference_bench] host=192.168.0.26 throughput=850.2 tok/s ...
+#     [inference_bench] host=192.168.0.23 throughput=843.7 tok/s ...
+#     [inference_bench] aggregate throughput: 1693.9 tok/s across 2 replicas (30s)
+#
+# Mirrors the shape of llama3_titan_debug.yaml exactly -- if you can
+# read one, you can read this.
+
+# Dispatch tag.  Read by ``forge.cli.launch`` to pick the driver app
+# (``forge.apps.inference_bench`` here, vs. ``forge.apps.titan_pretrain``
+# for B-full pretraining, vs. ``forge.apps.grpo`` for the default
+# RL post-training mode).  CLI ``--mode`` overrides this.
+mode: inference-bench
+
+# Cluster preset -- resolved under ``forge/configs/clusters/``.
+# 2node_pure_inference shares the pure-training profile with the
+# titan preset (no HiXL/torchstore env), but publishes a ``generator``
+# role instead of ``trainer`` so the role name in the algo YAML below
+# binds against something in the preset.
+launcher_preset: 2node_pure_inference
+
+# Per-role NPU budget.  devices=8 means "8 NPUs cluster-wide for
+# generator" -- the inference-bench app spreads them as 1 TP=8 vLLM
+# replica per host (8 / 2 hosts = 4 per host BUT we choose to keep
+# all 8 of one host together for a single TP group; see the driver
+# code for how procs_per_host=1 + tp_size=8 reconciles this).
+roles:
+  generator:
+    devices: 8
+
+# vLLM configuration surface.  Everything under ``inference:`` is
+# read by ``forge.apps.inference_bench`` on the driver host and
+# forwarded to ``VLLMInferenceActor.init`` on each replica.
+inference:
+  # HuggingFace model id or local path.  We use the *modelscope*
+  # mirror on disk because the HF hub snapshot for this model on
+  # the cluster is partial (model.safetensors only -- no tokenizer
+  # files), and ``HF_HUB_OFFLINE=1`` in the pure-training profile
+  # blocks the runtime download.  The modelscope path has the full
+  # tokenizer (``tokenizer.json``, ``vocab.json``, ``merges.txt``,
+  # ``tokenizer_config.json``) cached.  Both hosts of the
+  # 2node_pure_inference preset have this path populated.
+  #
+  # Long term: ``forge sync`` (or its equivalent) should reconcile
+  # HF snapshot completeness across hosts at preset-bring-up time
+  # so that the algo YAML can use the canonical ``Qwen/...`` ID.
+  model: /root/.cache/modelscope/hub/models/Qwen/Qwen2___5-1___5B-Instruct
+
+  # Tensor parallel size.  Must divide the model's attention head
+  # count -- Qwen2.5-1.5B has 12 heads, so TP must be in {1, 2, 3,
+  # 4, 6, 12}.  TP=8 is *not* legal here despite each host having
+  # 8 NPUs (vLLM raises ``Total number of attention heads (12)
+  # must be divisible by tensor parallel size``); pick a model
+  # with a head count divisible by 8 (e.g. Qwen2.5-3B has 16,
+  # Qwen2.5-14B has 40, Qwen2.5-72B has 64) to use the full host.
+  #
+  # We pick TP=4 here because (a) it's the largest legal value for
+  # this model, (b) it still validates the multi-NPU TP shard path
+  # end-to-end, and (c) it leaves 4 idle NPUs per host -- acceptable
+  # for a structural smoke, swap in a TP=8-friendly model when
+  # measuring real throughput.  The launcher itself is independent
+  # of the TP value (one vLLM process per host either way).
+  tensor_parallel_size: 4
+
+  # Numerics.  bfloat16 is the universal choice for Qwen2/Llama3 on
+  # NPU; fp16 works but bf16 has better dynamic range for the MLP
+  # activations.
+  dtype: bfloat16
+
+  # Max prompt + generation length the engine will allocate KV-cache
+  # for.  Smaller = more concurrent requests can fit; we set it to
+  # 4096 because the benchmark prompts are <= 256 in_tokens.
+  max_model_len: 4096
+
+  # Fraction of NPU HBM vLLM is allowed to use.  0.85 leaves ~15% for
+  # the runtime + tokenizer; bump to 0.9 for tight-fit scenarios but
+  # mind OOM.
+  gpu_memory_utilization: 0.85
+
+  # Synthetic-load benchmark parameters.  All overridable via CLI
+  # flags on ``forge launch`` if/when needed (current driver only
+  # honours --duration to keep the surface small).
+  benchmark:
+    # How long each replica generates traffic.  Driver waits for all
+    # replicas to finish then aggregates.
+    duration_seconds: 30
+
+    # Number of concurrent in-flight requests per replica.  vLLM
+    # batches them dynamically; 16 is a sane default for 1.5B at
+    # TP=8 (KV-cache budget is the bottleneck for higher values).
+    concurrency: 16
+
+    # Synthetic prompt length in tokens.  256 keeps prefill fast so
+    # the benchmark exercises the decode loop more than prefill.
+    input_tokens: 256
+
+    # Per-request output length cap.  vLLM stops at this many
+    # generated tokens (or EOS, whichever first).
+    output_tokens: 128
+
+    # PRNG seed for the synthetic prompt token IDs.  Fixed for
+    # reproducibility; change to randomise between runs.
+    seed: 0

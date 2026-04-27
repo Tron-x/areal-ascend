@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -51,15 +52,66 @@ DEFAULT_ALGO_YAML = FORGE_ROOT / "examples" / "math" / "gsm8k_grpo_npu.yaml"
 DEFAULT_TRAIN_SCRIPT = FORGE_ROOT / "examples" / "math" / "gsm8k_rl.py"
 DEFAULT_CANN_HOME = "/usr/local/Ascend/cann-9.0.0-beta.1"
 
-_LAUNCHER_LAYER_KEYS: frozenset[str] = frozenset({"launcher_preset", "roles"})
-"""Top-level algo-YAML keys owned by ``forge launch`` (not grpo.py).
+_LAUNCHER_LAYER_KEYS: frozenset[str] = frozenset(
+    {"launcher_preset", "roles", "mode", "titan", "inference"}
+)
+"""Top-level algo-YAML keys owned by ``forge launch`` (not the inner app).
 
-These describe infrastructure intent and are consumed by the preset
-composer in ``forge/cli/presets.py``.  grpo.py's ``load_expr_config``
-merges against a strict ``GRPOConfig`` dataclass which rejects unknown
-top-level keys, so we strip these before writing the algo-side temp
-YAML.  ``cluster`` is *not* stripped -- it maps to AReaL's existing
-``ClusterSpecConfig`` and is legitimately part of GRPOConfig.
+These describe infrastructure intent + dispatch intent and are
+consumed by the preset composer (``forge/cli/presets.py``) and the
+mode dispatcher in this module.  grpo.py's ``load_expr_config``
+merges against a strict ``GRPOConfig`` dataclass which rejects
+unknown top-level keys, so we strip these before writing the
+algo-side temp YAML.  ``cluster`` is *not* stripped -- it maps to
+AReaL's existing ``ClusterSpecConfig`` and is legitimately part of
+GRPOConfig.
+
+Why each key is here:
+
+* ``launcher_preset``  -- preset-resolution input
+* ``roles``            -- per-role devices override merged into
+                          the preset
+* ``mode``             -- selects which ``forge.apps.<name>`` runs
+                          on the driver (``grpo`` vs.
+                          ``titan-pretrain`` vs. ``inference-bench``)
+* ``titan``            -- B-full algo block (config / cwd /
+                          procs_per_host / overrides) consumed by
+                          ``forge.apps.titan_pretrain``, never by
+                          ``forge.apps.grpo``
+* ``inference``        -- vLLM benchmark block (model / tp_size /
+                          benchmark) consumed by
+                          ``forge.apps.inference_bench``, never by
+                          ``forge.apps.grpo``
+"""
+
+_VALID_MODES: frozenset[str] = frozenset({"grpo", "titan-pretrain", "inference-bench"})
+"""Recognised values for ``mode:`` / ``--mode``.
+
+* ``grpo``            -- default; runs ``forge.apps.grpo`` on the
+                         driver.  Worker profile defaults to
+                         ``hixl-coexist`` (HCCL + HiXL coexistence).
+* ``titan-pretrain``  -- B-full TorchTitan pretrain entry; runs
+                         ``forge.apps.titan_pretrain`` on the driver.
+                         Worker profile defaults to ``pure-training``.
+* ``inference-bench`` -- 2-node vLLM benchmark entry; runs
+                         ``forge.apps.inference_bench`` on the
+                         driver.  Worker profile defaults to
+                         ``pure-training`` (no HiXL/torchstore env
+                         needed for standalone inference).
+"""
+
+_MODE_DEFAULT_PROFILE: dict[str, str] = {
+    "grpo": "hixl-coexist",
+    "titan-pretrain": "pure-training",
+    "inference-bench": "pure-training",
+}
+"""Default worker env profile for each mode.
+
+Picked when neither ``--profile`` (currently inferred only via
+preset YAML) nor ``launcher.profile`` in the preset overrides it.
+The defaults match each mode's transport requirements -- GRPO needs
+the HiXL/torchstore env to do weight sync in-process; titan-pretrain
+just wants vanilla HCCL with the optimal HCCS+RoCE auto-routing.
 """
 
 
@@ -133,6 +185,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override `+total_train_steps` on the training CLI.",
     )
     p.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help=(
+            "Inference-bench only: override "
+            "``inference.benchmark.duration_seconds`` from the algo YAML.  "
+            "Ignored by grpo / titan-pretrain modes."
+        ),
+    )
+    p.add_argument(
         "--model",
         default=None,
         help=("Override `actor.path` (Huggingface model path or local snapshot)."),
@@ -141,6 +203,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--backend",
         default=None,
         help="Training backend (titan / areal / fsdp).",
+    )
+    p.add_argument(
+        "--mode",
+        default=None,
+        choices=sorted(_VALID_MODES),
+        help=(
+            "Driver dispatch mode.  ``grpo`` (default) runs "
+            "``forge.apps.grpo``; ``titan-pretrain`` runs "
+            "``forge.apps.titan_pretrain`` for pure TorchTitan "
+            "pretraining (B-full, no GRPO loop / vLLM / "
+            "torchstore); ``inference-bench`` runs "
+            "``forge.apps.inference_bench`` for a 2-node vLLM "
+            "throughput benchmark (one TP=N replica per host).  "
+            "If omitted, read from the algo YAML's top-level "
+            "``mode:`` key, falling back to ``grpo``.  Mode "
+            "determines worker env profile (grpo -> hixl-coexist; "
+            "titan-pretrain / inference-bench -> pure-training) "
+            "and driver env exports (the pure-training modes skip "
+            "the HiXL/torchstore vars)."
+        ),
     )
     p.add_argument(
         "--model-name",
@@ -377,6 +459,24 @@ def main(argv: list[str]) -> int:
     # directly.
     config, algo_config = _resolve_configs(positional, algo_override=args.algo_config)
 
+    # Resolve mode: CLI flag > algo YAML's ``mode:`` > default ``grpo``.
+    # Resolved BEFORE pre-flight so subsequent steps (profile pick,
+    # driver dispatch) all see the same value.
+    #
+    # IMPORTANT: read from ``positional`` (the original algo YAML),
+    # NOT from ``algo_config``.  ``_resolve_configs`` returns a
+    # sanitized algo YAML with launcher-layer keys stripped --
+    # including ``mode`` itself -- so reading ``algo_config`` here
+    # would always miss it.
+    mode = args.mode or _read_mode_from_algo_yaml(positional) or "grpo"
+
+    # Resolve worker env profile: launcher YAML's ``launcher.profile``
+    # (preset-authoritative) > mode-derived default.  No CLI flag
+    # for profile yet -- if a user needs to override per-mode they
+    # author / pick a different preset, which keeps the
+    # "preset = infra decisions" contract clean.
+    profile = _read_profile_from_yaml(config) or _MODE_DEFAULT_PROFILE[mode]
+
     train_script = Path(args.train_script).resolve()
 
     hostfile = (
@@ -390,6 +490,9 @@ def main(argv: list[str]) -> int:
     # fields (CLI > YAML > default) avoids a second rule users have
     # to remember.
     launcher_impl = args.launcher_impl or _read_launcher_impl_from_yaml(config)
+    # NOTE: ssh_job and bash are both profile-aware as of the
+    # ForgeSSHJob refactor (see ``forge/provisioner_ssh.py::
+    # _profile_env_parts``); no special-casing needed here.
 
     # R1.5c: prefer ``launcher.pool`` from the YAML over the hostfile
     # when both are available.  The pool is the authoritative cluster
@@ -468,10 +571,12 @@ def main(argv: list[str]) -> int:
     workers_arg = ",".join(f"tcp://{h}:{args.worker_port}" for h in hosts)
 
     print("=" * 64)
-    print(" forge launch: multi-node GRPO")
+    print(f" forge launch: multi-node {mode}")
     print("=" * 64)
     print(f"  launcher config : {config}")
     print(f"  algo config     : {algo_config}")
+    print(f"  mode            : {mode}")
+    print(f"  worker profile  : {profile}")
     print(f"  host source     : {'pool (yaml)' if using_pool else 'hostfile'}")
     print(f"  hostfile        : {hostfile}")
     print(f"  driver host     : {driver}")
@@ -493,6 +598,24 @@ def main(argv: list[str]) -> int:
     #
     # --sync-path implies --sync (users typically only pass the paths
     # list, which would otherwise be silently ignored).
+    #
+    # ``--sync`` is redundant when ``launcher_impl: ssh_job`` runs
+    # with ``mount_code=True`` (the default): ``_SSHJobFleet.start()``
+    # exposes the launcher's checkout to workers via FUSE
+    # ``remote_mount``, which is drift-free and skips the ``tar | ssh``
+    # transfer entirely.  We emit a hint instead of silently no-op'ing
+    # so users discover the better path; we still run the sync (it's
+    # harmless -- just wasteful) in case the user has bash workers
+    # mixed in or is debugging.
+    if (args.sync or args.sync_paths) and launcher_impl == "ssh_job":
+        print(
+            "[launch] note: --sync is redundant under "
+            "``launcher_impl: ssh_job`` -- workers already see "
+            "the launcher's source via FUSE ``remote_mount``.  "
+            "Drop --sync from your invocation unless you also "
+            "have bash-managed workers."
+        )
+
     if args.sync or args.sync_paths:
         from forge.cli.sync import sync_paths_to_hosts
 
@@ -533,6 +656,7 @@ def main(argv: list[str]) -> int:
             worker_port=args.worker_port,
             ssh_port=args.ssh_port,
             cann=args.cann,
+            profile=profile,
         )
     elif launcher_impl == "bash":
         worker_fleet = _BashFleet(
@@ -540,6 +664,7 @@ def main(argv: list[str]) -> int:
             worker_port=args.worker_port,
             ssh_port=args.ssh_port,
             cann=args.cann,
+            profile=profile,
         )
     else:
         print(
@@ -566,16 +691,60 @@ def main(argv: list[str]) -> int:
         )
 
         # --- Run training via SSH to driver ----------------------------
-        train_rc = _run_driver_training(
-            args=args,
-            driver=driver,
-            hostfile=hostfile,
-            config=config,
-            algo_config=algo_config,
-            train_script=train_script,
-            workers_arg=workers_arg,
-            extra_argv=extra_argv,
-        )
+        # Mode dispatch: GRPO, titan-pretrain, and inference-bench go
+        # through different apps with different env/CLI surfaces.
+        # Keeping them as distinct functions keeps the GRPO path's
+        # complex flag forwarding (model / model_name / model_flavor /
+        # forge env vars) separate from the much simpler
+        # algo-YAML-driven invocations of the standalone modes.
+        # When the worker fleet manages its own code-sync (e.g.
+        # ``_SSHJobFleet`` with ``mount_code=True``), use the
+        # worker-visible mount path for the driver's ``cd`` /
+        # ``PYTHONPATH`` -- otherwise the driver reads its local
+        # checkout, which can drift from the launcher's checkout
+        # and reintroduce the stale-code bug class ``--sync`` /
+        # ``forge.cli.sync`` was originally written to defeat.
+        # Bash fleet has no opinion -- defaults to FORGE_ROOT.
+        driver_code_root = getattr(worker_fleet, "code_root", str(FORGE_ROOT))
+
+        if mode == "titan-pretrain":
+            # titan-pretrain reads the ``titan:`` block out of the
+            # algo YAML, which is stripped from ``algo_config`` by
+            # _resolve_configs (because GRPOConfig rejects it).  Pass
+            # the ORIGINAL ``positional`` here -- it lives on disk at
+            # the same path on every host (algo YAMLs under
+            # examples/ are checked-in code, not /tmp scratch).
+            train_rc = _run_driver_titan_pretrain(
+                args=args,
+                driver=driver,
+                algo_config=positional,
+                workers_arg=workers_arg,
+                code_root=driver_code_root,
+            )
+        elif mode == "inference-bench":
+            # Same reasoning as titan-pretrain: ``inference:`` is
+            # stripped from ``algo_config`` by _resolve_configs, so
+            # the inference_bench driver needs the ORIGINAL algo
+            # YAML path to read its block back.
+            train_rc = _run_driver_inference_bench(
+                args=args,
+                driver=driver,
+                algo_config=positional,
+                workers_arg=workers_arg,
+                code_root=driver_code_root,
+            )
+        else:
+            train_rc = _run_driver_training(
+                args=args,
+                driver=driver,
+                hostfile=hostfile,
+                config=config,
+                algo_config=algo_config,
+                train_script=train_script,
+                workers_arg=workers_arg,
+                extra_argv=extra_argv,
+                code_root=driver_code_root,
+            )
     finally:
         if not args.keep_workers:
             worker_fleet.stop()
@@ -593,6 +762,7 @@ def _run_worker_mgr(
     worker_port: int,
     ssh_port: int,
     cann: str | None = None,
+    profile: str | None = None,
 ) -> int:
     cmd: list[str] = [
         "bash",
@@ -608,6 +778,14 @@ def _run_worker_mgr(
     if action == "start":
         assert cann is not None
         cmd += ["--cann", cann, "--areal-root", str(FORGE_ROOT)]
+        # ``forge launch`` is the GRPO + weight-sync entrypoint, so it
+        # always wants the ``hixl-coexist`` worker env (HiXL RoCE +
+        # HCCL port range + torchstore RDMA pool).  Skipping the flag
+        # would silently fall through to ``worker_manager.sh``'s new
+        # default of ``pure-training`` -- correct for B-mini, fatal
+        # for HiXL Connect on the GRPO path.
+        if profile is not None:
+            cmd += ["--profile", profile]
     return subprocess.call(cmd)
 
 
@@ -676,11 +854,11 @@ class _WorkerFleet:
 
 
 class _BashFleet(_WorkerFleet):
-    """Legacy ``worker_manager.sh start/stop`` path.
+    """``worker_manager.sh start/stop`` path with explicit env profile.
 
-    Kept as default during the migration window.  Exact behavior as
-    the pre-refactor CLI: shell out to bash, rely on its per-host
-    TCP-probe loop (up to 60s) to decide readiness.
+    Shells out to bash; relies on the per-host TCP-probe loop (up to
+    60s) for readiness.  Caller picks the worker env profile
+    (``hixl-coexist`` for GRPO, ``pure-training`` for titan-pretrain).
     """
 
     def __init__(
@@ -690,11 +868,13 @@ class _BashFleet(_WorkerFleet):
         worker_port: int,
         ssh_port: int,
         cann: str,
+        profile: str,
     ) -> None:
         self._hostfile = hostfile
         self._worker_port = worker_port
         self._ssh_port = ssh_port
         self._cann = cann
+        self._profile = profile
 
     def start(self) -> int:
         return _run_worker_mgr(
@@ -703,6 +883,7 @@ class _BashFleet(_WorkerFleet):
             worker_port=self._worker_port,
             ssh_port=self._ssh_port,
             cann=self._cann,
+            profile=self._profile,
         )
 
     def stop(self) -> None:
@@ -711,6 +892,37 @@ class _BashFleet(_WorkerFleet):
             worker_port=self._worker_port,
             ssh_port=self._ssh_port,
         )
+
+
+DEFAULT_MOUNT_ROOT: str = "/root/AReaL_remote"
+"""Worker-visible path where launcher source is FUSE-mounted by
+:class:`_SSHJobFleet` when ``mount_code=True``.
+
+We deliberately pick a *different* path from the launcher's local
+checkout (``/root/AReaL`` aka :data:`FORGE_ROOT`) so the FUSE mount
+does NOT shadow whichever local copy the worker host already has.
+Two practical wins:
+
+* The launcher itself runs on one of the worker hosts (the same
+  python process registers the SSHJob and is also a worker host).
+  Shadowing ``/root/AReaL`` on the launcher would mask the source we
+  read with -- a self-foot-shooting hazard on every launch.
+* On Ctrl-C the FUSE mount may take a moment to unmount cleanly; in
+  the meantime any process whose ``cwd`` is still inside the mount
+  prevents teardown.  Keeping the mount under a dedicated path means
+  we never accidentally cwd into it from the launcher itself.
+"""
+
+DEFAULT_MOUNT_SUBDIRS: tuple[str, ...] = ("forge", "areal")
+"""Subdirectories of :data:`FORGE_ROOT` to expose via FUSE on workers.
+
+Mirrors :data:`forge.cli.sync.DEFAULT_PATHS`: these are the only two
+editable trees the workers need at import time.  Mounting only the
+subset that workers actually import keeps each FUSE setup small
+(forge/ + areal/ ~10MB combined vs. 2.5GB for the full repo with
+``.venv`` / ``.git``) and makes the per-host mount latency bounded
+(~5-10s on our 100GbE testbed).
+"""
 
 
 class _SSHJobFleet(_WorkerFleet):
@@ -725,6 +937,43 @@ class _SSHJobFleet(_WorkerFleet):
     Also faster: the POC measured ~4-12s per host vs the bash path's
     60s ceiling, because we attach immediately after apply() returns
     instead of polling each host's TCP port in sequence.
+
+    Profile-aware: the ``profile`` constructor arg is forwarded
+    verbatim to :class:`ForgeSSHJob` and selects which env block
+    every worker boots with.  See ``forge/provisioner_ssh.py``
+    module docstring for the full profile catalog.
+
+    FUSE-backed code sync (``mount_code=True``, default)
+    ----------------------------------------------------
+
+    When enabled, ``start()`` registers a Monarch ``remote_mount``
+    for every entry of :data:`mount_subdirs` (default ``forge/`` and
+    ``areal/``) onto the workers under :data:`mount_root` (default
+    ``/root/AReaL_remote``).  After ``apply()`` brings up the workers
+    and TCP-readiness passes, ``state()`` triggers the FUSE setup --
+    spawning a ``FUSEActor`` mesh on each host and attaching the
+    block-transfer pipeline that serves source files on demand.
+
+    Workers and drivers see the launcher's checkout through the FUSE
+    mount, not whatever happens to be on the worker host's local
+    disk.  This replaces the older :func:`forge.cli.sync.sync_paths_to_hosts`
+    (``tar | ssh``) preamble: instead of physically copying the
+    source tree to each host before starting workers, we expose it
+    declaratively and let the kernel + FUSE driver fetch blocks as
+    workers actually open files.
+
+    Trade-off: FUSE mount setup adds 5-10s per launch; the alternative
+    ``--sync`` step also takes a comparable amount of time but
+    transferred the entire tree (most of which the workers never
+    read).  The mount-based path is also drift-free: edits to the
+    launcher's checkout become visible on workers immediately,
+    without an explicit re-sync.
+
+    Set ``mount_code=False`` to fall back to the legacy non-mount
+    behaviour where workers/drivers read from their local
+    ``/root/AReaL`` -- caller must then arrange for that path to be
+    in sync (typically via ``forge launch --sync`` or out-of-band
+    ``rsync``).
     """
 
     def __init__(
@@ -734,16 +983,37 @@ class _SSHJobFleet(_WorkerFleet):
         worker_port: int,
         ssh_port: int,
         cann: str,
+        profile: str,
         conda_env: str = "monarch_ascend",
         conda_bin: str = "/root/miniconda3/bin/conda",
+        mount_code: bool = True,
+        mount_root: str = DEFAULT_MOUNT_ROOT,
+        mount_subdirs: tuple[str, ...] = DEFAULT_MOUNT_SUBDIRS,
     ) -> None:
         self._hostfile = hostfile
         self._worker_port = worker_port
         self._ssh_port = ssh_port
         self._cann = cann
+        self._profile = profile
         self._conda_env = conda_env
         self._conda_bin = conda_bin
+        self._mount_code = bool(mount_code)
+        self._mount_root = mount_root.rstrip("/") or "/"
+        self._mount_subdirs = tuple(mount_subdirs)
         self._job = None  # type: ignore[assignment]
+
+    @property
+    def code_root(self) -> str:
+        """Worker-visible path that holds ``forge/`` + ``areal/``.
+
+        Either :attr:`_mount_root` (FUSE) or :data:`FORGE_ROOT`
+        (legacy local-checkout) depending on ``mount_code``.  The
+        outer launcher reads this to point ``_run_driver_*`` at the
+        right ``cd`` / ``PYTHONPATH`` location -- the driver process
+        on the chosen driver host needs to see the same source view
+        as the workers it orchestrates.
+        """
+        return self._mount_root if self._mount_code else str(FORGE_ROOT)
 
     def start(self) -> int:
         # Import lazily so ``forge launch --help`` works without a
@@ -768,19 +1038,65 @@ class _SSHJobFleet(_WorkerFleet):
             "-o",
             "StrictHostKeyChecking=no",
         ]
+        # When mount_code is on, point ForgeSSHJob's areal_root at the
+        # FUSE mountpoint so the worker preamble's PYTHONPATH and ``cd``
+        # both target the soon-to-be-mounted view.  ForgeSSHJob already
+        # does ``mkdir -p {areal_root}`` before ``cd``, so the directory
+        # not existing yet at apply() time is fine -- the FUSE mount
+        # populates it asynchronously inside state().
+        worker_areal_root = self._mount_root if self._mount_code else str(FORGE_ROOT)
         job = ForgeSSHJob(
             cann_home=self._cann,
             conda_env=self._conda_env,
             conda_bin=self._conda_bin,
-            areal_root=str(FORGE_ROOT),
+            areal_root=worker_areal_root,
             python_exe="python",
             ssh_args=ssh_args,
             monarch_port=self._worker_port,
+            profile=self._profile,
         )
         # The mesh name here is ONLY used internally by the Job for
         # grouping; it does not surface to BareMetalLauncher, which
         # attaches independently via attach_to_workers.
         job.add_mesh("forge_bare_metal", hosts)
+
+        # Register remote_mount entries BEFORE apply().
+        # ``remote_mount`` is config-only here: the actual FUSE setup
+        # only runs inside ``state()``.  We mount each subdir
+        # individually (forge -> mount_root/forge, areal ->
+        # mount_root/areal) so the FUSE mount tree mirrors the
+        # repo layout from PYTHONPATH=mount_root.
+        if self._mount_code:
+            for sub in self._mount_subdirs:
+                src = FORGE_ROOT / sub
+                if not src.is_dir():
+                    print(
+                        f"[launch] ssh_job: mount source {src} missing; skipping",
+                        flush=True,
+                    )
+                    continue
+                target = f"{self._mount_root}/{sub}"
+                print(
+                    f"[launch] ssh_job: registering FUSE mount "
+                    f"{src} -> {target} (transfer_mode=actor)",
+                    flush=True,
+                )
+                # transfer_mode="actor" routes block transfer through
+                # Monarch actor messages -- works without Meta-internal
+                # TLS certs (the ``rust_tls`` default needs ``fb-tls``
+                # cert paths we don't have on bare-metal NPU hosts).
+                # python_exe=None tells JobTrait NOT to rewrite the
+                # worker's python path to ``{mountpoint}/.venv/bin/python``;
+                # we use a conda env at /root/miniconda3 unrelated to
+                # the source tree, so the rewrite would be wrong.
+                job.remote_mount(
+                    source=str(src),
+                    mntpoint=target,
+                    meshes=["forge_bare_metal"],
+                    python_exe=None,
+                    transfer_mode="actor",
+                )
+
         try:
             job.apply(client_script=None)
         except Exception as e:  # noqa: BLE001
@@ -813,6 +1129,26 @@ class _SSHJobFleet(_WorkerFleet):
                 file=sys.stderr,
             )
             return 11
+
+        # Activate FUSE mounts.  state() does both attach + mount; we
+        # only care about the mount side here (the driver side does
+        # its own attach_to_workers later).  Calling state() now also
+        # surfaces FUSE / transport bugs at start time rather than at
+        # first import inside the actor process.
+        if self._mount_code:
+            print(
+                "[launch] ssh_job: activating FUSE mounts via state() "
+                "(this can take ~5-10s) ...",
+                flush=True,
+            )
+            try:
+                job.state(cached_path=None)
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[launch] ssh_job: state() failed (FUSE mount): {e!r}",
+                    file=sys.stderr,
+                )
+                return 12
         return 0
 
     def stop(self) -> None:
@@ -820,10 +1156,16 @@ class _SSHJobFleet(_WorkerFleet):
             return
         print("[launch] ssh_job: stopping workers ...", flush=True)
         try:
-            self._job._kill()
+            # ``kill()`` (public) calls ``_mounts.ensure_stopped()``
+            # before tearing down workers.  Without the unmount the
+            # mount_worker subprocess survives and leaks the FUSE
+            # mount across runs.  ``_kill()`` (private) skips this
+            # step -- never call it directly when remote_mount is in
+            # use.  See JobTrait.kill in monarch/_src/job/job.py.
+            self._job.kill()
         except Exception as e:  # noqa: BLE001
             print(
-                f"[launch] ssh_job: _kill raised {e!r}; "
+                f"[launch] ssh_job: kill() raised {e!r}; "
                 f"some remote procs may still be live",
                 file=sys.stderr,
             )
@@ -959,6 +1301,59 @@ def _resolve_configs(
         file=sys.stderr,
     )
     raise SystemExit(2)
+
+
+def _read_mode_from_algo_yaml(algo_path: Path) -> str | None:
+    """Return the algo YAML's top-level ``mode:`` value, or ``None``.
+
+    Used as the second-priority source for mode resolution
+    (CLI flag > algo YAML > default ``grpo``).  Any read/parse
+    error degrades to ``None`` so a malformed YAML can't silently
+    flip mode -- caller falls back to the default.
+    """
+    try:
+        import yaml
+
+        data = yaml.safe_load(algo_path.read_text()) or {}
+    except Exception:
+        return None
+    val = data.get("mode") if isinstance(data, dict) else None
+    if val is None:
+        return None
+    val_str = str(val)
+    if val_str not in _VALID_MODES:
+        # Don't propagate garbage -- caller will default to grpo
+        # and the algo author gets one warning instead of a cryptic
+        # downstream failure.
+        print(
+            f"[launch] algo YAML has unrecognised mode={val_str!r}; "
+            f"valid choices: {sorted(_VALID_MODES)}.  Falling back "
+            f"to default.",
+            file=sys.stderr,
+        )
+        return None
+    return val_str
+
+
+def _read_profile_from_yaml(config_path: Path) -> str | None:
+    """Return ``launcher.profile`` from the launcher YAML, or ``None``.
+
+    The cluster preset is the authoritative source for which worker
+    env profile to install -- e.g. ``2node_pure_training.yaml`` sets
+    ``launcher.profile: pure-training``.  Caller falls back to
+    :data:`_MODE_DEFAULT_PROFILE` when this returns ``None``.
+    """
+    try:
+        import yaml
+
+        data = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        return None
+    launcher_block = data.get("launcher") or {}
+    if not isinstance(launcher_block, dict):
+        return None
+    val = launcher_block.get("profile")
+    return str(val) if val else None
 
 
 def _read_launcher_impl_from_yaml(config_path: Path) -> str:
@@ -1098,8 +1493,20 @@ def _run_driver_training(
     train_script: Path,
     workers_arg: str,
     extra_argv: list[str],
+    code_root: str | None = None,
 ) -> int:
-    """SSH into the driver host and run ``python -m forge.apps.grpo``."""
+    """SSH into the driver host and run ``python -m forge.apps.grpo``.
+
+    ``code_root`` overrides the worker-visible ``cd``/``PYTHONPATH``
+    target.  Default :data:`FORGE_ROOT` keeps the legacy behaviour
+    (driver reads its own local ``/root/AReaL`` checkout); pass
+    :attr:`_SSHJobFleet.code_root` (typically ``/root/AReaL_remote``)
+    when ``mount_code=True`` so the driver sees the same FUSE-mounted
+    source view as the workers it orchestrates -- no more local-disk
+    drift across hosts.
+    """
+    if code_root is None:
+        code_root = str(FORGE_ROOT)
     # When the YAML paths live under /tmp (i.e. were auto-generated by
     # ``_resolve_configs`` for the two-layer composer), they only exist
     # on the local launcher host.  The driver SSH below reads them from
@@ -1188,14 +1595,12 @@ def _run_driver_training(
     ):
         v = os.environ.get(var)
         if v is not None:
-            # Shell-escape via Python's shlex-style quoting.
-            import shlex
-
             env_lines.append(f"export {var}={shlex.quote(v)}")
 
     remote_cmd_parts = [
         *env_lines,
-        f"cd {FORGE_ROOT}",
+        f"mkdir -p {shlex.quote(code_root)}",
+        f"cd {shlex.quote(code_root)}",
         _shellify(grpo_argv) + " 2>&1 | tee /tmp/forge_multinode.log",
     ]
     remote_cmd = "; ".join(remote_cmd_parts)
@@ -1223,6 +1628,247 @@ def _run_driver_training(
     else:
         print(f" forge launch: training FAILED rc={rc} ({elapsed:.0f}s)")
         print(_error_hint(rc))
+    print("=" * 64)
+    return rc
+
+
+def _run_driver_titan_pretrain(
+    *,
+    args: argparse.Namespace,
+    driver: str,
+    algo_config: Path,
+    workers_arg: str,
+    code_root: str | None = None,
+) -> int:
+    """SSH into the driver host and run ``python -m forge.apps.titan_pretrain``.
+
+    The titan-pretrain mode needs a much smaller env block than
+    GRPO -- no HiXL, no torchstore, no ModelScope/HF mirror plumbing
+    (TT loads its own datasets via the ``c4_test`` fixture path).
+    Keeping this function separate from :func:`_run_driver_training`
+    avoids an "if mode == 'titan-pretrain': skip these 12 exports"
+    fork inside the GRPO path.
+
+    ``code_root`` overrides the worker-visible ``cd``/``PYTHONPATH``
+    target (see :func:`_run_driver_training` for rationale).  Default
+    :data:`FORGE_ROOT`; pass :attr:`_SSHJobFleet.code_root` to read
+    source through the FUSE mount instead of the driver's local
+    checkout.
+    """
+    if code_root is None:
+        code_root = str(FORGE_ROOT)
+    # Stage the algo YAML on the driver if it lives under /tmp
+    # (auto-generated by ``_resolve_configs``); otherwise it's a
+    # checked-in file the driver can read from its own checkout.
+    # Pass the algo_config twice so _stage_tmp_yamls_on_driver doesn't
+    # have to grow a new signature for the single-file case.
+    _, algo_config = _stage_tmp_yamls_on_driver(
+        config=algo_config,
+        algo_config=algo_config,
+        driver=driver,
+        ssh_port=args.ssh_port,
+    )
+
+    # Build the forge.apps.titan_pretrain command line.  Mirror the
+    # flags the app's argparse accepts (see
+    # forge/apps/titan_pretrain.py::_build_parser).
+    pretrain_argv = [
+        "python",
+        "-m",
+        "forge.apps.titan_pretrain",
+        "--algo-config",
+        str(algo_config),
+        "--bare-metal-workers",
+        workers_arg,
+    ]
+    if args.steps is not None:
+        pretrain_argv += ["--steps", str(args.steps)]
+
+    # Slim env block: pure-training profile parity.  Match the
+    # ``common_env_block`` of worker_manager.sh so the driver proc
+    # has the same CANN + HCCL_DEBUG knobs as the workers it
+    # orchestrates.  Crucially, NO HiXL / torchstore / HCCL port
+    # range exports -- those would re-introduce the HCCS->RoCE
+    # downgrade we explicitly avoided by selecting profile=
+    # pure-training in the first place.
+    env_lines = [
+        f"source {args.cann}/set_env.sh 2>/dev/null",
+        f"ASCEND_ROOT=$(dirname {args.cann})",
+        '[[ -f "$ASCEND_ROOT/nnal/atb/set_env.sh" ]] && '
+        'source "$ASCEND_ROOT/nnal/atb/set_env.sh"',
+        'eval "$(/root/miniconda3/bin/conda shell.bash hook)"',
+        "conda activate monarch_ascend",
+        f'export PYTHONPATH={shlex.quote(code_root)}":/root/torchstore:/root/monarch/python:${{PYTHONPATH:-}}"',
+        "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        'export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"',
+        'export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"',
+        'export HCCL_DEBUG="${HCCL_DEBUG:-INFO}"',
+        "export HCCL_CONNECT_TIMEOUT=120",
+        # HF offline trio: TT itself uses bundled c4_test fixtures and
+        # doesn't load anything from HuggingFace, but if any helper
+        # the driver imports pulls in ``transformers`` it will try to
+        # contact huggingface.co and hang on the firewall.  Mirror
+        # inference-bench's defaults so the env is coherent.
+        'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"',
+        'export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"',
+        'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"',
+    ]
+
+    # ``set -o pipefail`` is critical: without it, ``python ... | tee``
+    # returns ``tee``'s exit status (always 0), masking titan_pretrain
+    # failures and turning every smoke run into a false-positive "OK".
+    remote_cmd_parts = [
+        "set -o pipefail",
+        *env_lines,
+        f"mkdir -p {shlex.quote(code_root)}",
+        f"cd {shlex.quote(code_root)}",
+        _shellify(pretrain_argv) + " 2>&1 | tee /tmp/forge_titan_pretrain.log",
+    ]
+    remote_cmd = "; ".join(remote_cmd_parts)
+
+    ssh_cmd = [
+        "ssh",
+        "-p",
+        str(args.ssh_port),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=10",
+        f"root@{driver}",
+        remote_cmd,
+    ]
+
+    start = time.time()
+    print(
+        f"[launch] titan-pretrain on {driver} (started at {time.strftime('%H:%M:%S')})"
+    )
+    rc = subprocess.call(ssh_cmd)
+    elapsed = time.time() - start
+
+    print("=" * 64)
+    if rc == 0:
+        print(f" forge launch: titan-pretrain OK ({elapsed:.0f}s)")
+    else:
+        print(f" forge launch: titan-pretrain FAILED rc={rc} ({elapsed:.0f}s)")
+    print("=" * 64)
+    return rc
+
+
+def _run_driver_inference_bench(
+    *,
+    args: argparse.Namespace,
+    driver: str,
+    algo_config: Path,
+    workers_arg: str,
+    code_root: str | None = None,
+) -> int:
+    """SSH into the driver host and run ``python -m forge.apps.inference_bench``.
+
+    Near-clone of :func:`_run_driver_titan_pretrain`: same slim
+    pure-training env, same algo-YAML staging, same SSH wrapper.
+    The only differences are (a) the driver module name, (b) the
+    ``--duration`` convenience override, and (c) the log file name
+    (so concurrent titan + inference smokes don't clobber each
+    other's logs).
+
+    Why duplicate instead of factoring?  Both functions are ~80
+    lines of straight-line code and duplication makes each easy to
+    read in isolation.  When a third backend appears and the
+    duplication actually starts to drift, that's the signal to
+    factor; until then keep them parallel and audit them side-by-
+    side whenever either changes.
+
+    ``code_root``: see :func:`_run_driver_titan_pretrain` for the
+    same rationale -- worker-visible source path, defaults to
+    :data:`FORGE_ROOT` (legacy local checkout) and gets pointed at
+    the FUSE mountpoint when ``mount_code=True``.
+    """
+    if code_root is None:
+        code_root = str(FORGE_ROOT)
+    _, algo_config = _stage_tmp_yamls_on_driver(
+        config=algo_config,
+        algo_config=algo_config,
+        driver=driver,
+        ssh_port=args.ssh_port,
+    )
+
+    bench_argv = [
+        "python",
+        "-m",
+        "forge.apps.inference_bench",
+        "--algo-config",
+        str(algo_config),
+        "--bare-metal-workers",
+        workers_arg,
+    ]
+    # ``args.steps`` is the GRPO/titan-pretrain training-step knob;
+    # for inference we surface ``--duration`` instead via a
+    # dedicated CLI flag.  Both flags are forwarded only when the
+    # user actually set them so the YAML's value is honoured by
+    # default.
+    duration = getattr(args, "duration", None)
+    if duration is not None:
+        bench_argv += ["--duration", str(duration)]
+
+    env_lines = [
+        f"source {args.cann}/set_env.sh 2>/dev/null",
+        f"ASCEND_ROOT=$(dirname {args.cann})",
+        '[[ -f "$ASCEND_ROOT/nnal/atb/set_env.sh" ]] && '
+        'source "$ASCEND_ROOT/nnal/atb/set_env.sh"',
+        'eval "$(/root/miniconda3/bin/conda shell.bash hook)"',
+        "conda activate monarch_ascend",
+        f'export PYTHONPATH={shlex.quote(code_root)}":/root/torchstore:/root/monarch/python:${{PYTHONPATH:-}}"',
+        "export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        'export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"',
+        'export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"',
+        'export HCCL_DEBUG="${HCCL_DEBUG:-INFO}"',
+        "export HCCL_CONNECT_TIMEOUT=120",
+        # vLLM + HF cache: workers in pure-training profile already
+        # set HF_HUB_OFFLINE so the model load reuses local snapshots.
+        # The driver itself doesn't load the model (orchestration only)
+        # but mirroring keeps the env coherent if any helper imports
+        # transformers and tries to phone home.
+        'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"',
+        'export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"',
+        'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"',
+    ]
+
+    # ``set -o pipefail`` is critical: without it, ``python ... | tee``
+    # returns ``tee``'s exit status (always 0), masking inference_bench
+    # failures and turning every smoke run into a false-positive "OK".
+    remote_cmd_parts = [
+        "set -o pipefail",
+        *env_lines,
+        f"mkdir -p {shlex.quote(code_root)}",
+        f"cd {shlex.quote(code_root)}",
+        _shellify(bench_argv) + " 2>&1 | tee /tmp/forge_inference_bench.log",
+    ]
+    remote_cmd = "; ".join(remote_cmd_parts)
+
+    ssh_cmd = [
+        "ssh",
+        "-p",
+        str(args.ssh_port),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=10",
+        f"root@{driver}",
+        remote_cmd,
+    ]
+
+    start = time.time()
+    print(
+        f"[launch] inference-bench on {driver} (started at {time.strftime('%H:%M:%S')})"
+    )
+    rc = subprocess.call(ssh_cmd)
+    elapsed = time.time() - start
+
+    print("=" * 64)
+    if rc == 0:
+        print(f" forge launch: inference-bench OK ({elapsed:.0f}s)")
+    else:
+        print(f" forge launch: inference-bench FAILED rc={rc} ({elapsed:.0f}s)")
     print("=" * 64)
     return rc
 

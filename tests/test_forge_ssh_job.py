@@ -133,6 +133,112 @@ class TestEnvPreamble:
 
 
 # ---------------------------------------------------------------------------
+# Profile-aware env block.  The two profiles must ALWAYS share the
+# common block (CANN, conda, PYTHONPATH, generic HCCL) and ONLY
+# diverge on the HiXL/torchstore exports -- mirroring
+# ``worker_manager.sh::profile_env_block``.
+# ---------------------------------------------------------------------------
+
+
+class TestProfile:
+    def _make(self, profile: str | None = None) -> ForgeSSHJob:
+        kw: dict = {
+            "cann_home": "/usr/local/Ascend/cann-9.0.0-beta.1",
+            "conda_env": "monarch_ascend",
+            "conda_bin": "/root/miniconda3/bin/conda",
+            "areal_root": "/root/AReaL",
+            "monarch_port": 22222,
+        }
+        if profile is not None:
+            kw["profile"] = profile
+        return ForgeSSHJob(**kw)
+
+    def test_default_profile_is_hixl_coexist(self):
+        # Backward-compat guard: omitting ``profile=`` must keep the
+        # pre-refactor HiXL-coexist env so existing GRPO callers
+        # don't break silently.
+        job = self._make()
+        assert job._profile == "hixl-coexist"
+
+    def test_invalid_profile_raises(self):
+        # Misspelled profile names must fail at construction time
+        # rather than silently flipping to a default and breaking
+        # transport selection 5 minutes into the run.
+        with pytest.raises(ValueError, match="profile="):
+            self._make(profile="hixl_coexist")  # underscore vs. dash
+
+    # --- pure-training -----------------------------------------------------
+
+    def test_pure_training_omits_hixl_transport_pin(self):
+        # pure-training MUST let HCCL auto-select transport.  Any
+        # MONARCH_HIXL_TRANSPORT export defeats the whole point of
+        # the profile (forces RoCE intra-host => 10x bandwidth loss).
+        p = self._make(profile="pure-training")._env_preamble()
+        assert "MONARCH_HIXL_TRANSPORT" not in p
+        assert "HCCL_INTRA_ROCE_ENABLE" not in p
+
+    def test_pure_training_omits_hccl_port_range(self):
+        # The 60000-60255 port range exists only to dodge the
+        # HiXL/HCCL collision on 16666; pure-training has no HiXL,
+        # so HCCL should keep the default (16666) for fastest path.
+        p = self._make(profile="pure-training")._env_preamble()
+        assert "HCCL_NPU_SOCKET_PORT_RANGE" not in p
+
+    def test_pure_training_omits_torchstore_exports(self):
+        p = self._make(profile="pure-training")._env_preamble()
+        assert "TORCHSTORE_MONARCH_RDMA" not in p
+        assert "TORCHSTORE_RDMA_ENABLED" not in p
+
+    def test_pure_training_keeps_common_env(self):
+        # Common block (CANN, conda, PYTHONPATH, HCCL_DEBUG, HF
+        # offline) MUST still be present -- pure-training only
+        # strips the HiXL/torchstore overlay, not the basic worker
+        # bootstrap.
+        p = self._make(profile="pure-training")._env_preamble()
+        assert "/usr/local/Ascend/cann-9.0.0-beta.1/set_env.sh" in p
+        assert "conda activate monarch_ascend" in p
+        assert "/root/AReaL" in p
+        assert 'HCCL_DEBUG="${HCCL_DEBUG:-INFO}"' in p
+        assert "HCCL_CONNECT_TIMEOUT=120" in p
+        assert "HF_DATASETS_OFFLINE" in p
+
+    def test_pure_training_ends_with_cd(self):
+        # cd MUST be the last command so any subsequent python
+        # invocation runs from the repo root regardless of the
+        # profile-specific exports above it.
+        p = self._make(profile="pure-training")._env_preamble().rstrip()
+        assert p.endswith("cd /root/AReaL")
+
+    # --- hixl-coexist (regression guards: re-assert the canonical
+    # HiXL exports through the new code path) -------------------------------
+
+    def test_hixl_coexist_includes_all_hixl_exports(self):
+        # If a future refactor accidentally moves any of these into
+        # _common_env_parts() or removes them, GRPO weight sync
+        # silently breaks.  Pin the full list here.
+        p = self._make(profile="hixl-coexist")._env_preamble()
+        for required in (
+            "MONARCH_HIXL_TRANSPORT=roce",
+            "HCCL_INTRA_ROCE_ENABLE=1",
+            "HCCL_NPU_SOCKET_PORT_RANGE",
+            "unset TORCHSTORE_RDMA_ENABLED",
+            "TORCHSTORE_MONARCH_RDMA_EAGER_D2H=0",
+            "TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:0",
+            "TORCHSTORE_MONARCH_RDMA_POOL_MB",
+        ):
+            assert required in p, f"hixl-coexist preamble missing: {required}"
+
+    def test_profiles_share_common_block_byte_for_byte(self):
+        # The two profiles diverge ONLY on the profile-specific
+        # block -- the common (CANN/conda/PYTHONPATH/...) block must
+        # be identical between them.  Catch accidental drift where
+        # someone "fixes" a common-block export only in one profile.
+        common_pure = self._make(profile="pure-training")._common_env_parts()
+        common_hixl = self._make(profile="hixl-coexist")._common_env_parts()
+        assert common_pure == common_hixl
+
+
+# ---------------------------------------------------------------------------
 # _start_host -- SSH command composition.
 # ---------------------------------------------------------------------------
 

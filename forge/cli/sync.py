@@ -1,5 +1,29 @@
 """``forge sync`` -- push local source trees to bare-metal worker hosts.
 
+.. note::
+
+   **Preferred path is now FUSE-backed code mount, not push-sync.**
+
+   As of the ``remote_mount`` integration in ``_SSHJobFleet``
+   (default ``mount_code=True``), workers and drivers under
+   ``launcher_impl: ssh_job`` see the launcher's checkout
+   transparently via FUSE -- no pre-launch ``tar | ssh`` step
+   needed.  The mount also avoids drift entirely: edits to the
+   launcher's source become visible on workers immediately.
+
+   This subcommand and the matching ``forge launch --sync`` flag
+   are kept for two scenarios:
+
+   * ``launcher_impl: bash`` (the legacy ``worker_manager.sh``
+     path) -- workers there read code from local
+     ``/root/AReaL`` on each host, which still needs an
+     out-of-band sync.
+   * ``mount_code=False`` opt-out (rare; e.g.\\ debugging FUSE).
+
+   New deployments should leave ``mount_code`` at its default
+   and skip ``--sync`` entirely.  See ``_SSHJobFleet`` docstring
+   in ``forge/cli/launch.py`` for the FUSE-backed path.
+
 Motivation
 ----------
 Bare-metal multi-node (``launcher == BARE_METAL``) deployments assume

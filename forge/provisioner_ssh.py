@@ -6,6 +6,31 @@ This module is the production-grade replacement for
 every host, we subclass Monarch's :class:`monarch._src.job.job.SSHJob`
 and inject our CANN / conda / HCCL / HiXL environment preamble.
 
+Worker env profiles
+-------------------
+
+Like ``worker_manager.sh``, this class supports two env profiles
+(see :data:`VALID_PROFILES`):
+
+* ``hixl-coexist`` (default for backward compat) -- the GRPO +
+  weight-sync env: forces HCCL intra-host onto RoCE so HiXL Connect
+  doesn't deadlock, opens HCCL port range 60000-60255 to dodge the
+  HiXL/HCCL collision on 16666, and configures torchstore's RDMA
+  staging pool.  Required for any workload that imports HiXL or
+  torchstore into the HCCL process.
+* ``pure-training`` -- minimal HCCL env.  No HiXL/torchstore exports,
+  no port-range override, no forced intra-host RoCE.  HCCL then
+  auto-selects HCCS for intra-host pairs (~400 GB/s) and RoCE for
+  inter-host pairs.  This is the right profile for B-mini/B-full
+  TorchTitan, SFT, pretrain, and eval.
+
+The profile lives in this Python class (not in a shell script) so
+:class:`forge.cli.launch._SSHJobFleet` can pick it up from the
+two-layer YAML composer (``preset.launcher.profile``) without
+shelling out.  Keep the env-block diff between the two profiles
+identical to ``worker_manager.sh::profile_env_block`` so a reviewer
+can diff the two side-by-side.
+
 Rationale
 ---------
 
@@ -71,6 +96,7 @@ Typical usage
         areal_root="/root/AReaL",
         ssh_args=["-p", "36000", "-o", "StrictHostKeyChecking=no"],
         monarch_port=22222,
+        profile="pure-training",  # or omit for default "hixl-coexist"
     )
     job.add_mesh("bare_metal", ["192.168.0.26", "192.168.0.23"])
     job.apply()            # starts remote workers
@@ -96,6 +122,26 @@ from collections.abc import Sequence
 from monarch._src.job.job import ProcessState, SSHJob
 
 logger = logging.getLogger(__name__)
+
+VALID_PROFILES: frozenset[str] = frozenset({"hixl-coexist", "pure-training"})
+"""Recognised values for :class:`ForgeSSHJob`'s ``profile`` arg.
+
+Mirrors ``worker_manager.sh``'s ``--profile`` choices.  Any string
+outside this set raises :class:`ValueError` from
+:meth:`ForgeSSHJob.__init__` -- silent acceptance would risk a
+misspelled profile name flipping us back to the default and
+silently breaking transport selection.
+"""
+
+DEFAULT_PROFILE: str = "hixl-coexist"
+"""Default profile when caller doesn't specify one.
+
+Kept as ``hixl-coexist`` for backward compatibility: the
+pre-profile-aware ``ForgeSSHJob`` always installed the HiXL/
+torchstore env, and existing GRPO callers expect the same.  New
+non-GRPO callers (e.g. :mod:`forge.apps.titan_pretrain`) should
+pass ``profile="pure-training"`` explicitly.
+"""
 
 
 class ForgeSSHJob(SSHJob):
@@ -136,9 +182,20 @@ class ForgeSSHJob(SSHJob):
         monarch_port: TCP port the remote worker listens on.  Must
             match whatever the driver's :class:`BareMetalLauncher`
             is configured to attach to (default 22222).
+        profile: Worker env profile (see module docstring).  One of
+            :data:`VALID_PROFILES`.  Defaults to :data:`DEFAULT_PROFILE`
+            (``hixl-coexist``) so existing GRPO callers keep working
+            with no code change.  Pass ``"pure-training"`` for
+            workloads that don't mix HiXL/torchstore into the HCCL
+            process (B-full TorchTitan, SFT, pretrain, eval).
         torchstore_pool_mb: HiXL RDMA staging pool size per worker.
             8 GB is the validated default for Qwen3-0.6B; bump up
-            for larger models.
+            for larger models.  Only consulted when
+            ``profile="hixl-coexist"`` (the pure-training preamble
+            doesn't export torchstore env at all).
+
+    Raises:
+        ValueError: ``profile`` is not in :data:`VALID_PROFILES`.
     """
 
     def __init__(
@@ -151,8 +208,13 @@ class ForgeSSHJob(SSHJob):
         python_exe: str = "python",
         ssh_args: Sequence[str] = (),
         monarch_port: int = 22222,
+        profile: str = DEFAULT_PROFILE,
         torchstore_pool_mb: int = 8192,
     ):
+        if profile not in VALID_PROFILES:
+            raise ValueError(
+                f"ForgeSSHJob: profile={profile!r} not in {sorted(VALID_PROFILES)}"
+            )
         super().__init__(
             python_exe=python_exe,
             ssh_args=tuple(ssh_args),
@@ -162,18 +224,18 @@ class ForgeSSHJob(SSHJob):
         self._conda_env = conda_env
         self._conda_bin = conda_bin
         self._areal_root = areal_root
+        self._profile = profile
         self._pool_mb = torchstore_pool_mb
 
     # ------------------------------------------------------------------
 
-    def _env_preamble(self) -> str:
-        """Bash one-liner that must precede the remote ``python -c ...``.
+    def _common_env_parts(self) -> list[str]:
+        """Profile-agnostic bash commands run on every worker, regardless of profile.
 
-        Kept deliberately parallel to the pre-refactor
-        ``worker_manager.sh::worker_script`` so a reviewer can diff
-        the two side-by-side.  The preamble is identical across all
-        hosts in a fleet; per-host customization happens in the
-        ``python -c`` address, not here.
+        Mirrors ``worker_manager.sh::common_env_block`` -- if you
+        change one, change the other.  Excludes the trailing ``cd``,
+        which lives at the very end of the composed preamble so it
+        always runs after every export.
         """
         ascend_root = os.path.dirname(self._cann_home.rstrip("/"))
         pythonpath = ":".join(
@@ -184,7 +246,7 @@ class ForgeSSHJob(SSHJob):
                 "${PYTHONPATH:-}",
             ]
         )
-        parts = [
+        return [
             # CANN + ATB (Ascend Transformer Boost) env.  ``2>/dev/null``
             # silences benign "file not found" noise when CANN is not at
             # a default install path -- the missing file only matters if
@@ -210,26 +272,115 @@ class ForgeSSHJob(SSHJob):
             'export ASCEND_GLOBAL_LOG_LEVEL="${ASCEND_GLOBAL_LOG_LEVEL:-3}"',
             'export ASCEND_SLOG_PRINT_TO_STDOUT="${ASCEND_SLOG_PRINT_TO_STDOUT:-1}"',
             'export HCCL_DEBUG="${HCCL_DEBUG:-INFO}"',
-            # Cross-node transport: HiXL requires RoCE; HCCS is
-            # intra-supernode only on 910B.
-            "export MONARCH_HIXL_TRANSPORT=roce",
-            # Must be set BEFORE python starts -- CANN reads this once
-            # at library load time and ignores later Rust-side sets.
-            "export HCCL_INTRA_ROCE_ENABLE=1",
             # HCCL accepts only [120, 7200]; anything smaller bounces
             # with EI0001.
             "export HCCL_CONNECT_TIMEOUT=120",
-            # Wider port range so HiXL sub-comm and HCCL process-group
-            # don't collide on the default 16666 slot.  256 ports is the
-            # validated minimum for FSDP-4 + HiXL on one NPU.
-            'export HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-60000-60255}"',
-            # Clear legacy torchstore RDMA toggles so the MonarchRDMA
-            # backend (HiXL) stays active.
-            "unset TORCHSTORE_RDMA_ENABLED",
-            # torchstore staging pool: keep NPU-resident, 2 MB aligned.
-            "export TORCHSTORE_MONARCH_RDMA_EAGER_D2H=0",
-            "export TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:0",
-            f'export TORCHSTORE_MONARCH_RDMA_POOL_MB="${{TORCHSTORE_MONARCH_RDMA_POOL_MB:-{self._pool_mb}}}"',
+            # HuggingFace offline mode.  Bare-metal NPU clusters are
+            # typically air-gapped, so datasets/models loaded via
+            # ``datasets.load_dataset`` or ``from_pretrained`` must
+            # come from local cache.  Without these three flags the
+            # transformers/datasets/hub clients do a HEAD request to
+            # huggingface.co on every load, which fails DNS lookup
+            # and wastes ~30s per rank in the 5x retry loop.  Set
+            # to 0 explicitly in the operator's shell to re-enable
+            # network fetches (e.g. during initial cache warmup).
+            'export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"',
+            'export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"',
+            'export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"',
+        ]
+
+    def _profile_env_parts(self) -> list[str]:
+        """Profile-specific bash commands.
+
+        Mirrors ``worker_manager.sh::profile_env_block`` byte-for-byte
+        in intent.  The two-profile design is documented in detail
+        there; the short version:
+
+        * ``hixl-coexist``  -- HiXL/torchstore RDMA env.  Forces HCCL
+          intra-host onto RoCE, opens HCCL port range 60000-60255 to
+          avoid the HiXL/HCCL collision on 16666, configures the
+          torchstore staging pool.  Required for any in-process
+          mixing of HCCL collectives and HiXL Connect.
+        * ``pure-training`` -- empty.  HCCL auto-selects the optimal
+          transport (HCCS intra + RoCE inter) and no torchstore
+          staging is set up.  Right answer for B-full TorchTitan,
+          SFT, pretrain, eval -- anything that doesn't import HiXL.
+        """
+        if self._profile == "pure-training":
+            # Intentionally empty.  The whole point of this profile
+            # is "let HCCL pick its own transport" -- adding ANY
+            # HCCL_INTRA_* / HCCL_NPU_SOCKET_PORT_RANGE / MONARCH_HIXL_*
+            # var here would silently re-introduce the GRPO env and
+            # defeat the profile.  If a future override is genuinely
+            # profile-agnostic (e.g. raising HCCL_BUFFSIZE), put it in
+            # _common_env_parts instead.
+            return []
+
+        if self._profile == "hixl-coexist":
+            return [
+                # Cross-node transport: HiXL requires RoCE; HCCS is
+                # intra-supernode only on 910B.
+                "export MONARCH_HIXL_TRANSPORT=roce",
+                # Must be set BEFORE python starts -- CANN reads this once
+                # at library load time and ignores later Rust-side sets.
+                # Forces HCCL intra-host onto RoCE so the link-type
+                # negotiation with HiXL's RoCE Connect doesn't deadlock.
+                # Costs ~10x intra-host bandwidth vs. HCCS -- the price
+                # of in-process HiXL/HCCL coexistence.
+                "export HCCL_INTRA_ROCE_ENABLE=1",
+                # Wider port range so HiXL sub-comm and HCCL process-group
+                # don't collide on the default 16666 slot.  256 ports is
+                # the validated minimum for FSDP-4 + HiXL on one NPU.
+                'export HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-60000-60255}"',
+                # Clear legacy torchstore RDMA toggles so the MonarchRDMA
+                # backend (HiXL) stays active.
+                "unset TORCHSTORE_RDMA_ENABLED",
+                # torchstore staging pool: keep NPU-resident, 2 MB aligned.
+                "export TORCHSTORE_MONARCH_RDMA_EAGER_D2H=0",
+                "export TORCHSTORE_MONARCH_RDMA_STORAGE_DEVICE=npu:0",
+                f'export TORCHSTORE_MONARCH_RDMA_POOL_MB="${{TORCHSTORE_MONARCH_RDMA_POOL_MB:-{self._pool_mb}}}"',
+            ]
+
+        # Validated in __init__; defensive check in case someone
+        # bypasses the constructor and pokes at _profile directly.
+        raise ValueError(f"ForgeSSHJob: unknown profile {self._profile!r}")
+
+    def _env_preamble(self) -> str:
+        """Bash one-liner that must precede the remote ``python -c ...``.
+
+        Composition order (must match
+        ``worker_manager.sh::worker_script``):
+
+        1. :meth:`_common_env_parts`    -- CANN, conda, PYTHONPATH,
+                                            generic HCCL, HF offline
+        2. :meth:`_profile_env_parts`   -- profile-specific exports
+        3. ``mkdir -p {areal_root}``    -- defensive: when areal_root
+                                            is a Monarch ``remote_mount``
+                                            target (e.g. ``/root/AReaL_remote``)
+                                            the directory does NOT exist
+                                            yet at apply() time; the FUSE
+                                            mount only activates inside
+                                            ``state()`` which runs AFTER
+                                            ``apply()``.  Without this,
+                                            the immediately-following
+                                            ``cd`` fails with rc=1 and
+                                            sshd silently drops the
+                                            worker before
+                                            ``run_worker_loop_forever``
+                                            even starts.  No-op when the
+                                            directory already exists
+                                            (the typical no-mount case).
+        4. ``cd {areal_root}``          -- always last so subsequent
+                                            python sees the right cwd
+
+        The result is a single ``;``-joined string because Monarch's
+        parent ``_start_host`` invokes it via ``ssh host -n "<cmd>"``,
+        which doesn't run a login shell that would interpret newlines.
+        """
+        parts = [
+            *self._common_env_parts(),
+            *self._profile_env_parts(),
+            f"mkdir -p {shlex.quote(self._areal_root)}",
             f"cd {shlex.quote(self._areal_root)}",
         ]
         return "; ".join(parts)
@@ -254,7 +405,11 @@ class ForgeSSHJob(SSHJob):
         )
         py_cmd = f"{shlex.quote(self._python_exe)} -c {shlex.quote(startup)}"
         full_cmd = f"{self._env_preamble()}; exec {py_cmd}"
-        logger.info("ForgeSSHJob: starting worker at %s", addr)
+        logger.info(
+            "ForgeSSHJob: starting worker at %s (profile=%s)",
+            addr,
+            self._profile,
+        )
         proc = subprocess.Popen(
             ["ssh", *self._ssh_args, host, "-n", full_cmd],
             start_new_session=True,

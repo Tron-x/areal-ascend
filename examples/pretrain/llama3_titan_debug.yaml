@@ -1,0 +1,78 @@
+# B-full TorchTitan pretraining smoke -- algorithm-author view.
+#
+# This is the two-layer YAML's *algo* half: the only fields the
+# algorithm engineer writes are (a) which cluster preset to bind
+# against, (b) per-role NPU budget, and (c) the TorchTitan
+# configuration surface (toml path + cwd + overrides).  Every infra
+# concern (which host is driver, which env profile, how many NPUs
+# per host) is delegated to the preset.
+#
+# Run::
+#
+#     python -m forge launch examples/pretrain/llama3_titan_debug.yaml \
+#         --steps 5
+#
+# ``--mode`` is auto-detected from the top-level ``mode:`` key here.
+# ``--steps N`` is sugar for appending ``--training.steps N`` to
+# ``titan.overrides``; both work.
+#
+# Equivalent to the legacy::
+#
+#     python forge/scripts/titan_train_multinode.py \
+#         --hostfile forge/configs/hostfile.txt \
+#         --tt-config /root/torchtitan/.../debug_model.toml \
+#         --tt-cwd /root/torchtitan \
+#         --procs-per-host 4 --steps 5
+#
+# but goes through ``forge launch`` so worker spawn / cleanup /
+# profile selection / driver dispatch all share the GRPO code path.
+
+# Dispatch tag.  Read by ``forge.cli.launch`` to pick which app to
+# run on the driver host (``forge.apps.titan_pretrain`` here, vs.
+# ``forge.apps.grpo`` for the default GRPO mode).  The CLI
+# ``--mode`` flag overrides this.
+mode: titan-pretrain
+
+# Cluster preset -- resolved under ``forge/configs/clusters/``.  The
+# ``pure-training`` profile in this preset is what gives us HCCS
+# intra-host transport (vs. the GRPO preset's forced RoCE).
+launcher_preset: 2node_pure_training
+
+# Per-role NPU budget.  Merged into the preset's ``roles:`` block.
+# devices=8 means "give trainer 8 NPUs cluster-wide"; the
+# titan-pretrain app spreads them evenly across pool hosts (8 / 2 =
+# 4 per host).  Set to 4 for a single-host smoke (will pin to the
+# driver host).
+roles:
+  trainer:
+    devices: 8
+
+# TorchTitan configuration surface.  Everything under ``titan:`` is
+# passed verbatim to the actor on the driver host, then forwarded
+# to TorchTitan's CLI via ``Trainer(JobConfig.from_args(...))``.
+titan:
+  # Path to a TorchTitan .toml.  Absolute, since the worker procs
+  # don't share cwd with the launcher host.
+  config: /root/torchtitan/torchtitan/models/llama3/train_configs/debug_model.toml
+
+  # Working directory for every actor before TT's Trainer is
+  # constructed.  TT debug configs use relative paths to bundled
+  # tokenizer + c4_test fixtures, so this MUST point at the TT repo
+  # root.
+  cwd: /root/torchtitan
+
+  # NPUs per host.  Multiplied by len(pool) gives the world size.
+  # Defaults to roles.trainer.devices / len(pool) if omitted; we
+  # spell it out here for clarity.
+  procs_per_host: 4
+
+  # HCCL rendezvous port for ``torch.distributed`` init.  0 lets
+  # Monarch's SPMDActor pick a free port on rank 0 -- the right
+  # default for one-shot smoke runs.  Pin to a fixed port for
+  # firewall-restricted environments.
+  master_port: 0
+
+  # Extra TorchTitan CLI overrides.  Merged after ``--steps`` (CLI
+  # > overrides) so a `forge launch ... --steps 5` always wins.
+  # Useful for: --metrics.log_freq 1, --training.local_batch_size 2.
+  overrides: []
