@@ -149,6 +149,7 @@ async def _run(
     procs_per_host: int,
     master_port: int,
     overrides: dict,
+    use_modelscope: bool,
 ) -> int:
     """Drive one full single-host LlamaFactory training run."""
     from monarch.actor import this_host
@@ -190,6 +191,11 @@ async def _run(
         accelerate_yaml_path=str(accelerate_config),
         cwd=str(lf_cwd),
         overrides=overrides or None,
+        # Single-host this_host() actors inherit the driver's env so
+        # USE_MODELSCOPE_HUB exported in main() reaches them anyway,
+        # but pass the flag through explicitly for parity with the
+        # B-full ``forge.apps.llamafactory_train`` driver.
+        use_modelscope=use_modelscope,
     )
     elapsed = time.time() - t0
 
@@ -267,6 +273,7 @@ def main(argv: list[str]) -> int:
                 procs_per_host=args.procs_per_host,
                 master_port=args.master_port,
                 overrides=overrides,
+                use_modelscope=bool(args.use_modelscope),
             )
         )
     except KeyboardInterrupt:

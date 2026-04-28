@@ -53,7 +53,7 @@ DEFAULT_TRAIN_SCRIPT = FORGE_ROOT / "examples" / "math" / "gsm8k_rl.py"
 DEFAULT_CANN_HOME = "/usr/local/Ascend/cann-9.0.0-beta.1"
 
 _LAUNCHER_LAYER_KEYS: frozenset[str] = frozenset(
-    {"launcher_preset", "roles", "mode", "titan", "inference"}
+    {"launcher_preset", "roles", "mode", "titan", "inference", "llamafactory"}
 )
 """Top-level algo-YAML keys owned by ``forge launch`` (not the inner app).
 
@@ -82,9 +82,16 @@ Why each key is here:
                           benchmark) consumed by
                           ``forge.apps.inference_bench``, never by
                           ``forge.apps.grpo``
+* ``llamafactory``     -- B-full LF SFT/PT block (lf_config /
+                          accelerate_config / cwd / procs_per_host /
+                          overrides / use_modelscope) consumed by
+                          ``forge.apps.llamafactory_train``, never
+                          by ``forge.apps.grpo``
 """
 
-_VALID_MODES: frozenset[str] = frozenset({"grpo", "titan-pretrain", "inference-bench"})
+_VALID_MODES: frozenset[str] = frozenset(
+    {"grpo", "titan-pretrain", "inference-bench", "llamafactory-train"}
+)
 """Recognised values for ``mode:`` / ``--mode``.
 
 * ``grpo``            -- default; runs ``forge.apps.grpo`` on the
@@ -98,12 +105,18 @@ _VALID_MODES: frozenset[str] = frozenset({"grpo", "titan-pretrain", "inference-b
                          driver.  Worker profile defaults to
                          ``pure-training`` (no HiXL/torchstore env
                          needed for standalone inference).
+* ``llamafactory-train`` -- B-full LlamaFactory SFT/PT entry; runs
+                         ``forge.apps.llamafactory_train`` on the
+                         driver.  Worker profile defaults to
+                         ``pure-training``; same FSDP-only env
+                         envelope as titan-pretrain (no HiXL).
 """
 
 _MODE_DEFAULT_PROFILE: dict[str, str] = {
     "grpo": "hixl-coexist",
     "titan-pretrain": "pure-training",
     "inference-bench": "pure-training",
+    "llamafactory-train": "pure-training",
 }
 """Default worker env profile for each mode.
 
@@ -191,7 +204,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Inference-bench only: override "
             "``inference.benchmark.duration_seconds`` from the algo YAML.  "
-            "Ignored by grpo / titan-pretrain modes."
+            "Ignored by grpo / titan-pretrain / llamafactory-train modes."
         ),
     )
     p.add_argument(
@@ -215,13 +228,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "pretraining (B-full, no GRPO loop / vLLM / "
             "torchstore); ``inference-bench`` runs "
             "``forge.apps.inference_bench`` for a 2-node vLLM "
-            "throughput benchmark (one TP=N replica per host).  "
-            "If omitted, read from the algo YAML's top-level "
-            "``mode:`` key, falling back to ``grpo``.  Mode "
-            "determines worker env profile (grpo -> hixl-coexist; "
-            "titan-pretrain / inference-bench -> pure-training) "
-            "and driver env exports (the pure-training modes skip "
-            "the HiXL/torchstore vars)."
+            "throughput benchmark (one TP=N replica per host); "
+            "``llamafactory-train`` runs "
+            "``forge.apps.llamafactory_train`` for LlamaFactory "
+            "SFT/PT (B-full LF backend, FSDP2 via accelerate "
+            "config, no GRPO loop).  If omitted, read from the "
+            "algo YAML's top-level ``mode:`` key, falling back to "
+            "``grpo``.  Mode determines worker env profile (grpo "
+            "-> hixl-coexist; titan-pretrain / inference-bench / "
+            "llamafactory-train -> pure-training) and driver env "
+            "exports (the pure-training modes skip the "
+            "HiXL/torchstore vars)."
         ),
     )
     p.add_argument(
@@ -691,8 +708,9 @@ def main(argv: list[str]) -> int:
         )
 
         # --- Run training via SSH to driver ----------------------------
-        # Mode dispatch: GRPO, titan-pretrain, and inference-bench go
-        # through different apps with different env/CLI surfaces.
+        # Mode dispatch: GRPO, titan-pretrain, inference-bench, and
+        # llamafactory-train go through different apps with different
+        # env/CLI surfaces.
         # Keeping them as distinct functions keeps the GRPO path's
         # complex flag forwarding (model / model_name / model_flavor /
         # forge env vars) separate from the much simpler
@@ -727,6 +745,18 @@ def main(argv: list[str]) -> int:
             # the inference_bench driver needs the ORIGINAL algo
             # YAML path to read its block back.
             train_rc = _run_driver_inference_bench(
+                args=args,
+                driver=driver,
+                algo_config=positional,
+                workers_arg=workers_arg,
+                code_root=driver_code_root,
+            )
+        elif mode == "llamafactory-train":
+            # Same reasoning as titan-pretrain: ``llamafactory:`` is
+            # stripped from ``algo_config`` by _resolve_configs (it
+            # would fail GRPOConfig validation), so the LF driver
+            # reads its block from the ORIGINAL algo YAML path.
+            train_rc = _run_driver_llamafactory_train(
                 args=args,
                 driver=driver,
                 algo_config=positional,
@@ -1487,7 +1517,8 @@ def _stage_tmp_yamls_on_driver(
 # Driver dispatch
 # ---------------------------------------------------------------------------
 #
-# All three driver entrypoints (grpo / titan-pretrain / inference-bench)
+# All four driver entrypoints (grpo / titan-pretrain / inference-bench /
+# llamafactory-train)
 # share the same machinery: SSH into the driver host with a bash
 # preamble that sources CANN, activates the conda env, exports a few
 # dozen runtime knobs, ``cd`` into the source root (FUSE mount or
@@ -1506,7 +1537,8 @@ def _stage_tmp_yamls_on_driver(
 #   timed status print.  Single owner of the ugly shell parts; mode
 #   builders just hand it ``argv``, ``env_extras``, and a log path.
 # * :func:`_run_driver_training` / :func:`_run_driver_titan_pretrain`
-#   / :func:`_run_driver_inference_bench` -- thin builders that
+#   / :func:`_run_driver_inference_bench` /
+#   :func:`_run_driver_llamafactory_train` -- thin builders that
 #   compose the per-mode argv + env extras, then call the helper.
 #
 # Future direction: replace SSH+tee with a Monarch ``BashActor``
@@ -1871,6 +1903,64 @@ def _run_driver_inference_bench(
         argv=bench_argv,
         env_extras=env_extras,
         log_path="/tmp/forge_inference_bench.log",
+    )
+
+
+def _run_driver_llamafactory_train(
+    *,
+    args: argparse.Namespace,
+    driver: str,
+    algo_config: Path,
+    workers_arg: str,
+    code_root: str | None = None,
+) -> int:
+    """SSH into the driver host and run ``python -m forge.apps.llamafactory_train``.
+
+    Same slim ``pure-training`` envelope as titan-pretrain: no
+    HiXL, no torchstore env injected.  LlamaFactory's actor-side
+    setup pulls FSDP env vars out of the accelerate YAML at
+    ``run()``-time (see ``_export_fsdp2_env`` in
+    :mod:`forge.actors.llamafactory_trainer`), so the driver only
+    needs PYTHONPATH plumbing for ``import monarch`` / ``import
+    forge.actors.llamafactory_trainer``.  LF itself is expected to
+    be importable from the env active on each worker (see
+    ``CLAUDE.md`` -- the ``monarch_ascend`` conda env has both LF
+    and forge installed).
+    """
+    if code_root is None:
+        code_root = str(FORGE_ROOT)
+    _, algo_config = _stage_tmp_yamls_on_driver(
+        config=algo_config,
+        algo_config=algo_config,
+        driver=driver,
+        ssh_port=args.ssh_port,
+    )
+
+    train_argv = [
+        "python",
+        "-m",
+        "forge.apps.llamafactory_train",
+        "--algo-config",
+        str(algo_config),
+        "--bare-metal-workers",
+        workers_arg,
+    ]
+    if args.steps is not None:
+        train_argv += ["--steps", str(args.steps)]
+
+    env_extras = [
+        f'export PYTHONPATH={shlex.quote(code_root)}":/root/torchstore:/root/monarch/python:${{PYTHONPATH:-}}"',
+    ]
+
+    return _run_driver_via_ssh(
+        mode_label="llamafactory-train",
+        driver=driver,
+        ssh_port=args.ssh_port,
+        cann=args.cann,
+        code_root=code_root,
+        argv=train_argv,
+        env_extras=env_extras,
+        log_path="/tmp/forge_llamafactory_train.log",
     )
 
 

@@ -1,0 +1,108 @@
+# B-full LlamaFactory SFT smoke -- algorithm-author view.
+#
+# This is the two-layer YAML's *algo* half: the only fields the
+# algorithm engineer writes are (a) which cluster preset to bind
+# against, (b) per-role NPU budget, and (c) the LlamaFactory
+# configuration surface (lf_config + accelerate_config + cwd +
+# overrides).  Every infra concern (which host is driver, which env
+# profile, how many NPUs per host) is delegated to the preset.
+#
+# Run::
+#
+#     python -m forge launch examples/sft/qwen3vl_4b_lf_npu.yaml \
+#         --steps 3
+#
+# ``--mode`` is auto-detected from the top-level ``mode:`` key here.
+# ``--steps N`` is sugar for setting ``llamafactory.overrides.max_steps``;
+# both work, with CLI > YAML.
+#
+# Equivalent to the legacy::
+#
+#     /root/miniconda3/envs/monarch_ascend/bin/python \
+#         forge/scripts/llamafactory_train_singlehost.py \
+#         --lf-config examples/sft/qwen3vl_4b_lf_fsdp2_debug.yaml \
+#         --accelerate-config examples/accelerate/lf_fsdp2_npu.yaml \
+#         --lf-cwd /root/LlamaFactory \
+#         --procs-per-host 4 --max-steps 3
+#
+# but goes through ``forge launch`` so worker spawn / cleanup /
+# profile selection / driver dispatch all share the GRPO code path.
+
+# Dispatch tag.  Read by ``forge.cli.launch`` to pick which app to
+# run on the driver host (``forge.apps.llamafactory_train`` here,
+# vs. ``forge.apps.titan_pretrain`` for B-full TT, vs.
+# ``forge.apps.grpo`` for the default GRPO mode).  The CLI
+# ``--mode`` flag overrides this.
+mode: llamafactory-train
+
+# Cluster preset -- resolved under ``forge/configs/clusters/``.  The
+# 1-node preset's ``pure-training`` profile is what gives us HCCS
+# intra-host transport (vs. the GRPO preset's forced RoCE).  Switch
+# to ``2node_pure_training`` for a 2-host run; the LF actor handles
+# both n_hosts=1 and n_hosts>1 with no code change.
+launcher_preset: 1node_pure_training
+
+# Per-role NPU budget.  Merged into the preset's ``roles:`` block.
+# devices=4 means "give the LF trainer 4 NPUs cluster-wide"; the
+# llamafactory-train app spreads them evenly across pool hosts
+# (4 / 1 = 4 per host on the 1-node preset).  Bump to 8 for a
+# full-node run.
+roles:
+  trainer:
+    devices: 4
+
+# LlamaFactory configuration surface.  Everything under
+# ``llamafactory:`` is passed verbatim to the actor on the driver
+# host, then forwarded to LF's ``run_exp(args=lf_yaml | overrides)``
+# entry.  The split into lf_config + accelerate_config mirrors LF's
+# upstream invocation::
+#
+#     accelerate launch --config_file <accelerate_config> \
+#         src/train.py <lf_config>
+#
+# but with accelerate's launcher replaced by Monarch's actor mesh.
+# The accelerate YAML is parsed for FSDP env vars only (no
+# ``accelerate launch`` is ever exec'd).
+llamafactory:
+  # LF training YAML -- model / data / training-loop knobs.
+  # Absolute path so the actor on a remote host doesn't need to
+  # share cwd with the launcher.
+  lf_config: /root/AReaL/examples/sft/qwen3vl_4b_lf_fsdp2_debug.yaml
+
+  # Accelerate FSDP2 config YAML.  Read by the actor at run() time
+  # and translated to env vars (ACCELERATE_USE_FSDP / FSDP_VERSION /
+  # FSDP_AUTO_WRAP_POLICY / ...) before LF / transformers import,
+  # so accelerate.Accelerator() picks them up via env-var fallback.
+  accelerate_config: /root/AReaL/examples/accelerate/lf_fsdp2_npu.yaml
+
+  # Working directory for every actor before run_exp() is called.
+  # MUST point at the LlamaFactory repo root so
+  # ``data/dataset_info.json`` and the bundled mllm_demo /
+  # identity datasets resolve correctly.  Note: this is OUTSIDE the
+  # forge tree -- LF lives at /root/LlamaFactory, not as a forge
+  # submodule.  See CLAUDE.md for env / install layout.
+  cwd: /root/LlamaFactory
+
+  # NPUs per host.  Multiplied by len(pool) gives the world size.
+  # 4 here matches roles.trainer.devices on the 1-node preset; bump
+  # to 8 for a full-node run (and bump roles.trainer.devices in
+  # lockstep).
+  procs_per_host: 4
+
+  # HCCL rendezvous port for ``torch.distributed`` init.  0 lets
+  # SPMDActor pick a free port on rank 0 (recommended for one-shot
+  # runs).  Pin to a fixed port for firewall-restricted environments.
+  master_port: 0
+
+  # Use ModelScope for snapshot lookups when HuggingFace is not
+  # reachable.  Sets ``USE_MODELSCOPE_HUB=1`` on the driver before
+  # the actor procs are spawned, so they inherit it.  Default true
+  # because the deployment cluster has no HF egress.
+  use_modelscope: true
+
+  # Extra LF args dict, merged into ``lf_config`` at run() time.
+  # CLI ``--steps N`` is appended after this as
+  # ``overrides.max_steps`` so it always wins (mirrors
+  # titan-pretrain's overrides+CLI ordering).  Useful keys:
+  # output_dir, per_device_train_batch_size, logging_steps.
+  overrides: {}

@@ -177,6 +177,8 @@ class LlamaFactoryTrainerActor(SPMDActor):
         overrides: dict[str, Any] | None = None,
         master_addr: str | None = None,
         master_port: int | None = None,
+        use_modelscope: bool = False,
+        extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Drive one full LlamaFactory training run on this rank.
 
@@ -202,6 +204,18 @@ class LlamaFactoryTrainerActor(SPMDActor):
                 set the rendezvous via ``self._setup_env``.  When
                 ``None`` the caller is expected to have invoked
                 ``setup_env`` beforehand.
+            use_modelscope: When ``True``, set ``USE_MODELSCOPE_HUB=1``
+                inside this actor proc *before* the ``llamafactory``
+                import.  Required when (a) HuggingFace is unreachable
+                from this host AND (b) the driver lives in a different
+                process tree (e.g. SSHJob workers don't inherit the
+                driver's env).  Single-host ``this_host()`` drivers
+                that already export this in their parent shell can
+                leave it ``False``.
+            extra_env: Arbitrary env-var overrides applied alongside
+                ``use_modelscope`` (after FSDP env, before LF import).
+                Escape hatch for one-offs (HF_ENDPOINT, MODELSCOPE_CACHE,
+                etc.) without churning this signature.
 
         Returns:
             ``{"rank": int, "host": str, "elapsed_s": float, "ok": True}``
@@ -216,12 +230,20 @@ class LlamaFactoryTrainerActor(SPMDActor):
               first ``import accelerate`` in this proc.  We do that via
               :func:`_export_fsdp2_env` before any ``llamafactory``
               import.
+            * Same ordering rule applies to ``USE_MODELSCOPE_HUB``:
+              must be set before ``import llamafactory`` because LF's
+              hub-resolver is keyed on it at module-load time.
         """
 
         if master_addr is not None and master_port is not None:
             self._setup_env(master_addr, master_port)
 
         os.chdir(cwd)
+
+        if use_modelscope:
+            os.environ.setdefault("USE_MODELSCOPE_HUB", "1")
+        if extra_env:
+            os.environ.update({str(k): str(v) for k, v in extra_env.items()})
 
         rank = int(os.environ.get("RANK", "-1"))
         local_rank = int(os.environ.get("LOCAL_RANK", "-1"))

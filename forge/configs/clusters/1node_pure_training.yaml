@@ -1,0 +1,61 @@
+# Cluster preset: 1-bare-metal-node pure-training layout.
+#
+# INFRA-OWNED.  Single-host counterpart to ``2node_pure_training.yaml``.
+# Targets the same workload class (TT pretrain / SFT / eval / B-full
+# ``--mode titan-pretrain`` / ``--mode llamafactory-train``) but on a
+# single bare-metal node, where the driver and the only worker live
+# on the same machine.
+#
+# Differences vs. ``2node_pure_training.yaml``:
+#
+#   * ``pool`` has a single entry, tagged ``role: driver``.  The
+#     driver-discovery path in ``forge.cli.launch._read_pool_from_yaml``
+#     happily accepts a 1-host pool; the ``forge.apps.<mode>`` driver
+#     then ssh-into-itself to run the orchestration loop.  No code
+#     branching needed for n_hosts=1.
+#   * ``trainer.devices`` defaults to 4 (half a node) -- the typical
+#     single-host smoke envelope.  Bump to 8 in the algo YAML for a
+#     full-node run.
+#
+# Use this preset for single-host smokes / debug iteration; switch
+# to ``2node_pure_training`` once the algo YAML is stable.
+#
+# Two-layer mental model (unchanged):
+#
+#   preset (this file)     "what hardware exists + which env profile"
+#   algo yaml              "how many NPUs trainer wants + framework config"
+#   scheduler              "bind them" -> host_idx per role
+
+launcher:
+  type: bare_metal
+
+  # Same SSHJob path as the 2-node preset.  On a 1-host pool the
+  # SSH target is loopback -- works fine, and keeps the driver/worker
+  # provisioning code path identical to multi-host runs (no special
+  # casing in forge/provisioner_ssh.py).
+  launcher_impl: ssh_job
+
+  # Pure-training profile: HCCL auto-selects HCCS for intra-host
+  # NPU pairs; no HiXL / torchstore env injected.  Same rationale as
+  # the 2-node preset.
+  profile: pure-training
+
+  # Single-host pool.  Tagged ``role: driver`` so the launcher uses
+  # the same ``_read_pool_from_yaml`` driver-discovery path it uses
+  # for multi-host presets -- the ``forge.apps.<mode>`` orchestrator
+  # SSHs into this host and attach_to_workers() reaches the local
+  # worker daemon over loopback.
+  pool:
+    - host: 192.168.0.26
+      port: 22222
+      hardware: npu
+      n_devices: 8
+      role: driver
+
+  # Single-role layout.  ``devices`` here is the aggregate NPU count
+  # the trainer is allowed to occupy on this host.  Algo YAMLs
+  # typically override this to spell out their actual budget.
+  roles:
+    trainer:
+      devices: 4
+      hardware: npu
