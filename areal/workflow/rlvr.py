@@ -21,6 +21,7 @@ from areal.utils.perf_tracer import (
     session_context,
     trace_session,
 )
+from areal.workflow import register_workflow
 
 logger = logging.getLogger("RLVRWorkflow")
 
@@ -43,6 +44,7 @@ def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:
     return data["messages"]
 
 
+@register_workflow("rlvr")
 class RLVRWorkflow(RolloutWorkflow):
     """Single-turn reward learning workflow supporting optional thinking tokens."""
 

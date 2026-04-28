@@ -16,11 +16,13 @@ from areal.utils.perf_tracer import (
     session_context,
     trace_session,
 )
+from areal.workflow import register_workflow
 from areal.workflow.rlvr import RLVRWorkflow
 
 logger = logging.getLogger("VisionRLVRWorkflow")
 
 
+@register_workflow("vision_rlvr")
 class VisionRLVRWorkflow(RLVRWorkflow):
     def __init__(
         self,

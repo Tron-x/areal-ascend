@@ -22,27 +22,8 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
+    from forge.cli._list_registry import render_registry
     from forge.reward import _REGISTRY, ensure_loaded
 
     ensure_loaded()
-
-    if not _REGISTRY:
-        print("(no rewards registered)")
-        return 0
-
-    # Group by module for readability.
-    by_module: dict[str, list[tuple[str, str]]] = {}
-    for name, fn in sorted(_REGISTRY.items()):
-        mod = getattr(fn, "__module__", "<unknown>")
-        qual = getattr(fn, "__qualname__", fn.__name__)
-        by_module.setdefault(mod, []).append((name, qual))
-
-    width = max(len(name) for name in _REGISTRY)
-    print(f"Found {len(_REGISTRY)} registered reward(s):\n")
-    for mod in sorted(by_module):
-        print(f"  {mod}")
-        for name, qual in by_module[mod]:
-            print(f"    • {name:<{width}}  → {qual}")
-        print()
-
-    return 0
+    return render_registry(label="reward", registry=_REGISTRY)

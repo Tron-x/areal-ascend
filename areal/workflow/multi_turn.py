@@ -9,10 +9,12 @@ from areal import workflow_context
 from areal.api import AsyncRewardWrapper, InferenceEngine, ModelRequest, RolloutWorkflow
 from areal.api.cli_args import GenerationHyperparameters
 from areal.utils import logging, stats_tracker
+from areal.workflow import register_workflow
 
 logger = logging.getLogger("MultiTurnWorkflow")
 
 
+@register_workflow("multi_turn")
 class MultiTurnWorkflow(RolloutWorkflow):
     """Multi-attempt workflow that retries generation until the reward is positive."""
 
