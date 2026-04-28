@@ -1,0 +1,151 @@
+# 2-node Qwen3-VL-4B-Instruct inference smoke -- algorithm-author view.
+#
+# Spins up 2 independent vLLM replicas (one per host), each owning
+# half of its host's NPUs as a TP=4 group.  No cross-host
+# communication, no weight sync, no HiXL.  Standalone inference
+# counterpart of the LlamaFactory + TorchTitan training smokes:
+# verifies the same ``forge launch`` pattern carries vLLM workloads
+# end-to-end with the 4B Qwen3-VL model we just used for training.
+#
+# Run::
+#
+#     python -m forge launch examples/inference/qwen3vl.yaml
+#
+# Optional CLI overrides (all map to the ``inference.benchmark``
+# block below)::
+#
+#     --duration 60         # bench longer
+#
+# Output (driver host stdout)::
+#
+#     [inference_bench] host=192.168.0.26 throughput=...  tok/s ...
+#     [inference_bench] host=192.168.0.23 throughput=...  tok/s ...
+#     [inference_bench] aggregate throughput: ... tok/s across 2 replicas (30s)
+#
+# Mirror of ``examples/inference/qwen2_tp8_bench.yaml`` -- same
+# launcher preset, same actor, same benchmark protocol.  Only the
+# model + TP pair differ:
+#
+#     qwen2_tp8_bench.yaml  : Qwen2.5-1.5B-Instruct, TP=4
+#                             (12 heads, max legal TP for the model)
+#     qwen3vl.yaml (this)   : Qwen3-VL-4B-Instruct,  TP=4
+#                             (32 heads, 8 KV heads -- TP ∈ {1,2,4,8};
+#                             4 leaves 4 idle NPUs/host but is the
+#                             cleanest 4B smoke shape)
+#
+# Why this YAML exists alongside qwen2_tp8_bench
+# ----------------------------------------------
+# Two reasons it's not just one parameterised file:
+#
+# 1. Algo-author intent: this YAML pins a specific model + TP combo
+#    we know works end-to-end on our pool, so dropping
+#    ``--algo-config examples/inference/qwen3vl.yaml`` is enough --
+#    no per-run flag soup.  Same convention LF/TT use
+#    (``examples/sft/qwen3vl_4b_lf_npu.yaml`` is the LF training
+#    counterpart of this file).
+# 2. Multimodal model regression coverage: Qwen3-VL has a vision
+#    encoder (Conv3D + transformer stack on top of a 2560-dim text
+#    backbone), so this smoke exercises a code path qwen2-text-only
+#    does not.  Worth keeping as a separate artefact.
+
+# Dispatch tag.  Read by ``forge.cli.launch`` to pick the driver app
+# (``forge.apps.inference_bench`` here, vs. ``forge.apps.titan_pretrain``
+# for B-full pretraining, vs. ``forge.apps.llamafactory_train`` for SFT,
+# vs. ``forge.apps.grpo`` for the default RL post-training mode).  CLI
+# ``--mode`` overrides this.
+mode: inference-bench
+
+# Cluster preset -- resolved under ``forge/configs/clusters/``.
+# 2node_pure_inference shares the pure-training profile with the
+# titan/LF presets (no HiXL/torchstore env), and publishes a
+# ``generator`` role instead of ``trainer`` so the role name in the
+# algo YAML below binds against something in the preset.
+launcher_preset: 2node_pure_inference
+
+# Per-role NPU budget.  ``devices: 8`` means "8 NPUs cluster-wide
+# for the generator role" -- the inference-bench app spreads them
+# evenly across the pool as one TP=tensor_parallel_size replica per
+# host.  With 2 hosts and ``tensor_parallel_size=4`` below, each
+# replica owns 4 NPUs.
+roles:
+  generator:
+    devices: 8
+
+# vLLM configuration surface.  Everything under ``inference:`` is
+# read by ``forge.apps.inference_bench`` on the driver host and
+# forwarded to ``VLLMInferenceActor.init`` on each replica.
+inference:
+  # Local ModelScope cache path -- identical layout on both hosts
+  # of the bare-metal pool (verified 2026-04-28 after the LF
+  # training smoke tar-streamed it to .23).  In container/k8s
+  # deployments this becomes ``/shared/models/Qwen/Qwen3-VL-4B-Instruct``
+  # via PVC mount; the algo YAML stays unchanged because the
+  # operator overlay rewrites this single field.  Same convention
+  # the LF training smoke uses for the same model on the same host.
+  #
+  # We bind to a local path (not the canonical ``Qwen/Qwen3-VL-4B-Instruct``
+  # hub ID) because the pure-training profile sets
+  # ``HF_HUB_OFFLINE=1`` and ``.23`` cannot resolve modelscope.cn
+  # DNS, so first-run hub lookups fail.  When the cluster gains
+  # outbound DNS, switch back to the hub ID for portability.
+  model: /root/.cache/modelscope/hub/models/Qwen/Qwen3-VL-4B-Instruct
+
+  # Tensor parallel size.  Qwen3-VL-4B has 32 attention heads and
+  # 8 KV heads (GQA), so vLLM requires TP ∈ {1, 2, 4, 8} (must
+  # divide both head counts).  TP=4 is chosen because:
+  #
+  # * The model fits comfortably at TP=4 (~8GB weights at bf16
+  #   sharded across 4 NPUs leaves plenty of HBM for KV-cache).
+  # * TP=8 would also work but adds intra-host comm overhead
+  #   for no throughput gain on a 4B model -- TP=4 is faster.
+  # * Sticking to a power-of-two TP keeps the vision encoder's
+  #   1024-dim hidden splits cleanly across shards.
+  #
+  # The launcher itself is independent of the TP value (one vLLM
+  # process per host either way).
+  tensor_parallel_size: 4
+
+  # Numerics.  bfloat16 is the universal choice for Qwen3-VL on
+  # NPU -- matches the LF training run we just did.
+  dtype: bfloat16
+
+  # Max prompt + generation length the engine will allocate KV-cache
+  # for.  4096 is plenty for the synthetic-load benchmark
+  # (in_tokens=256, out_tokens=128 -> 384 tokens per request).
+  # Bump to 16k or 32k for long-context evals; mind HBM budget.
+  max_model_len: 4096
+
+  # Fraction of NPU HBM vLLM is allowed to use.  0.85 leaves ~15%
+  # for the runtime + tokenizer + vision encoder activations; bump
+  # to 0.9 if you OOM'd on a longer-context run, drop to 0.8 if
+  # you see OOMs at 0.85.
+  gpu_memory_utilization: 0.85
+
+  # Synthetic-load benchmark parameters.  Mirror the qwen2 bench so
+  # results are roughly comparable across models / TP shapes.
+  # ``forge launch ... --duration N`` overrides ``duration_seconds``.
+  benchmark:
+    # How long each replica generates traffic.  Driver waits for
+    # all replicas to finish then aggregates.
+    duration_seconds: 30
+
+    # Number of concurrent in-flight requests per replica.  vLLM
+    # batches them dynamically; 16 is a sane default for a 4B
+    # model at TP=4 (KV-cache budget bottlenecks higher values).
+    concurrency: 16
+
+    # Synthetic prompt length in tokens.  256 keeps prefill fast
+    # so the benchmark exercises the decode loop more than prefill.
+    # ``VLLMInferenceActor.run_benchmark`` builds these as raw
+    # token IDs (no tokenizer roundtrip), bypassing any
+    # multimodal preprocessing -- this benchmark is text-only,
+    # vision encoder paths are exercised at model-load time only.
+    input_tokens: 256
+
+    # Per-request output length cap.  vLLM stops at this many
+    # generated tokens (or EOS, whichever first).
+    output_tokens: 128
+
+    # PRNG seed for the synthetic prompt token IDs.  Fixed for
+    # reproducibility; change to randomise between runs.
+    seed: 0
