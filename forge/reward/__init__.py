@@ -53,8 +53,29 @@ from typing import Any
 
 logger = logging.getLogger("RewardRegistry")
 
+# Reward "scope" determines how :class:`RewardPipeline` invokes the
+# registered function:
+#
+#   * ``final``   -- single scalar for the whole trajectory.  Called
+#                    with the legacy ``(prompt, response, **kw)``
+#                    signature.  This is the default for backward
+#                    compatibility; every reward that predated A3
+#                    keeps working unchanged.
+#   * ``process`` -- per-turn scalars.  Called with the trajectory
+#                    object and expected to return a list[float] the
+#                    same length as ``trajectory.turns``.
+#
+# Scope is stored both in an auxiliary registry (``_SCOPES``) and as
+# an attribute on the function (``fn._forge_reward_scope``) so either
+# introspection path works.
+_VALID_SCOPES = ("final", "process")
+
 # Name -> reward callable.
 _REGISTRY: dict[str, Callable[..., Any]] = {}
+# Name -> scope string ("final" | "process").  Parallel dict rather
+# than a combined struct so the hot-path ``get_reward`` lookup stays
+# a single dict access.
+_SCOPES: dict[str, str] = {}
 
 # Lazy-init guard.  The first call to ``ensure_loaded`` scans the built-in
 # reward modules; subsequent calls are no-ops.  External packages that
@@ -63,21 +84,34 @@ _REGISTRY: dict[str, Callable[..., Any]] = {}
 _AUTO_DISCOVER_DONE = False
 
 
-def register_reward(name: str):
+def register_reward(name: str, *, scope: str = "final"):
     """Decorator: register ``fn`` under ``name`` in the reward registry.
 
     Usage::
 
+        # Final-scope: one scalar per trajectory (legacy, default).
         @register_reward("gsm8k")
         def gsm8k_reward_fn(prompt, response, **kwargs) -> float:
             ...
 
-    Duplicates raise ``ValueError`` at decoration time — this surfaces
+        # Process-scope: per-turn scalars (Phase A3).
+        @register_reward("tool_call_valid", scope="process")
+        def tool_call_valid_reward(trajectory) -> list[float]:
+            return [0.1 if turn.tool_calls else 0.0
+                    for turn in trajectory.turns]
+
+    Backward compatibility: ``scope`` defaults to ``"final"``, so
+    every legacy reward decorated with ``@register_reward("x")``
+    keeps exactly the same behavior and signature.
+
+    Duplicates raise ``ValueError`` at decoration time -- this surfaces
     collisions early rather than producing silently inconsistent
     behavior at run time.  If you intentionally want to replace an
     existing entry (hot-reload during iteration), delete from
     ``_REGISTRY`` first.
     """
+    if scope not in _VALID_SCOPES:
+        raise ValueError(f"invalid scope {scope!r}; must be one of {_VALID_SCOPES}")
 
     def wrap(fn: Callable[..., Any]) -> Callable[..., Any]:
         if name in _REGISTRY and _REGISTRY[name] is not fn:
@@ -88,9 +122,38 @@ def register_reward(name: str):
                 f"{fn.__module__}.{fn.__qualname__}"
             )
         _REGISTRY[name] = fn
+        _SCOPES[name] = scope
+        # Stash on the function too so callers that have a
+        # reference to ``fn`` (without going through the registry)
+        # can still introspect the scope.
+        try:
+            fn._forge_reward_scope = scope  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            # Builtins / C extensions may reject attribute assignment;
+            # the parallel ``_SCOPES`` dict still covers us.
+            pass
         return fn
 
     return wrap
+
+
+def get_reward_scope(name: str) -> str:
+    """Return the registered scope (``"final"`` or ``"process"``) for
+    ``name``.  Unknown names raise ``ValueError`` via :func:`get_reward`
+    so the error message already lists placement hints.
+    """
+    get_reward(name)  # reuses the rich error path
+    return _SCOPES.get(name, "final")
+
+
+def rewards_by_scope(scope: str) -> list[str]:
+    """List registered short names whose scope equals ``scope``.
+
+    Useful for :class:`RewardPipeline` to discover all
+    process-scope rewards without hard-coding their names.
+    """
+    ensure_loaded()
+    return sorted(n for n, s in _SCOPES.items() if s == scope)
 
 
 def get_reward(name: str) -> Callable[..., Any]:
@@ -191,12 +254,15 @@ def reset_for_tests() -> None:
     """
     global _AUTO_DISCOVER_DONE
     _REGISTRY.clear()
+    _SCOPES.clear()
     _AUTO_DISCOVER_DONE = False
 
 
 __all__ = [
     "register_reward",
     "get_reward",
+    "get_reward_scope",
+    "rewards_by_scope",
     "available_rewards",
     "ensure_loaded",
     "reset_for_tests",
