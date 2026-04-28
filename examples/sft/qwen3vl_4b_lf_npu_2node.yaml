@@ -1,0 +1,87 @@
+# B-full LlamaFactory SFT smoke -- 2-node algorithm-author view.
+#
+# Twin of qwen3vl_4b_lf_npu.yaml but binding the 2-host preset.
+# The LlamaFactoryTrainerActor handles ``n_hosts > 1`` with no
+# code change -- the only deltas from the algorithm-author's
+# perspective are ``launcher_preset`` and ``roles.trainer.devices``.
+#
+# Run::
+#
+#     python -m forge launch examples/sft/qwen3vl_4b_lf_npu_2node.yaml \
+#         --steps 3
+#
+# Portability contract
+# --------------------
+# This file is environment-neutral on purpose so it can move
+# between bare-metal NPU pools, containerised K8s clusters, and
+# shared-FS environments without edits.  The only paths it pins
+# are the ones every workflow already pins:
+#
+#   * ``lf_config`` / ``accelerate_config`` -- algorithm intent,
+#     resolved on the driver host's filesystem.  In a container
+#     deployment these will be at the same logical path baked
+#     into the image (or NFS-mounted), so the algo author's view
+#     is unchanged.
+#   * ``cwd`` -- LlamaFactory checkout root.  In a container
+#     deployment this typically becomes ``/workspace/LlamaFactory``
+#     baked at image-build time.  Override per-site via
+#     ``llamafactory.cwd`` here, not through cluster-side hacks.
+#
+# Site-specific knobs (which model snapshot to load, where the
+# tokenizer cache lives, etc.) belong either inside ``lf_config``
+# or in a per-site override file -- NOT in this YAML.  See
+# ``forge/docs/external_backends.md`` for the bare-metal PoC
+# pre-flight (tar LF + trl + model snapshot to every host) and
+# the production-equivalent migration story.
+
+mode: llamafactory-train
+
+# Cluster preset binds 2-host pool + pure-training profile (HCCS
+# intra-host, RoCE inter-host).  Same env contract as the 1-node
+# preset, just with a 2-entry pool.
+launcher_preset: 2node_pure_training
+
+# Per-role NPU budget.  4 NPUs/host * 2 hosts = 8 NPUs aggregate.
+# Bumping to 16 (full 8/host) is fine if intra-host bandwidth
+# isn't a bottleneck for your dataset -- the actor honours
+# whatever procs_per_host * len(pool) demands.
+roles:
+  trainer:
+    devices: 8
+
+llamafactory:
+  # Same LF / accelerate YAMLs as the 1-node smoke -- only the
+  # rendezvous topology changes between the 1-host and 2-host
+  # runs, not LF's training-loop shape.
+  lf_config: /root/AReaL/examples/sft/qwen3vl_4b_lf_fsdp2_debug.yaml
+  accelerate_config: /root/AReaL/examples/accelerate/lf_fsdp2_npu.yaml
+  cwd: /root/LlamaFactory
+
+  # 4 procs * 2 hosts = world_size 8.  Must equal
+  # ``roles.trainer.devices / len(pool)``.
+  procs_per_host: 4
+
+  # 0 lets SPMDActor pick a free port on rank 0.  In a 2-host run
+  # rank 0 lives on the host whose worker daemon was attached
+  # first -- inspect ``[llamafactory_train] rendezvous = ...`` in
+  # the launcher log to see which.
+  master_port: 0
+
+  # Use ModelScope as the resolver (HF mirror policy on the
+  # cluster).  The actual model identifier is pulled from
+  # ``lf_config.model_name_or_path`` -- a logical hub ID by
+  # default ("Qwen/Qwen3-VL-4B-Instruct"), which works as long
+  # as every host can resolve modelscope.cn OR has a pre-warmed
+  # cache at the standard ModelScope cache root.  In offline /
+  # restricted-DNS environments, point ``model_name_or_path`` to
+  # an on-disk snapshot inside ``lf_config`` (per-site config) or
+  # ship the cache to every host via the bare-metal bootstrap
+  # script -- not by hard-coding a host path here.
+  use_modelscope: true
+
+  # Empty: keep this YAML environment-neutral.  Per-site or
+  # per-experiment knobs (model_name_or_path, output_dir,
+  # learning_rate, ...) belong in lf_config or in a separate
+  # site-overlay YAML the operator owns -- pinning them here
+  # would couple algorithm intent to deployment layout.
+  overrides: {}
