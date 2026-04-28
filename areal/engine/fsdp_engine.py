@@ -1063,8 +1063,15 @@ class FSDPEngine(TrainEngine):
 
             fut = self.rollout_engine.init_weights_update_group(meta)
 
+            # ``meta.type`` is the AReaL-internal *mode* label
+            # ("xccl" = collective-communication mode, vs. "disk").  The
+            # underlying transport is whatever ``current_platform``
+            # ships -- "nccl" on CUDA, "hccl" on Ascend NPU, "xccl" on
+            # XPU.  Logging both avoids the recurring "we asked for
+            # XCCL, why is the wire protocol HCCL?" confusion on NPU.
             self.logger.info(
-                f"Initializing weight update group: type={meta.type} "
+                f"Initializing weight update group: mode={meta.type} "
+                f"backend={current_platform.communication_backend} "
                 f"init_method=tcp://{meta.nccl_master_address}:{meta.nccl_master_port} "
                 f"group={meta.nccl_group_name}"
             )
