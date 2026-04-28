@@ -146,10 +146,22 @@ class PythonSandbox:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# NOTE: ``register_tool`` is imported lazily inside the decorator call
+# to avoid a circular import when ``forge.tools.__init__`` is still
+# executing (it imports this module transitively via parsers.py).
+def _register_python_tool(cls):
+    from forge.tools import register_tool
+
+    return register_tool("python_sandbox")(cls)
+
+
+@_register_python_tool
 class PythonTool:
     """``Tool`` protocol implementation for Python code execution.
 
     Wraps ``PythonSandbox`` and provides the standard tool interface.
+    Registered under the short name ``python_sandbox`` so it can be
+    mounted via YAML ``roles.tool_server.tools: [python_sandbox]``.
 
     Usage::
 

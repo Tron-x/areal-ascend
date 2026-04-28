@@ -43,6 +43,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from forge.agents import register_agent
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,6 +59,7 @@ class ExternalAgentResult:
     duration: float = 0.0
 
 
+@register_agent("external")
 class ExternalAgentRunner:
     """Manage the lifecycle of an external agent process.
 

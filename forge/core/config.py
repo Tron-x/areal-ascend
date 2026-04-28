@@ -105,6 +105,25 @@ class ForgeConfig:
     ``forge/reward/__init__.py`` and
     ``examples/custom_rewards/README.md`` for the extension flow."""
 
+    agent: str = ""
+    """Short name registered via ``@register_agent("xxx")``.
+
+    Resolves to an agent-logic class via ``forge.agents.get_agent``.
+    Leave empty to keep legacy routing in ``forge.apps.agent_rl``
+    (which decides between ``SimpleReActAgent`` and ``ReToolAgent``
+    based on ``data_source`` presence).  When set, the short name
+    takes precedence and is used to pick the agent logic at
+    construction time.  Unknown names fail fast with the list of
+    available agents.  See ``python -m forge list-agents``."""
+
+    workflow: str = ""
+    """Short name registered via ``@register_workflow("xxx")``.
+
+    Resolves to a :class:`RolloutWorkflow` subclass via
+    ``areal.workflow.get_workflow``.  Leave empty to keep whichever
+    workflow the application script wires by default.  See
+    ``python -m forge list-workflows``."""
+
     reward_model_path: str = ""
     reward_mode: str = "rule"
     reward_model_device: str = "auto"

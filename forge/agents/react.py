@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 
+from forge.agents import register_agent
 from forge.core.types import AgentAction, ToolCall, ToolResult
 
 
@@ -26,6 +27,7 @@ def _extract_code_blocks(text: str) -> list[str]:
     return re.findall(pattern, text, re.DOTALL)
 
 
+@register_agent("react")
 class SimpleReActAgent:
     """Code-execution ReAct loop -- the default agentic RL strategy.
 

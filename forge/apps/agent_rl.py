@@ -42,12 +42,147 @@ from forge.actors.replay_buffer import ReplayBuffer
 from forge.actors.reward import RewardActor
 from forge.actors.sandbox import SandboxActor
 from forge.actors.trainer import TrainerActor
+from forge.agents import available_agents, get_agent
 from forge.bootstraps import ensure_ascend_custom_opp_path
 from forge.core.types import Episode
 from forge.engines import create_batch_adapter, create_config_bridge, create_engine
 from forge.provisioner import init_provisioner, shutdown
 
 logger = logging.getLogger("AgentRLApp")
+
+
+# Mapping from registered agent short-name -> ``AgentActor`` routing flag.
+# Phase A1 keeps the existing ``AgentActor`` dispatch (``run_episode`` vs
+# ``run_episode_retool``) untouched and just surfaces it under explicit
+# YAML names.  Generalising ``AgentActor`` to accept an arbitrary
+# ``agent_logic`` class is Phase A2 work -- when that lands this dict
+# collapses to a single ``get_agent(name)`` call that returns the class
+# directly.
+_AGENT_TO_USE_RETOOL: dict[str, bool] = {
+    "react": False,
+    "retool": True,
+}
+
+
+def _resolve_agent_routing(agent_name: str) -> bool | None:
+    """Validate ``agent_name`` against the registry and return the
+    ``use_retool`` flag for the current ``AgentActor`` dispatch path.
+
+    Returns:
+        ``True`` / ``False`` when the short name maps onto the existing
+        ``AgentActor`` endpoints; ``None`` when ``agent_name`` is empty
+        (caller should fall back to legacy heuristics).
+
+    Raises:
+        ValueError: ``agent_name`` is not a registered short name.
+        NotImplementedError: ``agent_name`` is registered but not yet
+            wired into ``AgentActor`` (``harbor``, ``external`` as of
+            Phase A1).  Message points at Phase A2.
+    """
+    if not agent_name:
+        return None
+
+    # Triggers a proper error listing all registered agents.
+    cls = get_agent(agent_name)
+
+    if agent_name in _AGENT_TO_USE_RETOOL:
+        logger.info(
+            "[AgentRL] agent=%r resolved to %s.%s (use_retool=%s)",
+            agent_name,
+            cls.__module__,
+            cls.__qualname__,
+            _AGENT_TO_USE_RETOOL[agent_name],
+        )
+        return _AGENT_TO_USE_RETOOL[agent_name]
+
+    raise NotImplementedError(
+        f"agent {agent_name!r} is registered ({cls.__module__}."
+        f"{cls.__qualname__}) but the current AgentActor dispatches\n"
+        f"only to the endpoints for {sorted(_AGENT_TO_USE_RETOOL)}.\n"
+        f"Extending AgentActor to accept an arbitrary agent_logic\n"
+        f"class is Phase A2 work -- see forge/docs/"
+        f"agentic_rl_architecture.md.\n"
+        f"\n"
+        f"Workarounds until A2 lands:\n"
+        f"  * Re-register your logic under one of the wired short\n"
+        f"    names ({sorted(_AGENT_TO_USE_RETOOL)}).\n"
+        f"  * Leave `agent:` empty in YAML to keep the legacy\n"
+        f"    data_source-driven routing.\n"
+        f"\n"
+        f"All registered agents: {available_agents()}"
+    )
+
+
+async def _spawn_tool_server():
+    """Spawn the tool server (currently ``SandboxActor``) honoring
+    the optional ``roles.tool_server`` block in YAML.
+
+    YAML-driven knobs:
+
+    * ``procs`` -- Monarch procs per actor (default 1).
+    * ``placement.count`` / ``extras.num_replicas`` -- replica count.
+      ``>1`` triggers ``as_service`` (load-balanced via
+      ``endpoint.route``); ``==1`` keeps the legacy single-actor
+      path (``endpoint.call_one``) so existing YAMLs see zero
+      behavior change.
+    * ``extras.mesh_name`` -- Monarch mesh name (default
+      ``"sandbox"``).
+    * ``tools`` -- list of tool short-names.  Currently informational
+      (``SandboxActor`` only serves ``python_sandbox``); A2-follow-up
+      will plumb arbitrary tools via ``ToolRegistry``.
+    * ``placement.host_idx`` -- R2 will consume this via
+      ``BareMetalLauncher.get_host_mesh(role_name)``.  Today it is
+      logged for traceability.
+
+    Missing/empty ``roles.tool_server`` is the default path and
+    keeps the pre-A2 behavior.
+    """
+    from forge.provisioner import _get_provisioner
+    from forge.tools.server_config import resolve_tool_server_options
+
+    launcher_cfg = None
+    try:
+        prov = await _get_provisioner()
+        launcher_cfg = getattr(prov, "launcher_config", None)
+    except Exception as exc:
+        logger.debug("[ToolServer] provisioner lookup failed: %r", exc)
+
+    opts = resolve_tool_server_options(launcher_cfg)
+
+    if not opts.enabled:
+        logger.info("[ToolServer] disabled via YAML (roles.tool_server.enabled=false)")
+        return None
+
+    logger.info(
+        "[ToolServer] spawning (%s): procs=%d replicas=%d mesh=%r tools=%s host_idx=%s",
+        opts._source,
+        opts.procs,
+        opts.num_replicas,
+        opts.mesh_name,
+        list(opts.tool_types),
+        opts.host_idx,
+    )
+    if "python_sandbox" not in opts.tool_types:
+        logger.warning(
+            "[ToolServer] tools=%s requested but only 'python_sandbox' is wired "
+            "today; non-python tools will be reachable via ToolRegistry in a "
+            "later A2 follow-up.",
+            list(opts.tool_types),
+        )
+
+    # Pass ``tool_types`` to the actor constructor so each replica
+    # mounts the requested registry.  Legacy single-tool path keeps
+    # ``execute_code`` working regardless of ``tool_types``.
+    ctor_kwargs = {"tool_types": list(opts.tool_types)}
+    if opts.as_service:
+        builder = SandboxActor.options(
+            procs=opts.procs,
+            mesh_name=opts.mesh_name,
+            num_replicas=opts.num_replicas,
+        )
+        return await builder.as_service(**ctor_kwargs)
+    builder = SandboxActor.options(procs=opts.procs, mesh_name=opts.mesh_name)
+    return await builder.as_actor(**ctor_kwargs)
 
 
 # ======================================================================
@@ -293,7 +428,9 @@ async def _create_weight_sync(forge_cfg, trainer, generator):
         await strategy.initialize(trainer, generator, config)
         logger.info(f"Weight sync initialized: method={method_str}")
     except Exception as e:
-        logger.warning(f"Weight sync initialization failed: {e}. Continuing without sync.")
+        logger.warning(
+            f"Weight sync initialization failed: {e}. Continuing without sync."
+        )
         return None
     return strategy
 
@@ -358,12 +495,14 @@ async def agent_rl_main(config=None, run_id: int = 0):
             model_weight=forge_cfg.reward_model_weight,
         )
 
-    sandbox = await SandboxActor.options(procs=1, mesh_name="sandbox").as_actor()
+    sandbox = await _spawn_tool_server()
 
     max_turns = raw_cfg.get("max_turns", 3) if hasattr(raw_cfg, "get") else 3
     turn_discount = (
         raw_cfg.get("turn_discount", 0.9) if hasattr(raw_cfg, "get") else 0.9
     )
+
+    agent_use_retool = _resolve_agent_routing(getattr(forge_cfg, "agent", ""))
 
     agent = await AgentActor.options(procs=1, mesh_name="agent").as_actor(
         generator=generator,
@@ -389,11 +528,14 @@ async def agent_rl_main(config=None, run_id: int = 0):
     weight_sync = None
 
     if use_engine:
-        engine = create_engine(backend=forge_cfg.backend_type, config={
-            "model_path": forge_cfg.model_path,
-            "max_steps": forge_cfg.backend_config.get("max_steps", 100),
-            **forge_cfg.backend_config,
-        })
+        engine = create_engine(
+            backend=forge_cfg.backend_type,
+            config={
+                "model_path": forge_cfg.model_path,
+                "max_steps": forge_cfg.backend_config.get("max_steps", 100),
+                **forge_cfg.backend_config,
+            },
+        )
         trainer = await TrainerActor.options(
             procs=forge_cfg.train_world_size, with_gpus=True, mesh_name="trainer"
         ).as_actor(engine=engine)
@@ -463,7 +605,11 @@ async def agent_rl_main(config=None, run_id: int = 0):
                         agent=agent,
                         shutdown_event=shutdown_event,
                         data_source=data_source,
-                        use_retool=data_source is not None,
+                        use_retool=(
+                            agent_use_retool
+                            if agent_use_retool is not None
+                            else data_source is not None
+                        ),
                     )
                 )
                 for _ in range(num_rollout_threads)

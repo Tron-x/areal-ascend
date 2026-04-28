@@ -51,7 +51,9 @@ print(json.dumps({{
 
 
 class SandboxActor(ForgeActor):
-    """Monarch Actor providing subprocess-isolated Python execution.
+    """Monarch Actor providing subprocess-isolated Python execution
+    and -- as of A2-full -- a pluggable tool server backed by
+    :class:`forge.tools.ToolRegistry`.
 
     Deploy as a service for load-balanced code execution::
 
@@ -59,15 +61,67 @@ class SandboxActor(ForgeActor):
             num_replicas=4, procs=1
         ).as_service()
         result = await sandbox.execute_code.route(code_str)
+
+    Multi-tool mode (A2-full)::
+
+        # YAML: roles.tool_server.tools: [python_sandbox, calculator]
+        sandbox = await SandboxActor.options(
+            num_replicas=2, mesh_name="tool_server"
+        ).as_service(tool_types=["python_sandbox", "calculator"])
+        result = await sandbox.execute_tool.route(
+            "calculator", {"expr": "2+2"},
+        )
+
+    ``execute_code`` remains as a backward-compatible shortcut for
+    ``execute_tool("python_sandbox", {"code": code})`` so existing
+    callers keep working with zero changes.
     """
 
     procs = 1
     with_gpus = False
 
-    def __init__(self):
+    def __init__(self, tool_types: list[str] | tuple[str, ...] | None = None):
+        """
+        Args:
+            tool_types: Short names (as registered via
+                ``@forge.tools.register_tool``) to mount in this
+                actor's :class:`ToolRegistry`.  ``None`` / empty
+                keeps legacy behavior (``execute_code`` only, no
+                registry).  Resolution is lazy-in-setup so a
+                missing tool only raises when the actor tries to
+                instantiate it, not during ``__init__`` -- that
+                matches Monarch's "construct cheap, init
+                expensive" split.
+        """
         self._call_count = 0
         self._success_count = 0
         self._total_time = 0.0
+        self._tool_types: tuple[str, ...] = tuple(tool_types) if tool_types else ()
+        # Built lazily in setup() so construction stays side-effect free.
+        self._registry = None
+
+    def _ensure_registry(self):
+        """Instantiate the per-actor :class:`ToolRegistry` on demand.
+
+        Built in the actor process (not the driver) so each tool's
+        state (e.g. ``PythonSandbox.timeout``) belongs to the worker
+        proc and survives restarts independently.
+        """
+        if self._registry is not None:
+            return self._registry
+        from forge.tools import ToolRegistry, get_tool
+
+        registry = ToolRegistry()
+        for name in self._tool_types:
+            cls = get_tool(name)
+            registry.register_tool(cls())
+        self._registry = registry
+        logger.info(
+            "[SandboxActor] mounted tools=%s (registry size=%d)",
+            list(self._tool_types),
+            len(registry.list_tools()),
+        )
+        return registry
 
     @endpoint
     def execute_code(self, code: str, timeout: float = 10.0) -> dict:
@@ -125,6 +179,46 @@ class SandboxActor(ForgeActor):
         return result
 
     @endpoint
+    async def execute_tool(self, name: str, arguments: dict) -> dict:
+        """Dispatch a tool call through the mounted
+        :class:`ToolRegistry` and return a plain dict so the result
+        is trivially Monarch-serializable.
+
+        This is the multi-tool path (A2-full).  ``execute_code`` is
+        the python-only shortcut kept for backward compat with
+        existing ``AgentActor._call_sandbox`` callers.
+
+        Raises ``RuntimeError`` if no tools were mounted (i.e. the
+        actor was constructed with ``tool_types=None``).
+        """
+        from forge.tools import ToolCall
+
+        if not self._tool_types:
+            return {
+                "success": False,
+                "output": "",
+                "error": (
+                    "execute_tool called on SandboxActor with no "
+                    "tool_types configured; pass "
+                    "tool_types=[...] at construction or use "
+                    "execute_code directly."
+                ),
+            }
+        registry = self._ensure_registry()
+        t0 = time.monotonic()
+        self._call_count += 1
+        result = await registry.execute(ToolCall(name=name, arguments=arguments))
+        elapsed = time.monotonic() - t0
+        self._total_time += elapsed
+        if result.success:
+            self._success_count += 1
+        return {
+            "success": result.success,
+            "output": result.output,
+            "error": result.error,
+        }
+
+    @endpoint
     def get_stats(self) -> dict:
         avg = (self._total_time / self._call_count) if self._call_count > 0 else 0
         return {
@@ -132,6 +226,7 @@ class SandboxActor(ForgeActor):
             "success_count": self._success_count,
             "total_time": self._total_time,
             "avg_time": avg,
+            "tool_types": list(self._tool_types),
         }
 
     @endpoint

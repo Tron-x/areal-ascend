@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import re
 
+from forge.agents import register_agent
 from forge.core.types import AgentAction, ToolCall, ToolResult
 from forge.tools.parsers import CompositeParser
 from forge.tools.protocol import ActionParser
 
 
+@register_agent("retool")
 class ReToolAgent:
     """Tool-integrated reasoning agent.
 

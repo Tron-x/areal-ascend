@@ -1,0 +1,110 @@
+# Agentic RL example: explicit tool_server role (Phase A2).
+#
+# This YAML demonstrates the R1 ``roles:`` schema + the A2
+# ``roles.tool_server`` usage pattern.  It is a *documentation*
+# artifact -- copy the ``launcher:`` block below into your experiment
+# YAML (or add it via Hydra composition) to opt in.
+#
+# Backward compatibility:
+# * If you omit ``roles.tool_server`` entirely, ``forge.apps.agent_rl``
+#   falls back to the pre-A2 behavior (single ``SandboxActor`` with
+#   ``procs=1, mesh_name="sandbox"``).  Nothing else changes.
+# * Legacy ``meshes:`` blocks still work -- ``LauncherConfig`` runs
+#   a bidirectional bridge between ``roles`` and ``meshes`` in
+#   ``__post_init__``.
+
+launcher:
+  type: bare_metal
+
+  bare_metal:
+    workers:
+      - tcp://192.168.0.26:22222
+      - tcp://192.168.0.23:22222
+    master_addr: 192.168.0.23
+    worker_port: 22222
+
+  # R1 / A2: role-driven placement.  Each entry is a RoleConfig; see
+  # ``forge/core/types.py`` for the full schema and
+  # ``forge/docs/agentic_rl_architecture.md`` for the agentic role
+  # catalog.  Unknown keys land in ``extras`` so role-type-specific
+  # knobs (timeout, tool parser, ...) don't require a schema change.
+  roles:
+
+    # GPU training role.
+    trainer:
+      role_type: trainer
+      procs: 8
+      gpus_per_proc: 1
+      hardware:
+        type: npu
+        model: 910b
+        requires_rdma: true
+      placement:
+        host_idx: 1                # driver host (monarch1)
+
+    # GPU generation role (vLLM).
+    generator:
+      role_type: generator
+      procs: 1
+      gpus_per_proc: 1
+      hardware:
+        type: npu
+        requires_rdma: true
+      placement:
+        host_idx: 0                # monarch2
+
+    # Storage volumes (torchstore).
+    storage:
+      role_type: storage
+      procs: 1
+      hardware:
+        type: npu
+        requires_rdma: true        # RDMA-registered staging pool
+      placement:
+        host_idx: 1                # colocated with trainer
+
+    # A2 NEW: tool server (Python sandbox) as an independent role.
+    # By being a separate role, the sandbox can (a) run on a dedicated
+    # CPU host to avoid NPU contention, (b) scale horizontally via
+    # num_replicas, and (c) evolve into a multi-tool server later
+    # without touching the generator.
+    tool_server:
+      role_type: tool_server
+      procs: 1                     # Monarch procs per replica
+      hardware:
+        type: cpu                  # sandbox is subprocess-based, no GPU
+      placement:
+        host_idx: 1                # co-host with trainer for now; set
+                                   # to a dedicated CPU host in larger
+                                   # deployments.  R2's placement
+                                   # scheduler will read host_idx via
+                                   # BareMetalLauncher.get_host_mesh.
+        count: 2                   # two replicas -> as_service path
+      tools:                       # short names; "python_sandbox" is
+        - python_sandbox           # the only wired tool in A2.
+      # Role-type-specific extras below this line are passed through
+      # verbatim via ``RoleConfig.extras``.  Current consumers:
+      #   num_replicas -- overrides placement.count (takes precedence)
+      #   mesh_name    -- Monarch mesh name (default: role_name =
+      #                   "tool_server", which is the key the R1/R2
+      #                   bridge uses when writing meshes entries;
+      #                   only override if you deliberately want a
+      #                   different mesh name, e.g. to share one
+      #                   physical slot with a legacy "sandbox"
+      #                   mesh declared elsewhere)
+      #   enabled      -- bool flag; set to false to skip sandbox spawn
+      #   timeout      -- forwarded to SandboxActor (future wiring)
+      #   max_output_len -- forwarded to SandboxActor (future wiring)
+      timeout: 30.0
+
+  # Weight-sync block is unchanged from the base launcher YAML.
+  weight_sync:
+    method: torchstore
+    backend: torchstore_multi_vol
+    storage_role: storage
+    pool_mb: 6144
+
+# Optional top-level forge config knobs consumed by agent_rl.py:
+agent: react           # forge.agents registry short-name
+workflow: rlvr         # areal.workflow registry short-name
+reward: ""             # leave empty to keep dynamic-import legacy path

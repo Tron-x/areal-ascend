@@ -28,6 +28,7 @@ import re
 import sys
 from typing import Any
 
+from forge.agents import register_agent
 from forge.core.types import AgentAction, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -47,11 +48,14 @@ def _try_load_rllm_parser(parser_name: str):
         return cls()
     except (ImportError, AssertionError) as e:
         if _RLLM_PARSER_LOADED is None:
-            logger.warning("rllm ToolParser not available (%s), using regex fallback", e)
+            logger.warning(
+                "rllm ToolParser not available (%s), using regex fallback", e
+            )
             _RLLM_PARSER_LOADED = False
         return None
 
 
+@register_agent("harbor")
 class HarborAgentLogic:
     """Bridge ``rllm.workflows.Workflow`` into the Forge ``AgentLogic`` protocol.
 
@@ -196,7 +200,11 @@ class HarborAgentLogic:
 
         forge_calls = []
         for tc in rllm_calls:
-            args_str = json.dumps(tc.arguments) if isinstance(tc.arguments, dict) else str(tc.arguments)
+            args_str = (
+                json.dumps(tc.arguments)
+                if isinstance(tc.arguments, dict)
+                else str(tc.arguments)
+            )
             forge_calls.append(
                 ToolCall(
                     type=tc.name,
