@@ -1,0 +1,46 @@
+# Accelerate FSDP2 config -- NPU single-host smoke (LlamaFactory backend).
+#
+# Adapted from upstream LF's ``examples/accelerate/fsdp2_config.yaml``,
+# with the rank topology fields stripped: the Monarch driver in
+# ``forge/scripts/llamafactory_train_singlehost.py`` owns rank/world
+# (``RANK`` / ``LOCAL_RANK`` / ``WORLD_SIZE`` / ``MASTER_ADDR`` /
+# ``MASTER_PORT``) so ``num_processes`` / ``num_machines`` /
+# ``machine_rank`` are intentionally absent.
+#
+# Only the FSDP2 semantics matter to us:
+#   * fsdp_version: 2                    -- new FSDP path
+#   * fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+#                                        -- shard transformer blocks
+#   * fsdp_cpu_ram_efficient_loading: true
+#                                        -- only rank0 loads HF weights,
+#                                          others receive via broadcast
+#                                          (saves ~3.5x peak host RAM)
+#   * fsdp_sync_module_states: true      -- required by the above
+#   * fsdp_offload_params: false         -- 4B fits on NPU; no CPU swap
+#   * fsdp_reshard_after_forward: true   -- standard FSDP2 default
+#   * fsdp_state_dict_type: FULL_STATE_DICT
+#                                        -- gather full weights on save
+#                                          (smoke run; switch to SHARDED
+#                                          for prod multi-host)
+#   * mixed_precision: bf16              -- NPU 910B native bf16
+
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: FSDP
+downcast_bf16: 'no'
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_sync_module_states: true
+  fsdp_offload_params: false
+  fsdp_reshard_after_forward: true
+  fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_version: 2
+  # Defaults that accelerate launch always exports.  Make them
+  # explicit so behaviour doesn't drift if accelerate changes its
+  # internal defaults (and so reading the YAML alone tells you what
+  # FSDP will do).
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+  fsdp_activation_checkpointing: false
+mixed_precision: bf16

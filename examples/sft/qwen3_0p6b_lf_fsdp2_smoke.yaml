@@ -1,0 +1,56 @@
+# LlamaFactory FRAMEWORK smoke -- Qwen3-0.6B (text-only) + FSDP2 on NPU.
+#
+# Sole purpose: validate that the
+# ``forge.actors.llamafactory_trainer.LlamaFactoryTrainerActor`` +
+# ``forge.scripts.llamafactory_train_singlehost`` glue layer works end
+# to end on NPU.  Uses a tiny 0.6B model + a 16-row demo dataset so
+# the run finishes in <2 minutes.
+#
+# This is a sibling to ``qwen3vl_4b_lf_fsdp2_debug.yaml``.  The 4B-VL
+# YAML is the real target; this one is the framework smoke that
+# unblocks dev iteration while the 4B-VL weights are still
+# downloading (the actor logic is byte-for-byte identical between
+# the two; the only diff is the model and dataset).
+
+### model
+model_name_or_path: Qwen/Qwen3-0.6B
+trust_remote_code: true
+flash_attn: fa2  # NPU FA2 fallback exercised here
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+disable_gradient_checkpointing: false
+
+### dataset
+# ``identity`` is the smallest text-only demo dataset shipped with LF
+# (~93 rows, all role-play "who are you" Q/A).  Bundled in
+# ``LlamaFactory/data/identity.json`` so no network I/O.
+dataset: identity
+template: qwen3
+cutoff_len: 256
+overwrite_cache: true
+preprocessing_num_workers: 4
+dataloader_num_workers: 0
+
+### output
+output_dir: /tmp/lf_smoke/qwen3_0p6b_sft
+logging_steps: 1
+save_steps: 1000   # > max_steps, no checkpoint write
+max_steps: 3
+plot_loss: false
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-4
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+seed: 1234
