@@ -46,7 +46,6 @@ import os
 import socket
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
 from monarch._src.spmd.actor import SPMDActor
@@ -93,8 +92,31 @@ _FSDP_BOOL_FIELDS: frozenset[str] = frozenset(
 )
 
 
-def _export_fsdp2_env(accelerate_yaml_path: str) -> dict[str, str]:
-    """Read an ``accelerate`` config YAML and export FSDP env vars.
+def _load_yaml_or_dict(spec: str | os.PathLike | dict, *, label: str) -> dict:
+    """Coerce a YAML spec to a dict, accepting either a path or a parsed dict.
+
+    Driver-side callers pre-parse the algorithm-author YAMLs and ship
+    dicts to the actor so workers don't need filesystem access to those
+    files (single source of truth = the launcher host).  Legacy
+    callers that still pass a path keep working: we just open it here.
+
+    ``label`` is a short tag ("lf", "accelerate", ...) used only in
+    the ValueError raised on a bad type so the breakage is debuggable.
+    """
+    if isinstance(spec, dict):
+        return spec
+    if isinstance(spec, (str, os.PathLike)):
+        import yaml
+
+        with open(spec) as fh:
+            return yaml.safe_load(fh) or {}
+    raise TypeError(
+        f"{label} YAML spec must be dict or path, got {type(spec).__name__}"
+    )
+
+
+def _export_fsdp2_env(accelerate_cfg: dict | str | os.PathLike) -> dict[str, str]:
+    """Translate an ``accelerate`` config (dict or YAML path) into env vars.
 
     Parses just the subset of ``accelerate``'s schema we care about:
 
@@ -106,6 +128,9 @@ def _export_fsdp2_env(accelerate_yaml_path: str) -> dict[str, str]:
     Returns the dict of env vars that were set, for logging.
     Side-effect: mutates :data:`os.environ`.
 
+    Accepts either a parsed dict (driver-side preferred) or a filesystem
+    path (legacy).  When a path is given, it is opened and parsed here.
+
     Notes:
         * ``cpu_ram_efficient_loading`` requires ``sync_module_states=True``
           (accelerate enforces this at launch time).  We mirror the check
@@ -114,15 +139,12 @@ def _export_fsdp2_env(accelerate_yaml_path: str) -> dict[str, str]:
           intentionally **ignored** -- the Monarch driver owns rank
           topology, the YAML is purely for FSDP semantics.
     """
-    import yaml
-
-    with open(accelerate_yaml_path) as fh:
-        cfg = yaml.safe_load(fh) or {}
+    cfg = _load_yaml_or_dict(accelerate_cfg, label="accelerate")
 
     set_vars: dict[str, str] = {}
     if str(cfg.get("distributed_type", "")).upper() != "FSDP":
         raise ValueError(
-            f"{accelerate_yaml_path}: distributed_type must be FSDP "
+            "accelerate config: distributed_type must be FSDP "
             f"(got {cfg.get('distributed_type')!r}); "
             "this actor is FSDP-only by design."
         )
@@ -146,7 +168,7 @@ def _export_fsdp2_env(accelerate_yaml_path: str) -> dict[str, str]:
         and set_vars.get("FSDP_SYNC_MODULE_STATES", "false") != "true"
     ):
         raise ValueError(
-            f"{accelerate_yaml_path}: fsdp_cpu_ram_efficient_loading=true "
+            "accelerate config: fsdp_cpu_ram_efficient_loading=true "
             "requires fsdp_sync_module_states=true (accelerate constraint)."
         )
 
@@ -171,28 +193,31 @@ class LlamaFactoryTrainerActor(SPMDActor):
     @endpoint
     def run(
         self,
-        lf_yaml_path: str,
-        accelerate_yaml_path: str,
+        lf_yaml: str | dict,
+        accelerate_yaml: str | dict,
         cwd: str,
         overrides: dict[str, Any] | None = None,
         master_addr: str | None = None,
         master_port: int | None = None,
         use_modelscope: bool = False,
         extra_env: dict[str, str] | None = None,
+        lf_yaml_origin: str | None = None,
     ) -> dict[str, Any]:
         """Drive one full LlamaFactory training run on this rank.
 
         Args:
-            lf_yaml_path: Path to the LlamaFactory training YAML
-                (e.g. ``examples/sft/qwen3vl_4b_lf_fsdp2_debug.yaml``).
-                Loaded into a dict and passed to ``run_exp(args=...)``.
-                Equivalent to ``src/train.py <yaml>`` upstream.
-            accelerate_yaml_path: Path to the accelerate FSDP2 config
-                YAML (e.g. ``examples/accelerate/lf_fsdp2_npu.yaml``).
-                Translated into env vars BEFORE ``run_exp`` imports
-                accelerate / transformers, so FSDP wrap picks them up.
-                Equivalent to ``accelerate launch --config_file ...``
-                upstream.
+            lf_yaml: LlamaFactory training spec.  Accepts either a
+                pre-parsed ``dict`` (driver-side preferred -- ships
+                a single source-of-truth across hosts so workers
+                don't need filesystem access) or a path to a YAML
+                file (legacy, kept for the ``this_host()`` driver and
+                manual smokes).  Equivalent to ``src/train.py <yaml>``
+                upstream once resolved to a dict.
+            accelerate_yaml: Accelerate FSDP2 config.  Same dict-or-path
+                contract as ``lf_yaml``.  Translated into env vars
+                BEFORE ``run_exp`` imports accelerate / transformers,
+                so FSDP wrap picks them up.  Equivalent to
+                ``accelerate launch --config_file ...`` upstream.
             cwd: Working directory before ``run_exp`` is called.  Must
                 be the LlamaFactory repo root because LF resolves
                 ``data/dataset_info.json`` relative to it.
@@ -216,6 +241,10 @@ class LlamaFactoryTrainerActor(SPMDActor):
                 ``use_modelscope`` (after FSDP env, before LF import).
                 Escape hatch for one-offs (HF_ENDPOINT, MODELSCOPE_CACHE,
                 etc.) without churning this signature.
+            lf_yaml_origin: Optional human label for ``lf_yaml`` -- e.g.
+                the driver's filesystem path -- folded into the actor's
+                log line so users can map a worker log back to the
+                source file.  Purely cosmetic; safe to leave ``None``.
 
         Returns:
             ``{"rank": int, "host": str, "elapsed_s": float, "ok": True}``
@@ -250,7 +279,7 @@ class LlamaFactoryTrainerActor(SPMDActor):
         world_size = int(os.environ.get("WORLD_SIZE", "-1"))
         host = socket.gethostname()
 
-        fsdp_env = _export_fsdp2_env(accelerate_yaml_path)
+        fsdp_env = _export_fsdp2_env(accelerate_yaml)
         if rank == 0:
             logger.info(
                 "LlamaFactoryTrainerActor exported FSDP env: %s",
@@ -274,24 +303,21 @@ class LlamaFactoryTrainerActor(SPMDActor):
         # of CLI args) because ``run_exp`` already accepts dict input
         # via its ``read_args`` shim, which keeps us off sys.argv -- a
         # must on Monarch where sys.argv is owned by the bootstrap.
-        import yaml
         from llamafactory.train.tuner import run_exp
 
-        with open(lf_yaml_path) as fh:
-            lf_args: dict[str, Any] = yaml.safe_load(fh) or {}
+        lf_args: dict[str, Any] = _load_yaml_or_dict(lf_yaml, label="lf")
 
         if overrides:
             lf_args.update(overrides)
 
         logger.info(
             "LlamaFactoryTrainerActor rank=%d local_rank=%d world_size=%d "
-            "host=%s lf_yaml=%s accelerate_yaml=%s",
+            "host=%s lf_yaml=%s",
             rank,
             local_rank,
             world_size,
             host,
-            lf_yaml_path,
-            accelerate_yaml_path,
+            lf_yaml_origin or "<inline-dict>",
         )
 
         t0 = time.time()
@@ -331,5 +357,5 @@ class LlamaFactoryTrainerActor(SPMDActor):
             "host": host,
             "elapsed_s": elapsed,
             "ok": err is None,
-            "lf_yaml": str(Path(lf_yaml_path).resolve()),
+            "lf_yaml": lf_yaml_origin or "<inline-dict>",
         }

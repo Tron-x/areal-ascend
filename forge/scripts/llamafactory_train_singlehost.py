@@ -185,10 +185,18 @@ async def _run(
         print(f"[driver] overrides = {overrides}", flush=True)
     print("=" * 72, flush=True)
 
+    # Pre-parse YAMLs on the driver and ship dicts to the actor so the
+    # actor doesn't reach back into the filesystem.  Same contract the
+    # B-full ``forge.apps.llamafactory_train`` driver uses.
+    import yaml
+
+    lf_yaml_dict = yaml.safe_load(lf_config.read_text()) or {}
+    accel_yaml_dict = yaml.safe_load(accelerate_config.read_text()) or {}
+
     t0 = time.time()
     results = await actor.run.call(
-        lf_yaml_path=str(lf_config),
-        accelerate_yaml_path=str(accelerate_config),
+        lf_yaml=lf_yaml_dict,
+        accelerate_yaml=accel_yaml_dict,
         cwd=str(lf_cwd),
         overrides=overrides or None,
         # Single-host this_host() actors inherit the driver's env so
@@ -196,6 +204,7 @@ async def _run(
         # but pass the flag through explicitly for parity with the
         # B-full ``forge.apps.llamafactory_train`` driver.
         use_modelscope=use_modelscope,
+        lf_yaml_origin=str(lf_config),
     )
     elapsed = time.time() - t0
 

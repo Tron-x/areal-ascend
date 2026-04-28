@@ -25,6 +25,12 @@ the ``forge launch`` lifecycle so:
   ``LlamaFactoryTrainerActor`` (which lives under
   :mod:`forge.actors.llamafactory_trainer` and is part of the
   daemon's PYTHONPATH).
+* ``lf_config`` / ``accelerate_config`` are read once on the driver
+  host, parsed to dicts, and shipped inline to every actor.  Workers
+  do **not** need filesystem access to the algo-author's
+  ``examples/sft/*.yaml`` -- saves one tar step on bare-metal PoC
+  hosts and removes a path-translation footgun under FUSE / NFS
+  mounts.
 * Same SIGINT / SIGTERM cleanup contract as GRPO / titan-pretrain.
 
 Why an LF-specific app instead of folding into titan-pretrain
@@ -32,8 +38,9 @@ Why an LF-specific app instead of folding into titan-pretrain
 TT and LF actors share the SPMDActor lifecycle (setup_env / get_host_port
 / run) but have *different* run() signatures: TT takes
 ``(toml_path, cwd, overrides)`` where overrides is a list of CLI
-flags; LF takes ``(lf_yaml_path, accelerate_yaml_path, cwd, overrides)``
-where overrides is a dict merged into the parsed YAML.  The
+flags; LF takes ``(lf_yaml, accelerate_yaml, cwd, overrides)``
+where ``lf_yaml`` / ``accelerate_yaml`` are dicts shipped from the
+driver and ``overrides`` is a dict merged into the LF dict.  The
 algo-YAML schema mirrors that asymmetry (``titan:`` block vs.
 ``llamafactory:`` block), so each app gets its own thin orchestrator
 and the actor-level abstraction stays clean.
@@ -209,8 +216,10 @@ def _load_lf_section(algo_yaml: Path) -> dict:
 async def _drive_training(
     *,
     workers: list[str],
-    lf_config: Path,
-    accelerate_config: Path,
+    lf_yaml_dict: dict[str, Any],
+    accelerate_yaml_dict: dict[str, Any],
+    lf_yaml_origin: str,
+    accelerate_yaml_origin: str,
     lf_cwd: Path,
     procs_per_host: int,
     master_port: int,
@@ -269,8 +278,9 @@ async def _drive_training(
 
     print("=" * 72, flush=True)
     print(
-        f"[llamafactory_train] launching LlamaFactory: lf_yaml={lf_config} "
-        f"accelerate_yaml={accelerate_config} cwd={lf_cwd}",
+        f"[llamafactory_train] launching LlamaFactory: lf_yaml={lf_yaml_origin} "
+        f"accelerate_yaml={accelerate_yaml_origin} cwd={lf_cwd} "
+        "(YAMLs shipped inline)",
         flush=True,
     )
     if overrides:
@@ -279,8 +289,11 @@ async def _drive_training(
 
     t0 = time.time()
     results = await actor.run.call(
-        lf_yaml_path=str(lf_config),
-        accelerate_yaml_path=str(accelerate_config),
+        # Inline parsed dicts -- workers no longer need filesystem
+        # access to the algo-author YAML files.  The original paths
+        # are passed only as cosmetic log labels.
+        lf_yaml=lf_yaml_dict,
+        accelerate_yaml=accelerate_yaml_dict,
         cwd=str(lf_cwd),
         overrides=overrides or None,
         # Critical for SSHJob workers: env doesn't inherit from the
@@ -288,6 +301,7 @@ async def _drive_training(
         # before importing LF.  See the actor docstring for the full
         # rationale.
         use_modelscope=use_modelscope,
+        lf_yaml_origin=lf_yaml_origin,
     )
     elapsed = time.time() - t0
 
@@ -365,12 +379,42 @@ def main(argv: list[str]) -> int:
     if use_modelscope:
         os.environ.setdefault("USE_MODELSCOPE_HUB", "1")
 
+    # Pre-parse both YAMLs on the driver host -- shipping dicts to
+    # workers (instead of paths they'd need to read locally) makes
+    # the algo-author's ``examples/sft/*.yaml`` strictly a launcher-
+    # host artefact.  In bare-metal PoC this saves a tar step; in
+    # production with a shared FS it makes the worker filesystem
+    # contract identical regardless of where the YAML actually
+    # lives.  Errors here surface on the driver where users have
+    # editor + logs, not buried in a worker daemon log.
+    import yaml
+
+    try:
+        lf_yaml_dict = yaml.safe_load(lf["lf_config"].read_text()) or {}
+    except yaml.YAMLError as exc:
+        print(
+            f"[llamafactory_train] lf_config unparseable ({lf['lf_config']}): {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        accel_yaml_dict = yaml.safe_load(lf["accelerate_config"].read_text()) or {}
+    except yaml.YAMLError as exc:
+        print(
+            "[llamafactory_train] accelerate_config unparseable "
+            f"({lf['accelerate_config']}): {exc}",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         return asyncio.run(
             _drive_training(
                 workers=workers,
-                lf_config=lf["lf_config"],
-                accelerate_config=lf["accelerate_config"],
+                lf_yaml_dict=lf_yaml_dict,
+                accelerate_yaml_dict=accel_yaml_dict,
+                lf_yaml_origin=str(lf["lf_config"]),
+                accelerate_yaml_origin=str(lf["accelerate_config"]),
                 lf_cwd=lf["cwd"],
                 procs_per_host=int(lf["procs_per_host"]),
                 master_port=int(lf["master_port"]),

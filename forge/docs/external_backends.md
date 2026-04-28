@@ -68,16 +68,24 @@ owns.
 
 ### What lives where
 
-| Artefact                                             | Origin host               | Target                                              | Why                                                                                                                     |
-| ---------------------------------------------------- | ------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `forge/`, `areal/`                                   | launcher (`192.168.0.26`) | every worker, FUSE-mounted at `/root/AReaL_remote/` | Source-of-truth pull from the launcher; no per-host drift. Configured by `_SSHJobFleet`.                                |
-| `examples/`, `LlamaFactory/`, model cache, conda env | each worker host          | each worker host                                    | NOT mounted by forge today (mount list is `forge/`+`areal/` only). Must be present on every host before `forge launch`. |
+| Artefact                                | Origin host               | Target                                                               | Why                                                                                                                                                                                                                                                                                                 |
+| --------------------------------------- | ------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `forge/`, `areal/`                      | launcher (`192.168.0.26`) | every worker, FUSE-mounted at `/root/AReaL_remote/`                  | Source-of-truth pull from the launcher; no per-host drift. Configured by `_SSHJobFleet`.                                                                                                                                                                                                            |
+| `examples/`                             | launcher                  | **driver host only** (per `role: driver` in the preset; today `.23`) | The algo-author YAML and any `lf_config` / `accelerate_config` it references are read **once on the driver** and shipped inline (as parsed dicts) to every actor. Workers never open them, so a worker host that lacks `examples/` still trains correctly. (Verified by smoke 2026-04-28 on `.26`.) |
+| `LlamaFactory/`, model cache, conda env | each worker host          | each worker host                                                     | NOT mounted by forge today (mount list is `forge/`+`areal/` only). Must be present on every host before `forge launch`.                                                                                                                                                                             |
 
 ### One-shot bootstrap (operator runs once per new host)
 
-The five tar-streams below are what we did to bring `.23` online. They are **not
-committed as a script** — they are infrastructure prep, not application code, and the
-production replacement (image bake + NFS) makes them obsolete (see next section).
+The four tar-streams below are what we currently do to bring `.23` online. They are
+**not committed as a script** — they are infrastructure prep, not application code, and
+the production replacement (image bake + NFS) makes them obsolete (see next section).
+
+> **Note on `examples/`** — `forge.apps.llamafactory_train` and the
+> `LlamaFactoryTrainerActor.run()` endpoint exchange the LF/accelerate configs as parsed
+> `dict` objects, not paths. The driver reads them once on its local FS and ships them
+> inline through Monarch. Worker hosts therefore do **not** need `examples/` on disk;
+> only the host tagged `role: driver` (in this preset, `.23`) does. The step below
+> covers the driver-host-only case.
 
 ```bash
 # From the launcher host (.26).  Replace HOST/PORT for your target.
@@ -99,8 +107,11 @@ cd $SP && tar -cz trl trl-*.dist-info \
 ssh -p $PORT root@$HOST \
     "echo /root/LlamaFactory/src > $SP/llamafactory.pth"
 
-# 4. Algorithm + accelerate YAMLs that the algo YAML references
-#    by absolute path.
+# 4. (DRIVER HOST ONLY -- skip on worker-only hosts.)  The algo
+#    YAML + the LF/accelerate YAMLs it references must be readable
+#    on whichever host the cluster preset tags ``role: driver``.
+#    Other workers don't need ``examples/`` because the driver
+#    parses these YAMLs and ships dicts to every actor.
 cd /root/AReaL && tar -czf - examples/sft examples/accelerate \
   | ssh -p $PORT root@$HOST 'mkdir -p /root/AReaL && cd /root/AReaL && tar -xzf -'
 
@@ -141,14 +152,14 @@ snapshots, …), do it via:
 This is the path from `deployment_modes.md` rendered for external backends specifically.
 None of the bootstrap above survives — every step has a cleaner equivalent:
 
-| Bare-metal step                  | Container/k8s replacement                                                                                                                                                   |
-| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Tar `LlamaFactory/` to each host | `pip install llamafactory==<pinned>` (or `git clone` + editable install) baked into the training image at build time.                                                       |
-| Tar `trl` site-package           | Listed in `requirements.txt` baked into the image.                                                                                                                          |
-| Add a `.pth` shim for LF source  | None. The pinned wheel is the source of truth.                                                                                                                              |
-| Tar `examples/` to each host     | Repo lives at `/workspace/AReaL` mounted from a PVC (read-only) OR baked into the image. The YAML in `examples/` is the same file, just at `/workspace/AReaL/examples/...`. |
-| Tar 8GB model snapshot           | NFS / Lustre / S3-FUSE mount at `/shared/models/...`, OR `initContainer` that pulls from an internal registry. The mount path replaces ModelScope cache.                    |
-| Conv3D NPU loader patch          | Either upstream LF fixes it, or we ship a vendored fork (versioned, in our internal registry) — not a runtime tarball.                                                      |
+| Bare-metal step                  | Container/k8s replacement                                                                                                                                                                                                                                      |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Tar `LlamaFactory/` to each host | `pip install llamafactory==<pinned>` (or `git clone` + editable install) baked into the training image at build time.                                                                                                                                          |
+| Tar `trl` site-package           | Listed in `requirements.txt` baked into the image.                                                                                                                                                                                                             |
+| Add a `.pth` shim for LF source  | None. The pinned wheel is the source of truth.                                                                                                                                                                                                                 |
+| Tar `examples/` to driver host   | Repo lives at `/workspace/AReaL` mounted from a PVC (read-only) OR baked into the image. The YAML in `examples/` is the same file, just at `/workspace/AReaL/examples/...`. (Workers don't need it either way — see actor↔driver dict-passing contract above.) |
+| Tar 8GB model snapshot           | NFS / Lustre / S3-FUSE mount at `/shared/models/...`, OR `initContainer` that pulls from an internal registry. The mount path replaces ModelScope cache.                                                                                                       |
+| Conv3D NPU loader patch          | Either upstream LF fixes it, or we ship a vendored fork (versioned, in our internal registry) — not a runtime tarball.                                                                                                                                         |
 
 What stays the same:
 
