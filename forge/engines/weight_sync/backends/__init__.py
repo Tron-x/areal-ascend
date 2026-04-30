@@ -20,10 +20,16 @@ Known names (match the ``FORGE_WEIGHT_SYNC_BACKEND`` env / config key):
   mesh (``layout.ps_mesh_name``) rather than colocated with trainer.  Lets
   users add a separate parameter-server node.  Same API as multi_vol.
 
-* ``"areal_xccl"`` -- (placeholder) Adapter over AReaL's existing
-  ``FSDPEngine._update_weights_from_distributed`` path (rank-0 HCCL broadcast
-  on a second torch.distributed process group).  Safe fallback when HiXL /
-  torchstore has issues; no RDMA required.
+* ``"areal_xccl"`` -- AReaL-style direct trainer-rank-0 -> generator-workers
+  HCCL broadcast on a second ``torch.distributed`` process group built via
+  ``areal.weight_sync.init_custom_process_group``.  Safe fallback when HiXL /
+  torchstore has issues; no RDMA required.  Reuses the generator workers'
+  ``init_bcast_group`` / ``recv_and_load_flat`` endpoints already validated
+  for ``collective_broadcast``; full E2E additionally requires three trainer
+  endpoints (``init_xccl_source`` / ``publish_weights_xccl`` /
+  ``shutdown_xccl_source``) -- see the backend module docstring for their
+  signatures.  Until those land on the trainer in use, ``initialize`` raises
+  ``NotImplementedError`` with a clear message pointing at the contract.
 
 The registry is intentionally small and explicit -- backends are big enough
 concerns that dynamic import-on-demand hurts more than it helps.
