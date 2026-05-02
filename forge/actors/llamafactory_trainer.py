@@ -1,9 +1,11 @@
 """LlamaFactoryTrainerActor -- run LlamaFactory's ``run_exp`` inside a Monarch actor.
 
 **Conforms to:** :class:`forge.core.protocols.SPMDTrainerProtocol`
-(Adapter Path; partial -- ``setup_env`` + ``run`` are present, ``teardown``
-is **TODO**).  See :class:`forge.actors.msswift_trainer.MsSwiftTrainerActor`
-for the canonical full conformance.
+(Adapter Path -- ``setup_env`` + ``run`` + ``teardown``).  See
+:class:`forge.actors.msswift_trainer.MsSwiftTrainerActor` for the
+canonical full conformance (its teardown additionally tears down ms-swift's
+cross-mesh weight-sync PGs; LlamaFactory has no such groups in the
+current SFT/RL setup, so this teardown is the smaller two-step version).
 
 Mirror of :class:`forge.actors.titan_trainer.TitanTrainerActor`, but for the
 LlamaFactory training stack.  The integration contract is intentionally
@@ -55,6 +57,8 @@ from typing import Any
 
 from monarch._src.spmd.actor import SPMDActor
 from monarch.actor import endpoint
+
+from forge.utils.process_tree import kill_descendants
 
 logger = logging.getLogger(__name__)
 
@@ -363,4 +367,78 @@ class LlamaFactoryTrainerActor(SPMDActor):
             "elapsed_s": elapsed,
             "ok": err is None,
             "lf_yaml": lf_yaml_origin or "<inline-dict>",
+        }
+
+    @endpoint
+    def teardown(
+        self,
+        *,
+        term_grace_s: float = 5.0,
+        kill_grace_s: float = 3.0,
+    ) -> dict[str, Any]:
+        """Best-effort cleanup symmetric to :class:`MsSwiftTrainerActor.teardown`.
+
+        LlamaFactory's ``run_exp`` runs FSDP/DDP in-proc and destroys
+        the process group in its own ``finally``, but ``transformers``-
+        backed pipelines often spawn helpers that survive ``run_exp``
+        return:
+
+        * ``DataLoader`` workers when ``dataloader_num_workers > 0``.
+        * ``transformers``' ``TrainerCallback`` background threads /
+          procs (e.g., ``WandbCallback`` upload worker, ``MLflow``
+          tracking proc).
+        * Any tool LF forked off via ``compute_metrics`` / ``preprocess``
+          shell-outs.
+
+        A SIGTERM from the driver before ``run_exp`` finishes also leaves
+        the dist process group live.  Both cases are handled by:
+
+        1. Destroy the torch.distributed process group if still
+           initialised.
+        2. Recursively SIGTERM/SIGKILL every descendant of this actor
+           via :func:`forge.utils.process_tree.kill_descendants`.
+
+        Returns ``{"rank", "host", "terminated", "killed", "survivors",
+        "dist_destroyed"}`` so the driver can assert no zombies.
+        """
+        rank = int(os.environ.get("RANK", "-1"))
+        host = socket.gethostname()
+
+        dist_destroyed = False
+        try:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.destroy_process_group()
+                dist_destroyed = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "LlamaFactoryTrainerActor rank=%d destroy_process_group raised: %s",
+                rank,
+                e,
+            )
+
+        terminated, killed, survivors = kill_descendants(
+            os.getpid(),
+            term_grace_s=term_grace_s,
+            kill_grace_s=kill_grace_s,
+        )
+
+        logger.info(
+            "LlamaFactoryTrainerActor teardown rank=%d host=%s "
+            "dist_destroyed=%s terminated=%d killed=%d survivors=%d",
+            rank,
+            host,
+            dist_destroyed,
+            terminated,
+            killed,
+            survivors,
+        )
+        return {
+            "rank": rank,
+            "host": host,
+            "dist_destroyed": dist_destroyed,
+            "terminated": terminated,
+            "killed": killed,
+            "survivors": survivors,
         }

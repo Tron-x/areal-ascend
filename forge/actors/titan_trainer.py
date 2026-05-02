@@ -1,9 +1,11 @@
 """TitanTrainerActor -- run TorchTitan's native training inside a Monarch actor.
 
 **Conforms to:** :class:`forge.core.protocols.SPMDTrainerProtocol`
-(Adapter Path; partial -- ``setup_env`` + ``run`` are present, ``teardown``
-is **TODO**).  See :class:`forge.actors.msswift_trainer.MsSwiftTrainerActor`
-for the canonical full conformance.
+(Adapter Path -- ``setup_env`` + ``run`` + ``teardown``).  See
+:class:`forge.actors.msswift_trainer.MsSwiftTrainerActor` for the
+canonical full conformance (its teardown additionally tears down ms-swift's
+cross-mesh weight-sync PGs; Titan has no such groups in the current
+SPMD/B-mini setup, so this teardown is the smaller two-step version).
 
 **Pure Path note:** TorchTitan is a *pure* training backend per
 ``.cursor/rules/framework-first-principles.mdc``, but the *current*
@@ -77,6 +79,8 @@ from typing import Any
 
 from monarch._src.spmd.actor import SPMDActor
 from monarch.actor import endpoint
+
+from forge.utils.process_tree import kill_descendants
 
 logger = logging.getLogger(__name__)
 
@@ -247,4 +251,79 @@ class TitanTrainerActor(SPMDActor):
             "host": host,
             "elapsed_s": elapsed,
             "ok": err is None,
+        }
+
+    @endpoint
+    def teardown(
+        self,
+        *,
+        term_grace_s: float = 5.0,
+        kill_grace_s: float = 3.0,
+    ) -> dict[str, Any]:
+        """Best-effort cleanup symmetric to :class:`MsSwiftTrainerActor.teardown`.
+
+        TorchTitan runs DDP/FSDP in-proc, so a normal ``run()`` exit
+        already destroys the process group in its own ``finally``.
+        This endpoint exists for the unhappy paths:
+
+        1. Driver SIGTERMs the actor mid-step -- ``run()`` never reaches
+           its ``finally``, so the process group is still live and the
+           next ``run()`` (or any neighboring smoke that reuses the
+           same actor mesh) inherits a stale PG.
+        2. ``Trainer.train()`` spawned helper subprocesses (data
+           prefetcher, profiler exporter, ``torch.compile`` worker
+           pool, ...) that need an explicit kill before the actor proc
+           returns to the driver pool.
+
+        Steps:
+
+        1. Destroy the torch.distributed process group if still
+           initialised.
+        2. Recursively SIGTERM/SIGKILL every descendant of this actor
+           via :func:`forge.utils.process_tree.kill_descendants`.
+
+        Returns ``{"rank", "host", "terminated", "killed", "survivors",
+        "dist_destroyed"}`` so the driver can assert no zombies and
+        compose with the other trainer actors' teardown shape.
+        """
+        rank = int(os.environ.get("RANK", "-1"))
+        host = socket.gethostname()
+
+        dist_destroyed = False
+        try:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.destroy_process_group()
+                dist_destroyed = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "TitanTrainerActor rank=%d destroy_process_group raised: %s",
+                rank,
+                e,
+            )
+
+        terminated, killed, survivors = kill_descendants(
+            os.getpid(),
+            term_grace_s=term_grace_s,
+            kill_grace_s=kill_grace_s,
+        )
+
+        logger.info(
+            "TitanTrainerActor teardown rank=%d host=%s "
+            "dist_destroyed=%s terminated=%d killed=%d survivors=%d",
+            rank,
+            host,
+            dist_destroyed,
+            terminated,
+            killed,
+            survivors,
+        )
+        return {
+            "rank": rank,
+            "host": host,
+            "dist_destroyed": dist_destroyed,
+            "terminated": terminated,
+            "killed": killed,
+            "survivors": survivors,
         }

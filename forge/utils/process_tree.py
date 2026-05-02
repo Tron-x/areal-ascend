@@ -7,7 +7,7 @@ return" hook in their ``teardown`` endpoint.
 
 Why this lives in ``forge/utils/`` rather than inside one actor
 -------------------------------------------------------------
-Two consumers and counting:
+Four consumers and counting:
 
 * :class:`forge.actors.msswift_rollout.MsSwiftRolloutActor` -- kills
   vLLM ``EngineCore`` + ``Worker_TP*`` grandchildren that hold HCCL
@@ -16,6 +16,13 @@ Two consumers and counting:
   pytorch ``DataLoader`` worker children (and any process the inner
   framework spawned mid-training) so a crashed step doesn't leak
   procs into the next ``run()`` call on the same actor.
+* :class:`forge.actors.titan_trainer.TitanTrainerActor` -- kills
+  ``Trainer.train()`` helpers (data prefetcher, profiler exporter,
+  ``torch.compile`` worker pool) when the driver SIGTERMs the actor
+  mid-step.
+* :class:`forge.actors.llamafactory_trainer.LlamaFactoryTrainerActor`
+  -- kills ``transformers.Trainer`` callback helpers (Wandb/MLflow
+  upload procs, dataloader workers) on the unhappy path.
 
 Per the framework first principles (`.cursor/rules/framework-first-principles.mdc`
 "common functionality goes down to ``areal/<component>/`` or

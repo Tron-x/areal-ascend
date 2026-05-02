@@ -206,8 +206,12 @@ wait_ready / teardown`）不是同一回事。新代码尽量走外置 rollout s
   - Pure Path MVP（grpo_titan.py：Titan + vLLM + Forge GRPO）是 Phase B 主任务
 - **AReaL 还在以"primary"自居的代码痕迹**：`forge/engines/areal/` 下有 `train_backend.py`
   / `inference_bridge.py` 等命名暗示 primary 身份，应当随清理 commit 改名
-- **TitanTrainerActor / LlamaFactoryTrainerActor 没 teardown endpoint**：
-  跟 ms-swift trainer 不对称；应补齐（复用 `forge.utils.process_tree.kill_descendants`）
+- ~~**TitanTrainerActor / LlamaFactoryTrainerActor 没 teardown endpoint**~~
+  （已闭合 2026-05-02，两者均已新增 `teardown` endpoint，复用
+  `forge.utils.process_tree.kill_descendants`，shape 与 `MsSwiftTrainerActor`
+  对齐：返回 `{rank, host, dist_destroyed, terminated, killed, survivors}`。
+  跨 mesh PG cleanup 仍是 ms-swift 独有；其它 SPMD trainer 的 teardown 是更小
+  的 destroy-pg + kill-descendants 双步版）
 - ~~**LoRA-aware weight sync 还没贯通**~~（已闭合 2026-05-02，ms-swift 跨机 4+4 5 步
   GRPO sub-case B 跑通）。最终落地：
   - `WeightSyncClient.push_lora_adapter_xccl(peft_config, named_lora_params,
