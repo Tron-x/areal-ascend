@@ -20,6 +20,9 @@ def __getattr__(name: str):
         "RewardActor": "forge.actors.reward",
         "SandboxActor": "forge.actors.sandbox",
         "TrainerActor": "forge.actors.trainer",
+        "WeightSyncActor": "forge.actors.weight_sync",
+        "WeightSyncActorHandle": "forge.actors.weight_sync",
+        "spawn_weight_sync_actor": "forge.actors.weight_sync",
     }
     if name in _lazy_map:
         import importlib
@@ -38,4 +41,7 @@ __all__ = [
     "RewardActor",
     "SandboxActor",
     "TrainerActor",
+    "WeightSyncActor",
+    "WeightSyncActorHandle",
+    "spawn_weight_sync_actor",
 ]

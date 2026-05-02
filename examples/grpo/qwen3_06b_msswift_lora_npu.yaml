@@ -1,0 +1,103 @@
+# ms-swift GRPO with LoRA via Monarch + Forge -- 4+4 split (rollout + trainer)
+#
+# Variant of ``qwen3_06b_msswift_npu.yaml`` switched from ``tuner_type:full``
+# to ``tuner_type:lora``.  Validates the LoRA training path on the
+# Adapter Path; weight sync still goes through the regular
+# ``/areal_set_update_weight_meta`` + ``/areal_update_weights_xccl``
+# pipeline because TRL/ms-swift's default LoRA flow MERGES the adapter
+# into the base model before pushing weights to vLLM
+# (``_move_full_model_to_vllm`` -> ``self.model.merge_adapter()`` ->
+# upload merged base weights).
+#
+# Bandwidth note: this is "sub-case A" -- broadcasts are still full-base
+# size (~600M for Qwen3-0.6B), so the wire cost equals full-tuning.
+# To get true LoRA-incremental sync (only (A, B) matrices over the
+# wire), set ``rollout_enable_lora: true`` AND extend the glue with
+# patches for ``VLLMClient.update_adapter_flattened_param`` /
+# ``update_adapter_param`` -- that is "sub-case B", a separate task
+# that exercises ``set_weight_meta_lora`` / ``update_weight_lora_xccl``
+# in ``areal/weight_sync/vllm_ext/worker_extension.py``.
+#
+# Topology / launch (identical to the full-tuning recipe)::
+#
+#     python -m forge.apps.grpo_msswift \
+#         --algo-config examples/grpo/qwen3_06b_msswift_lora_npu.yaml \
+#         --rollout-workers tcp://192.168.0.26:22222 \
+#         --trainer-workers tcp://192.168.0.23:22222 \
+#         --steps 5
+
+mode: grpo-msswift
+
+msswift:
+  use_modelscope: true
+  rollout_ready_timeout_s: 600.0
+
+  rollout:
+    port: 8000
+    swift_args:
+      model: /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B
+      torch_dtype: bfloat16
+
+      vllm_tensor_parallel_size: 4
+      vllm_data_parallel_size: 1
+      vllm_use_async_engine: false
+
+      max_model_len: 1024
+      vllm_gpu_memory_utilization: 0.85
+      vllm_enforce_eager: true
+
+  trainer:
+    cwd: /root/ms-swift
+    procs_per_host: 4
+    master_port: 0
+    ws_master_port: 49500
+
+    swift_args:
+      # GRPO core
+      rlhf_type: grpo
+      model: /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B
+      torch_dtype: bfloat16
+
+      # ====================== LoRA tuning ============================
+      # ms-swift wires PEFT internally when tuner_type='lora'.  The
+      # GRPOTrainer's ``_move_full_model_to_vllm`` will then call
+      # ``self.model.merge_adapter()`` before collecting state_dict
+      # (because ``rollout_enable_lora`` defaults to False), so vLLM
+      # sees full-base weights -- our existing weight-sync glue
+      # handles this transparently.
+      tuner_type: lora
+      lora_rank: 16
+      lora_alpha: 32
+      target_modules:
+        - all-linear
+      # We deliberately do NOT enable rollout_enable_lora=true here:
+      # that requires extending the glue with adapter-param patches
+      # (see "sub-case B" in the file header).  Keeping this off lets
+      # the run go through unchanged glue and validates LoRA training
+      # itself first.
+      # ===============================================================
+
+      dataset: /tmp/swift_areal_smoke/gsm8k_smoke.jsonl
+      load_from_cache_file: true
+
+      max_length: 1024
+      max_completion_length: 64
+      temperature: 1.0
+      top_p: 0.85
+
+      reward_funcs:
+        - accuracy
+        - format
+      num_generations: 4
+
+      max_steps: 1
+      per_device_train_batch_size: 1
+      gradient_accumulation_steps: 1
+      learning_rate: 5.0e-5         # higher LR is OK for LoRA
+      logging_steps: 1
+      output_dir: /tmp/swift_areal_smoke/forge_run/trainer_out_lora
+      num_train_epochs: 1
+      warmup_ratio: 0.0
+      save_strategy: 'no'
+      eval_strategy: 'no'
+      dataloader_num_workers: 0

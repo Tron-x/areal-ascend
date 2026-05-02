@@ -1,5 +1,19 @@
 """TitanTrainerActor -- run TorchTitan's native training inside a Monarch actor.
 
+**Conforms to:** :class:`forge.core.protocols.SPMDTrainerProtocol`
+(Adapter Path; partial -- ``setup_env`` + ``run`` are present, ``teardown``
+is **TODO**).  See :class:`forge.actors.msswift_trainer.MsSwiftTrainerActor`
+for the canonical full conformance.
+
+**Pure Path note:** TorchTitan is a *pure* training backend per
+``.cursor/rules/framework-first-principles.mdc``, but the *current*
+actor here treats it as a black-box (``run()`` calls
+``torchtitan.train.Trainer.train()`` and blocks).  When the Pure Path
+MVP lands, a sibling actor implementing per-step
+:class:`forge.core.protocols.TrainEngine` will be added so Forge
+algorithms can drive Titan step-by-step.  Both actor shapes will coexist
+because the SPMD shape stays useful for pure pretrain.
+
 This is the **B-mini** integration path for TorchTitan: a single Monarch
 actor mesh whose only job is to call ``torchtitan.train.Trainer.train()``
 on every rank.  No Forge GRPO orchestration, no vLLM, no weight sync --

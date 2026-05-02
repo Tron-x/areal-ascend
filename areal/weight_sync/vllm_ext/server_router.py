@@ -17,11 +17,22 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_se
 from vllm.entrypoints.openai.protocol import (
     CompletionRequest,
     ErrorResponse,
-    OpenAIBaseModel,
 )
 from vllm.entrypoints.utils import cli_env_setup, load_aware_call, with_cancellation
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+# Wire schemas live in a sibling module so trainer-side WeightSyncClient,
+# server-side router, and adapter shims (e.g. ms-swift glue) can import
+# from a single source rather than redeclaring fields per consumer.
+# See ``protocol.py`` for the rationale ("Coupling boundary").
+from areal.weight_sync.vllm_ext.protocol import (
+    UpdateGroupRequest,
+    UpdateWeightsFromXcclRequest,
+    UpdateWeightsFromXcclRequestLora,
+    UpdateWeightsRequest,
+    UpdateWeightsRequestLora,
+)
 
 logger = init_logger("areal_vllm_server")
 logger.setLevel(logging.INFO)
@@ -29,60 +40,6 @@ logger.setLevel(logging.INFO)
 # Global event to control generation resume/pause
 _generation_run_event = asyncio.Event()
 _generation_run_event.set()  # Initially not paused
-
-
-class UpdateWeightsRequest(OpenAIBaseModel):
-    # The model path with the new weights
-    model_path: str
-    # The format to load the weights
-    load_format: str | None = "auto"
-    # Whether to abort all requests before updating weights
-    abort_all_requests: bool = False
-
-
-class UpdateWeightsRequestLora(OpenAIBaseModel):
-    # The model path with the new weights of lora adaptor
-    lora_model_path: str
-    # The name of lora adaptor
-    lora_name: str
-    # The id of the lora adaptor in vllm
-    lora_int_id: int
-    # The name of the base model for lora adaptors
-    base_model_name: str
-    # The format to load the weights
-    load_format: str | None = "auto"
-    # Whether to abort all requests before updating weights
-    abort_all_requests: bool = False
-
-
-class UpdateGroupRequest(OpenAIBaseModel):
-    master_address: str
-    master_port: str
-    rank_offset: int
-    world_size: int
-    backend: str
-    group_name: str
-
-
-class UpdateWeightsFromXcclRequest(OpenAIBaseModel):
-    names: list[str]
-    dtypes: list[str]
-    shapes: list[list[int]]
-    group_name: str
-
-
-class UpdateWeightsFromXcclRequestLora(OpenAIBaseModel):
-    names: list[str]
-    dtypes: list[str]
-    shapes: list[list[int]]
-    lora_name: str
-    lora_int_id: int
-    lora_target_modules: list[str] | str
-    lora_rank: int
-    lora_alpha: int
-    lora_bias: str
-    base_model_name: str
-    group_name: str
 
 
 def to_json_response(success, message):

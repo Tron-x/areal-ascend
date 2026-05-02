@@ -1,15 +1,27 @@
 """Engine protocols -- pluggable contracts for training, inference, and reward.
 
-Two protocol levels:
+Three protocol families, each tied to a path in the dual-path architecture
+(see ``.cursor/rules/framework-first-principles.mdc``):
 
-1. **Engine protocols** (new, clean): ``TrainEngine``, ``InferenceEngine``,
-   ``RewardFn`` -- simple interfaces that any backend can implement.
-   These are what new code should target.
+1. **Pure Path protocols**: ``TrainEngine`` (per-step controllable trainers
+   like Titan / Megatron / FSDP2), ``InferenceEngine`` (in-process generators
+   like AReaL ``Generator``).  Used when Forge owns the algorithm and
+   composes pure backends.
 
-2. **Legacy backend protocols**: ``TrainBackend``, ``InferenceBridge``,
+2. **Adapter Path protocols**: ``SPMDTrainerProtocol`` (run-blocking trainer
+   actors that wrap a whole RL framework like ms-swift / LF / TRL),
+   ``InferenceServerProtocol`` (out-of-process FastAPI rollout servers like
+   ms-swift's ``SwiftRolloutDeploy`` / future SGLang server).  Used when a
+   third-party framework owns the algorithm and Forge only orchestrates.
+
+3. **Cross-path protocols**: ``RewardFn`` / ``RewardModelEngine`` /
+   ``BatchAdapter`` / ``AgentLogic`` -- common components both paths use.
+
+4. **Legacy backend protocols**: ``TrainBackend``, ``InferenceBridge``,
    ``RewardBackend``, ``DataProvider`` -- retained for backward compatibility
-   with ``forge/engines/areal/``.  They add AReaL-specific methods like
-   ``do_rollout``, ``train_on_batch``, etc.
+   with ``forge/engines/areal/`` (which architecturally is an Adapter Path
+   member used as a functional-correctness oracle for the Pure Path; do not
+   model new adapters on these legacy shapes).
 
 All protocols use ``typing.Protocol`` with ``@runtime_checkable``.
 """
@@ -28,12 +40,17 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class TrainEngine(Protocol):
-    """Framework-agnostic training engine for policy optimization.
+    """**Pure Path** -- per-step controllable training engine.
 
-    Implementations wrap a concrete training framework (FSDP2, Megatron,
-    AReaL PPOTrainer, etc.) and expose a uniform interface that the
-    orchestration layer (``TrainerActor``, ``apps/``) can drive without
-    knowledge of the underlying framework.
+    Implementations wrap a *pure* training framework (TorchTitan, Megatron,
+    FSDP2) and expose a uniform per-step interface that the Forge
+    orchestration layer (``TrainerActor``, ``apps/grpo_titan.py``, etc.)
+    can drive while owning the algorithm itself.
+
+    Adapter Path frameworks (ms-swift / LF / TRL / AReaL-as-adapter) which
+    own their own training loop should implement
+    :class:`SPMDTrainerProtocol` instead -- forcing them through this
+    per-step protocol would require fork-level changes to their internals.
 
     Key design decisions:
 
@@ -111,11 +128,16 @@ class TrainEngine(Protocol):
 
 @runtime_checkable
 class InferenceEngine(Protocol):
-    """Pluggable inference engine for text generation.
+    """**Pure Path** -- in-process generator (Forge ``Generator``-style).
 
-    Implementations wrap vLLM, SGLang, TGI, etc.
+    Implementations wrap vLLM / SGLang / TGI **as a Python object** living
+    inside a ``ForgeActor`` (e.g. AReaL's :class:`forge.actors.generator.Generator`).
+    This is the protocol when Forge drives generation directly via Python
+    method calls, not over HTTP.
 
-    Used by ``Generator`` actor.
+    For out-of-process FastAPI rollout servers (the Adapter Path default),
+    use :class:`InferenceServerProtocol` instead -- see that class for the
+    distinction.
     """
 
     async def generate(self, prompt: str, **kwargs: Any) -> dict:
@@ -128,6 +150,210 @@ class InferenceEngine(Protocol):
 
     def get_version(self) -> int:
         """Current policy version."""
+        ...
+
+
+# ======================================================================
+# Adapter Path protocols
+# ======================================================================
+# These protocols capture the "actor shape" for backends that wrap a whole
+# third-party RL framework.  The framework owns its own training loop /
+# rollout / algorithm; Forge just orchestrates lifecycle + cross-mesh
+# weight sync + reward/dataset adapters.
+#
+# Why separate from TrainEngine / InferenceEngine: a coarse-grained run()
+# endpoint that blocks until training is done has fundamentally different
+# semantics than a per-step train_step() call.  Forcing them into the same
+# interface either loses the algorithm-control granularity (Pure Path) or
+# requires fork-level changes to every adapted framework (Adapter Path).
+
+
+@runtime_checkable
+class SPMDTrainerProtocol(Protocol):
+    """**Adapter Path** -- coarse-grained SPMD trainer actor.
+
+    The "actor shape" for trainers that wrap a third-party framework's
+    own ``train.py`` (or equivalent).  Subclasses
+    :class:`monarch._src.spmd.actor.SPMDActor` to inherit ``RANK`` /
+    ``LOCAL_RANK`` / ``WORLD_SIZE`` / ``MASTER_ADDR`` / ``MASTER_PORT``
+    env wiring + ``setup_env(master_addr, master_port)`` endpoint, then
+    adds:
+
+    * ``run(config, **kwargs)`` -- block until the framework's training
+      loop completes, return a result dict.
+    * ``teardown(...)`` -- recursive process-tree cleanup so dataloader
+      workers / temporary subprocs don't leak across runs.
+
+    Conformant implementations (current):
+
+    * :class:`forge.actors.titan_trainer.TitanTrainerActor` (TorchTitan)
+      *(missing teardown -- TODO)*
+    * :class:`forge.actors.llamafactory_trainer.LlamaFactoryTrainerActor` (LF)
+      *(missing teardown -- TODO)*
+    * :class:`forge.actors.msswift_trainer.MsSwiftTrainerActor` (ms-swift)
+
+    The ``config`` arg's shape is framework-specific by design (TT takes a
+    toml path + overrides list, LF takes a dict-of-dicts, ms-swift takes a
+    flat CLI dict).  The driver layer knows which adapter it's calling and
+    builds the right shape from the YAML.  We deliberately do **not** force
+    a uniform config schema -- that would either water down each
+    framework's expressiveness or require parser hacks at the actor.
+
+    Lifecycle::
+
+        actor = mesh.spawn("trainer", MyTrainerActor)
+        await actor.setup_env.call(master_addr, master_port)  # SPMDActor
+        results = await actor.run.call(config=..., **kwargs)
+        # ... drive other paths if needed (rollout server etc.) ...
+        await actor.teardown.call()
+    """
+
+    def setup_env(self, master_addr: str, master_port: int) -> dict:
+        """Set RANK/LOCAL_RANK/.../MASTER_ADDR/MASTER_PORT.
+
+        Inherited from :class:`monarch._src.spmd.actor.SPMDActor`; listed
+        here so the protocol is self-contained for type-checking purposes.
+        """
+        ...
+
+    def run(self, config: Any, **kwargs: Any) -> dict:
+        """Block until the wrapped framework's training loop completes.
+
+        Args:
+            config: Framework-specific training config.  Shape varies
+                per adapter (toml path / dict / argv list).  See each
+                implementation's docstring for its expected shape.
+            **kwargs: Cross-cutting overrides commonly shared across
+                adapters: ``cwd``, ``ws_master_addr`` / ``ws_master_port``
+                (cross-mesh weight-sync TCPStore), ``extra_env``,
+                ``use_modelscope``.
+
+        Returns:
+            ``{"rank": int, "host": str, "elapsed_s": float, "ok": bool, ...}``
+            -- per-rank result.  ``ok=False`` means this rank's training
+            crashed; the driver should still call ``teardown`` to clean up.
+        """
+        ...
+
+    def teardown(
+        self,
+        *,
+        term_grace_s: float = 5.0,
+        kill_grace_s: float = 3.0,
+    ) -> dict:
+        """Recursive process-tree cleanup + DDP group destruction.
+
+        Always best-effort, never raises.  Should:
+
+        1. Destroy ``torch.distributed`` process group if still initialized.
+        2. Recursively SIGTERM/SIGKILL every descendant of this actor
+           (dataloader workers, framework-spawned subprocs).  Reuse
+           :func:`forge.utils.process_tree.kill_descendants`.
+
+        Returns ``{"rank", "host", "dist_destroyed", "terminated",
+        "killed", "survivors"}``.  ``survivors > 0`` is the actionable
+        failure (stuck NPU/GPU driver call -- needs host reboot).
+        """
+        ...
+
+
+@runtime_checkable
+class InferenceServerProtocol(Protocol):
+    """**Adapter Path / cross-path** -- out-of-process FastAPI rollout server.
+
+    The "actor shape" for inference backends that run as a long-lived
+    HTTP server hit by trainers over the network.  This is the default
+    inference shape for both Pure Path (Titan + vLLM-server) and Adapter
+    Path (ms-swift's ``SwiftRolloutDeploy``, future SGLang RLHF server),
+    because cross-mesh weight sync over HCCL/NCCL needs the inference
+    workers to be addressable by the trainer's :class:`WeightSyncClient`.
+
+    Distinction from :class:`InferenceEngine`:
+
+    * ``InferenceEngine`` = in-process Python object inside a Forge actor
+      (e.g. :class:`forge.actors.generator.Generator`).  Trainer drives
+      generation via Python method calls.
+    * ``InferenceServerProtocol`` = separate process tree exposing
+      FastAPI ``/generate`` + ``/areal_*`` weight-sync routes.  Trainer
+      hits it over HTTP (vLLM client / requests).
+
+    Conformant implementations (current):
+
+    * :class:`forge.actors.msswift_rollout.MsSwiftRolloutActor`
+
+    Future:
+
+    * SGLang-RLHF rollout actor (Pure Path inference for grpo_titan.py)
+    * Plain vLLM-only rollout actor (Pure Path lighter-weight than ms-swift)
+
+    Lifecycle::
+
+        actor = mesh.spawn("rollout", MyRolloutActor)
+        info = await actor.host_info.call_one()      # get NIC IP
+        await actor.start.call_one(args=..., port=8000)
+        await actor.wait_ready.call_one(timeout_s=300)
+        # ... trainer drives weight sync via http://info["ip"]:8000 ...
+        await actor.teardown.call_one()
+    """
+
+    def host_info(self) -> dict:
+        """Return ``{"ip": str, "hostname": str}`` for this actor's host.
+
+        Cheap (no model load).  Driver calls this BEFORE ``start`` so it
+        knows which URL to hand to the trainer's ``vllm_server_base_url``.
+        """
+        ...
+
+    def start(self, *, port: int = 8000, **kwargs: Any) -> dict:
+        """Boot the FastAPI server in a daemon thread, return immediately.
+
+        Heavy imports (vLLM, torch_npu, framework-specific) happen here
+        so the module stays importable on CPU-only orchestration hosts.
+        Apply any monkey-patches BEFORE constructing the server (e.g.
+        :func:`forge.engines.msswift.glue.install_server_patches`).
+
+        Returns ``{"host": str, "port": int, "world_size": int,
+        "pid": int}``.  ``world_size`` is what the trainer's weight-sync
+        client should expect on the inference side.
+        """
+        ...
+
+    def wait_ready(
+        self,
+        *,
+        timeout_s: float = 300.0,
+        interval_s: float = 2.0,
+    ) -> dict:
+        """Poll ``/health/`` until 200 OK or timeout.
+
+        Returns ``{"ready": True, "elapsed_s": float}``.  Raises
+        ``TimeoutError`` if not ready in budget; raises ``RuntimeError``
+        if the server thread died during startup (more useful than
+        polling forever).
+        """
+        ...
+
+    def teardown(
+        self,
+        *,
+        uvicorn_timeout_s: float = 10.0,
+        term_grace_s: float = 8.0,
+        kill_grace_s: float = 5.0,
+    ) -> dict:
+        """Best-effort uvicorn + recursive child-tree cleanup.
+
+        Cleanup order:
+
+        1. Flip ``uvicorn.Server.should_exit``, join the FastAPI thread.
+        2. Recursively SIGTERM/SIGKILL every descendant of this actor
+           (vLLM ``EngineCore`` + ``Worker_TP*`` grandchildren that hold
+           HCCL/NCCL ports).  Reuse
+           :func:`forge.utils.process_tree.kill_descendants`.
+        3. Reap direct-child zombies via ``waitpid``.
+
+        Returns ``{"uvicorn_joined", "host", "port", "terminated",
+        "killed", "survivors", ...}``.
+        """
         ...
 
 

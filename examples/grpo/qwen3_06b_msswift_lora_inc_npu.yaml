@@ -1,0 +1,109 @@
+# ms-swift GRPO with LoRA + true incremental weight sync (sub-case B)
+#
+# Variant of ``qwen3_06b_msswift_lora_npu.yaml`` that activates ms-swift's
+# ``rollout_enable_lora=True`` path so the trainer pushes only the LoRA
+# (A, B) matrices to vLLM each step (no merge-into-base).  Bandwidth is
+# now ~LoRA-rank * 2 * sum(target_module_dims) instead of full base
+# weights -- typically 1-2 orders of magnitude smaller.
+#
+# Wire path on each step:
+#
+#   trainer (rank 0)                           rollout (vLLM TP=4)
+#   --------------------------------           --------------------------------
+#   rollout_mixin._move_adapter_to_vllm
+#     -> VLLMClient.update_adapter_flattened_param(...)
+#        ^ patched by forge.engines.msswift.glue
+#          to push_lora_adapter_xccl(...)
+#     -> POST /areal_set_update_weight_meta_lora    -> set_weight_meta_lora collective_rpc
+#     -> POST /areal_update_weights_lora_xccl       -> update_weight_lora_xccl collective_rpc
+#     -> dist.broadcast(each LoRA tensor) ----HCCL--> torch.distributed.broadcast(recv)
+#                                                  -> LoRAModel.from_lora_tensors
+#                                                  -> activate_adapter
+#
+# Differences vs sub-case A YAML:
+#   * Trainer: ``rollout_enable_lora: true``  (default in TRL is False)
+#   * Rollout: ``vllm_enable_lora: true``     (default is False)
+#   * Rollout: ``vllm_max_lora_rank: 16``     (must be >= trainer lora_rank;
+#                                              keep them equal per vLLM docs)
+#   * Rollout: vLLM starts with LoRA support; first step's
+#     update_weight_lora_xccl creates the adapter slot from broadcast
+#     tensors (worker_extension was hardened to allow first-time push).
+
+mode: grpo-msswift
+
+msswift:
+  use_modelscope: true
+  rollout_ready_timeout_s: 600.0
+
+  rollout:
+    port: 8000
+    swift_args:
+      model: /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B
+      torch_dtype: bfloat16
+
+      vllm_tensor_parallel_size: 4
+      vllm_data_parallel_size: 1
+      vllm_use_async_engine: false
+
+      max_model_len: 1024
+      vllm_gpu_memory_utilization: 0.85
+      vllm_enforce_eager: true
+
+      # ============= LoRA-aware vLLM (sub-case B addition) ===========
+      vllm_enable_lora: true
+      vllm_max_lora_rank: 16
+      # ===============================================================
+
+  trainer:
+    cwd: /root/ms-swift
+    procs_per_host: 4
+    master_port: 0
+    ws_master_port: 49500
+
+    swift_args:
+      rlhf_type: grpo
+      model: /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B
+      torch_dtype: bfloat16
+
+      tuner_type: lora
+      lora_rank: 16
+      lora_alpha: 32
+      target_modules:
+        - all-linear
+
+      # ============= LoRA-incremental sync (sub-case B) ==============
+      # NOTE: ``rollout_enable_lora`` is NOT a CLI arg in ms-swift -- it
+      # is auto-derived (rollout_mixin.py:167-182) from the server's
+      # ``enable_lora`` flag, which we set above via
+      # ``rollout.swift_args.vllm_enable_lora=true``.  When that flag is
+      # on, the trainer's ``_move_full_model_to_vllm`` finishes with
+      # ``self._move_adapter_to_vllm()`` (rollout_mixin.py:727-730),
+      # which calls ``VLLMClient.update_adapter_flattened_param`` -- and
+      # our glue has patched that to push only the LoRA delta via
+      # ``WeightSyncClient.push_lora_adapter_xccl``.
+      # ===============================================================
+
+      dataset: /tmp/swift_areal_smoke/gsm8k_smoke.jsonl
+      load_from_cache_file: true
+
+      max_length: 1024
+      max_completion_length: 64
+      temperature: 1.0
+      top_p: 0.85
+
+      reward_funcs:
+        - accuracy
+        - format
+      num_generations: 4
+
+      max_steps: 1
+      per_device_train_batch_size: 1
+      gradient_accumulation_steps: 1
+      learning_rate: 5.0e-5
+      logging_steps: 1
+      output_dir: /tmp/swift_areal_smoke/forge_run/trainer_out_lora_inc
+      num_train_epochs: 1
+      warmup_ratio: 0.0
+      save_strategy: 'no'
+      eval_strategy: 'no'
+      dataloader_num_workers: 0

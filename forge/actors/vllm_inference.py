@@ -1,5 +1,17 @@
 """VLLMInferenceActor -- standalone TP=8 vLLM replica inside a Monarch actor.
 
+**Does NOT conform to** :class:`forge.core.protocols.InferenceServerProtocol`.
+This actor is a **benchmark actor** (``init`` / ``run_benchmark`` /
+``shutdown``), not a rollout server.  It exists for synthetic-load
+inference performance testing and has no FastAPI shim, no weight-sync
+hook, no ``/generate`` endpoint hit by trainers over the network.
+
+When the Pure Path MVP needs an inference server (vLLM-on-NPU rollout
+for ``grpo_titan.py``), add a **sibling actor** that conforms to
+:class:`InferenceServerProtocol` -- it will share weight-sync glue with
+:class:`forge.actors.msswift_rollout.MsSwiftRolloutActor` via
+:mod:`forge.engines.msswift.glue` (or a generalized version of it).
+
 This is the inference counterpart of :class:`TitanTrainerActor`: a
 single Monarch actor whose sole job is to wrap one TP=8 vLLM
 ``LLM`` instance and serve a self-contained synthetic-load benchmark.

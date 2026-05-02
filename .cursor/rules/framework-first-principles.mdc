@@ -1,0 +1,279 @@
+---
+description: First principles for the unified RL framework — Pure Path + Adapter Path, dual-track design. Read before every task.
+alwaysApply: true
+---
+
+# 第一性原理：我们在做什么
+
+> **本质**：用 Monarch 做统一调度层，把"纯净训练后端 × 纯净推理后端 × 自家算法"
+> 组成的 **Pure Path** 和"已有 RL 框架黑盒接进来"的 **Framework-Adapter Path**
+> 收敛到同一套 actor / 协议 / 共性组件之上，让算法人员可以按场景挑路径。
+>
+> **不是**在写又一个 RL 框架。**是**在做"框架适配总线 + 一份自家算法路径"。
+
+## 核心架构（每次执行任务先对齐到这张图）
+
+```
+                  ┌────────────────────────┐
+                  │   Monarch + Forge       │  L1 调度层（双路径共用）
+                  │   SSHJob/ProcMesh/Actor │
+                  └────────────┬───────────┘
+                               │
+        ┌──────────────────────┴───────────────────────┐
+        │                                               │
+┌───────▼──────────────────┐         ┌──────────────────▼─────────────┐
+│ Pure Path (target)        │         │ Framework-Adapter Path           │
+│                           │         │                                  │
+│ "Forge 拥有算法 + 纯净后端" │         │ "已有 RL 框架黑盒接进来"           │
+│                           │         │                                  │
+│ Pure Train (engines/):   │         │ Adapters (engines/<framework>/): │
+│  - TorchTitan             │         │  - areal/    (oracle 用法 ↓)     │
+│  - Megatron               │         │  - msswift/                      │
+│  - FSDP2                  │         │  - llamafactory/                 │
+│                           │         │  - trl/, torchtune/, ...         │
+│ Pure Infer (engines/):   │         │                                  │
+│  - vLLM                   │         │ 算法/loss/rollout/buffer 都在     │
+│  - SGLang                 │         │ 框架自己内部，Forge 不碰          │
+│                           │         │                                  │
+│ Algorithm (algorithms/): │         │ Forge 只提供：                    │
+│  - grpo / ppo / dpo       │         │  - SSH/proc lifecycle             │
+│  - 纯函数：(logits, rwd)  │         │  - weight_sync 通道               │
+│    → loss                 │         │  - reward / dataset 适配          │
+│                           │         │                                  │
+│ Apps:                    │         │ Apps:                            │
+│  - grpo_titan.py 🚧       │         │  - grpo_msswift.py ✅            │
+│  - grpo_megatron.py 🚧    │         │  - grpo_areal.py (= 现 grpo.py)  │
+│  - grpo_fsdp.py 🚧        │         │  - llamafactory_train.py ✅      │
+│                           │         │  - titan_pretrain.py ✅          │
+│ Trainer 协议:            │         │ Trainer 协议:                    │
+│  TrainEngine             │         │  SPMDTrainerProtocol             │
+│  (per-step 可控)         │         │  (run() 黑盒)                    │
+└───────────────────────────┘         └──────────────────────────────────┘
+        │                                               │
+        └──────────────────────┬────────────────────────┘
+                               ▼
+        共用 L2 共性组件（≥2 backend 用就下沉这里）：
+        ┌─────────────────────────────────────────────────────────────┐
+        │ weight_sync (集合通信)   areal/weight_sync/, areal_xccl 后端  │
+        │ weight_sync (单边通信)   torchstore (独立包) + multi_vol 后端 │
+        │ reward (RewardFn)        forge/core/protocols.py             │
+        │ dataset adapters         forge/dataset/                       │
+        │ batch adapters           forge/engines/{titan,fsdp,areal}/    │
+        │ tokenizer alignment      forge/core/chat_template.py          │
+        │ process_tree teardown    forge/utils/process_tree.py          │
+        │ network/utils            forge/utils/                          │
+        └─────────────────────────────────────────────────────────────┘
+```
+
+## AReaL 的特殊定位
+
+AReaL **架构上属于 Framework-Adapter Path**（它是一个完整 RL 框架，带算法、rollout、
+replay buffer、advantage 计算），不是 Pure Path 的成员。
+
+**用法上** AReaL 是我们当下唯一跑通完整 fine-grained pipeline 的实现，所以拿它做
+Pure Path MVP 的"功能/正确性对照"（learning curve / weight sync 节拍 / reward 收敛速度）。
+这是 *用法角色*，不是 *架构类别*。
+
+含义：
+- 现有 `forge/engines/areal/` + `forge/actors/trainer.py`（1140 行 grpo.py 配套）
+  保留可运行，但**不是参照实现**。新接 backend 不要参考这套接口。
+- 后续清理 commit 可以把 `engines/areal/` → `adapters/areal/`、`apps/grpo.py` →
+  `grpo_areal.py`，把分类显式化（不阻塞当前工作）。
+- 不要无脑把 AReaL 既有的 `TrainBackend` / 15+ endpoint 协议泛化给其他 adapter 用。
+
+## 两条路径用哪个协议（重要）
+
+| 路径 | Trainer 协议 | Inference 协议 | 算法位置 |
+|---|---|---|---|
+| Pure Path | `TrainEngine`（per-step） | `InferenceServerProtocol` | `forge/algorithms/` |
+| Adapter Path | `SPMDTrainerProtocol`（run 黑盒） | `InferenceServerProtocol`（同左） | 框架内部 |
+
+**关键**：两条路径在 **Inference 端是统一的**——都用 vLLM/SGLang FastAPI rollout
+server，差别只在 trainer 端。所以新增 inference backend 是 cross-path 受益的。
+
+`InferenceEngine` 协议（`generate / update_weights / get_version`）是**框架内嵌
+generator** 的协议（如 AReaL `Generator` / TRL 内置 vLLMClient），跟外置
+HTTP rollout server 的 `InferenceServerProtocol`（`host_info / start /
+wait_ready / teardown`）不是同一回事。新代码尽量走外置 rollout server。
+
+## 五条不能违背的设计准则
+
+1. **共性下沉，差异上抛**：发现 ≥2 个 adapter / pure backend 都需要的能力
+   （weight sync、tokenizer 对齐、batch 转换、健康检查、HTTP shim、process-tree
+   teardown …），下沉到 L2 共性组件，**不要**让它继续散落在各 backend 里。
+
+2. **协议优先，实现可换**：所有 backend 通过 `forge/core/protocols.py` 中的协议
+   交互；**禁止** actor / app 层直接 import 具体 backend 类。新接 framework =
+   新写一个 SPMDTrainerProtocol-conformant actor + 必要的 adapter 模块，
+   不改协议本身。
+
+3. **Monarch 是唯一调度入口 + 任何 adapter 都得接进 Monarch**：跨机/跨进程的
+   拓扑、生命周期、故障恢复全部经 Monarch（`SSHJob` / `ProcMesh` / `Actor`）。
+   **禁止**在 app 里裸用 `subprocess` / `torchrun` / `bash` 拉远端进程。
+   **延伸**：每接一个新的 RL 框架到 Adapter Path（ms-swift / LF / TRL /
+   torchtune / 你下一个想到的 …），它的 trainer / rollout / weight-sync
+   生命周期都必须落到 Monarch actor 里——**不允许**留一个"框架自己 fork
+   subprocess、Forge 不可见"的后门。Adapter 的算法在框架内部不动（准则 4），
+   但**所有进程的拉起、健康检查、teardown 必须 Monarch 可见可控**。这是把
+   "统一调度层"做实的硬底线，没有这条 Monarch 就只是一组帮手，而不是平台。
+   今天的实现状态：
+   - ✅ AReaL：trainer/generator/storage 都是 actor；`WeightSyncService` 已经
+     用 `forge.actors.weight_sync.WeightSyncActor` 包成 actor（跨机 1 步 GRPO
+     回归通过）
+   - ✅ ms-swift：trainer + rollout 都是 actor（cross-mesh 4+4 已通）；
+     trainer-内 cross-mesh PG 通过 `MsSwiftTrainerActor.cross_mesh_group_status`
+     / `cross_mesh_group_teardown` 端点暴露给 Monarch（见下"actor 化模式"）
+   - ✅ LlamaFactory：trainer 是 actor
+   - 🚧 后续接 TRL / torchtune / 任何新框架，从 day 1 就走 actor 形状，
+     **不要先裸跑再补 actor**——补的成本永远高于一开始就做对
+
+   **adapter-内进程局部资源的 actor 化模式（重要）**：
+   有些资源天然只能活在 adapter 自己的进程里——`torch.distributed.ProcessGroup`、
+   in-process callback、框架持有的 lifecycle hook，搬不走（PG 是 process-local
+   的，搬出去等于另开一个 PG）。**不要为它们伪造一个独立 actor**——那只是套个壳，
+   真实生命周期还在原 actor 里，反而把 ownership 弄糊。正确做法：
+   **给已经存在的、拥有该资源的 actor 加 endpoint 暴露 status + 强拆**。
+   例如 ms-swift 的 cross-mesh weight-sync PG 长在 `MsSwiftTrainerActor` 的
+   trainer 进程里，我们的方案是：
+   - `forge/engines/msswift/glue.py` 维护一个 module-level
+     `_AREAL_ACTIVE_CLIENTS` 注册表，patched `init_communicator` 注册、
+     `close_communicator` 注销
+   - `MsSwiftTrainerActor.cross_mesh_group_status()` endpoint 读注册表，告诉
+     driver "这个 PG 在不在、world_size 多少、backend 是什么"
+   - `MsSwiftTrainerActor.cross_mesh_group_teardown()` endpoint 强拆 PG +
+     释放 HCCL/XCCL 句柄，**不杀 trainer 进程**——给 driver 一条"卡死时
+     不掀桌、只重置 PG"的恢复路径
+   这种"在 owning actor 上加 endpoint"的模式比"再 spawn 一个 sidecar actor"
+   更诚实：lifecycle 绑在天然所有者上，Monarch 一样能看到、一样能管。
+
+4. **Adapter Path 非侵入接入**（重要）：适配第三方 RL 框架时，**不修改它们的
+   算法、训练循环、loss、advantage 计算、rollout 调度节拍**。我们要保证这些框架
+   "原生跑"——算法人员选 ms-swift / LF / TRL 是因为各家有各家的特色（多模态、
+   分布式策略、调参工程化），动它们的算法等于毁掉这些特色，本末倒置。
+   允许的接入手段：
+   - **monkey-patch 边界层**（如 `VLLMClient.update_named_param` →
+     我们的 `WeightSyncClient`），不改框架核心 loss/loop
+   - **环境变量 / 配置注入**（设 `MASTER_PORT` / `ASCEND_RT_VISIBLE_DEVICES` 等）
+   - **collective_rpc 注入**（vLLM `worker_extension` 这种官方扩展点）
+   - **抽出共性组件给框架使用**（如 `forge.utils.process_tree`），不让框架反向依赖
+     我们的算法
+   每接一个新框架，**带回它的优秀 idea 和真实痛点**——通过这些教训打磨
+   Pure Path 的 L2 共性组件 + 算法前端，让 Pure Path 站在所有 adapter 经验之上，
+   而不是和它们隔离演化。
+
+5. **L2 边界纪律：松耦合优先**（每次扩 L2 都自检）：L2 共性组件
+   （`areal/weight_sync/`、`forge/utils/`、`forge/core/protocols.py`、
+   `forge/engines/weight_sync/backends/`）必须保持"任何 adapter 都能用"的形状：
+   - **类型只用 dict / primitive / pydantic schema**——不暴露 ms-swift / TRL /
+     LF / AReaL 的内部 dataclass。需要复杂结构就在 L2 自己定 schema
+     （如 `areal/weight_sync/vllm_ext/protocol.py`），让框架往 L2 schema 转，不反向
+   - **不 import 任何适配框架**（`from swift.* import ...` / `from trl.* import ...`
+     这种只能出现在 `forge/engines/<framework>/glue.py`，永远不能出现在 L2）
+   - **docstring 不出现框架名词**——别说"ms-swift FlattenedTensorBucket"，说
+     "byte-offset bucket convention compatible with SGLang / ms-swift / ..."；
+     这逼自己想清楚抽象到底是什么，避免别的 adapter 看到名字就以为不能用
+   - **wire schema / 协议 / 常量单一源**——同一个 HTTP body / 同一份配置默认值
+     只能在一个地方定义，其他地方 import；发现两份就立刻合并
+   - **可选依赖懒加载**——如果非要拿框架里的某个常量当默认值（如 ms-swift
+     `VLLM_LORA_INT_ID`），要包 try/except + 文档化 fallback 值，不让 L2 因为
+     某个框架没装就 import 失败
+   反例：sub-case B 第一版 glue 里 `_SetWeightMetaLoraRequest` 复制了
+   `server_router.py` 的 `UpdateWeightsFromXcclRequestLora`（12 字段双份定义），
+   后来抽到 `areal/weight_sync/vllm_ext/protocol.py` 单一源，glue 和 server_router
+   都从这里 import——这就是"共性下沉 + 松耦合"的例子。
+
+## 已落地的共性组件（不要重复造）
+
+| 组件 | 路径 | 状态 | 备注 |
+|---|---|---|---|
+| 集合通信参数同步（trainer 侧） | `areal/weight_sync/` | ✅ AReaL + ms-swift 单/跨机已通 | 包级 |
+| 集合通信 backend（forge 侧） | `forge/engines/weight_sync/backends/areal_xccl.py` | ✅ 注册名 `areal_xccl` | |
+| 单边通信参数同步 | `torchstore` (独立包) + `forge/engines/weight_sync/backends/torchstore_multi_vol.py` | ✅ AReaL 已通 | 默认 backend |
+| Trainer / Inference / Reward 协议 | `forge/core/protocols.py` | ✅ 含 Pure 和 Adapter 双路径协议 | 见上表 |
+| Backend 注册表 | `forge/engines/weight_sync/backends/__init__.py::create_backend()` | ✅ | |
+| 进程树递归 teardown | `forge/utils/process_tree.py` | ✅ rollout + trainer actor 都用 | |
+| Glue (vLLM ↔ areal_xccl) | `forge/engines/msswift/glue.py` | ✅ ms-swift 通用 | LoRA sub-case A & B 都已通 |
+| LoRA-aware client (trainer 侧) | `WeightSyncClient.push_lora_adapter_xccl()` + `slice_flattened_lora_tensor()` | ✅ ms-swift 跨机 5 步 GRPO 已通 | 协议未变 |
+| LoRA-aware vLLM endpoints | `areal/weight_sync/vllm_ext/{worker_extension,server_router}.py` | ✅ 三 endpoint 全跑通（set_meta_lora / update_weight_lora_xccl / get_state_keys） | 容忍首次推送，无需预 add_lora |
+| HTTP wire schema 单一源 | `areal/weight_sync/vllm_ext/protocol.py` | ✅ 5 个 schema（含 LoRA） | server_router + msswift glue 都 import 这里，避免双份定义 desync |
+
+## 现状缺口（任何新任务先确认是否在补这些）
+
+- **Pure Path 还没真正跑通**：
+  - `TitanTrainerActor` 现是 `run()` 黑盒，未实现 per-step `TrainEngine` 协议
+  - `VLLMInferenceActor` 是 benchmark-only，无 weight_sync hook，不是 rollout server
+  - `forge/algorithms/` 还没 GRPO/PPO 纯函数实现
+  - Pure Path MVP（grpo_titan.py：Titan + vLLM + Forge GRPO）是 Phase B 主任务
+- **AReaL 还在以"primary"自居的代码痕迹**：`forge/engines/areal/` 下有 `train_backend.py`
+  / `inference_bridge.py` 等命名暗示 primary 身份，应当随清理 commit 改名
+- **TitanTrainerActor / LlamaFactoryTrainerActor 没 teardown endpoint**：
+  跟 ms-swift trainer 不对称；应补齐（复用 `forge.utils.process_tree.kill_descendants`）
+- ~~**LoRA-aware weight sync 还没贯通**~~（已闭合 2026-05-02，ms-swift 跨机 4+4 5 步
+  GRPO sub-case B 跑通）。最终落地：
+  - `WeightSyncClient.push_lora_adapter_xccl(peft_config, named_lora_params,
+    lora_name, lora_int_id, base_model_name)` ：trainer 侧入口，会先 POST
+    `/areal_set_update_weight_meta_lora` 再 POST `/areal_update_weights_lora_xccl`
+    （async），紧接着 `dist.broadcast` 每个 LoRA 张量
+  - `slice_flattened_lora_tensor(flattened, metadatas)` ：把 ms-swift
+    `FlattenedTensorBucket`（`enable_flattened_weight_sync=True` 默认开启）反切回
+    per-tensor 视图，便于 worker 侧逐张量 broadcast
+  - `forge/engines/msswift/glue.py`：patch `VLLMClient.update_adapter_param` 和
+    `update_adapter_flattened_param`，注册 `/areal_set_update_weight_meta_lora` 和
+    `/areal_update_weights_lora_xccl` shim 路由到 SwiftRolloutDeploy 的 FastAPI app
+  - `VLLMWorkerExtension.update_weight_lora_xccl`：原本要求 `lora_int_id` 必须预存在
+    （需先 `add_lora` 把 LoRA 落盘加载），改成首次推送时直接从 broadcast 张量
+    `LoRAModel.from_lora_tensors` 创建 adapter，无需文件系统兜底
+  - `VLLMWorkerExtension.get_state_keys`：补回 ms-swift/TRL 依赖的 vLLM-侧 model state
+    名查询 API（覆盖 `worker_extension_cls` 时丢了），是任何 framework adapter 都需要的
+    L2 helper
+  - **关键学习**：sub-case B bandwidth 收益取决于 LoRA-rank/base-size 比；600M base
+    + rank-16 LoRA（10M trainable）这种 toy 设定，HCCL 的 N×broadcast 启动延迟会吃掉
+    带宽收益（145s vs sub-case A 151s，差距小）；70B+ base 才能看到 1-2 个数量级提升。
+    Pure Path MVP 接进来后默认走这条路
+
+## 任务执行 checklist（开工前自问）
+
+1. 这个任务是 Pure Path 还是 Adapter Path？还是两条共用的 L2 共性组件？
+2. 协议是不是已经 cover？不 cover 就先扩 `forge/core/protocols.py`，再写实现。
+3. 是不是发现了第二个 backend 也需要某段代码？→ 下沉 L2，不要 copy-paste。
+4. 是不是裸起进程 / 裸建 process group？→ 改走 Monarch + 协议。
+5. AReaL 我是当 oracle 用，还是当 adapter 接进来？澄清后再动。
+6. 改完后，能用一句话回答「这一步让架构图哪个格子更接近完成」？
+
+## 反模式（看到立刻警觉）
+
+- ❌ 在 `forge/apps/*.py` 里直接 `from forge.engines.fsdp.train_engine import FSDPTrainEngine` 然后 `.train_step()`
+   → app 应当通过 actor + 协议驱动，不绑死实现
+- ❌ 在新 adapter 里复制一份 `init_custom_process_group` / `kill_descendants`
+   → 用 `from areal.weight_sync import init_custom_process_group` /
+     `from forge.utils.process_tree import kill_descendants`
+- ❌ 在 Pure Path 的某个 backend 里硬编码 GRPO loss
+   → loss 属于 `forge/algorithms/`，backend 只负责跑反向
+- ❌ 在 Adapter Path 里反过来要求"算法走 Forge 的"
+   → adapter 的算法在框架内部，强求统一只会让两条路都难受
+- ❌ **fork 适配框架来"修"它的算法、loss、advantage、rollout 调度节拍**（违反准则 4）
+   → 改 monkey-patch 边界（`VLLMClient` / `worker_extension`）、改环境变量、改
+     共性组件；不动框架内核
+- ❌ **把 Pure Path 的算法前端反向塞进 adapter trainer**
+   → adapter 用框架自己的 GRPO 实现；Pure Path 的 GRPO 是另一条路径
+- ❌ 用 `os.system("ssh ... torchrun ...")` 起远端 trainer
+   → 用 `SSHJob` + `SPMDActor` + `SPMDTrainerProtocol`
+- ❌ 把 `VLLMInferenceActor` 当 rollout server 用
+   → 它是 benchmark actor；rollout server 走 `MsSwiftRolloutActor` 同款的
+     `InferenceServerProtocol` 形状
+- ❌ **同一个 wire schema / 配置 / 常量在两处定义**（违反准则 5）
+   → 抽到 L2 单一源（如 `areal/weight_sync/vllm_ext/protocol.py`），双方都 import；
+     只要某个字段在 A 处加在 B 处忘加 → 静默 desync，调试灾难
+- ❌ **L2 docstring 提"ms-swift" / "TRL" / "LF" 等具体框架名**
+   → 改写成约定 / 协议名（如 "byte-offset bucket convention"）；不然别的
+     adapter 看到名字就以为不能复用，重复造轮子
+- ❌ **L2 模块顶层 import 适配框架**（如 `from swift.* import VLLM_LORA_NAME`）
+   → 这种常量该出现在 `forge/engines/<framework>/glue.py`；L2 接受
+     `lora_name: str` 形参，由 glue 传值
+
+## 这条规则本身在演化
+
+每个实现里程碑（Pure Path MVP 跑通、新 adapter 接入、共性组件下沉、协议扩展…）
+后，**回头精炼这份规则**：把新事实补进"已落地的共性组件"，把已闭合缺口从
+"现状缺口"删掉，把新发现的反模式补到反模式列表。规则不是一次写死的，是不断
+吸收实现教训的活文档。AI 在做大改动时主动 propose 改这份规则，不要默认它对。

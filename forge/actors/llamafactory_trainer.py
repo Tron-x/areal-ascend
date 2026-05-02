@@ -1,5 +1,10 @@
 """LlamaFactoryTrainerActor -- run LlamaFactory's ``run_exp`` inside a Monarch actor.
 
+**Conforms to:** :class:`forge.core.protocols.SPMDTrainerProtocol`
+(Adapter Path; partial -- ``setup_env`` + ``run`` are present, ``teardown``
+is **TODO**).  See :class:`forge.actors.msswift_trainer.MsSwiftTrainerActor`
+for the canonical full conformance.
+
 Mirror of :class:`forge.actors.titan_trainer.TitanTrainerActor`, but for the
 LlamaFactory training stack.  The integration contract is intentionally
 identical to TorchTitan's:

@@ -177,16 +177,13 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
     ``forge/docs/env_to_yaml_mapping.md §3``:
     ``yaml > env > default``.
     """
+    from forge.actors.weight_sync import spawn_weight_sync_actor
     from forge.engines.weight_sync._config_resolver import (
         resolve_bool,
         resolve_int,
         resolve_str,
     )
-    from forge.engines.weight_sync.backends import create_backend
-    from forge.engines.weight_sync.service import (
-        ParallelLayout,
-        WeightSyncService,
-    )
+    from forge.engines.weight_sync.service import ParallelLayout
     from forge.provisioner import _get_provisioner
 
     # Pull the resolved WeightSyncBlock off the global provisioner --
@@ -316,19 +313,6 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
     )
     os.environ["FORGE_SHARD_PUBLISH"] = "1" if shard_publish else "0"
 
-    try:
-        backend = create_backend(backend_name, **backend_kwargs)
-    except Exception as e:
-        print(
-            f"[WeightSync] failed to create backend {backend_name!r}: "
-            f"{type(e).__name__}: {e}.  Disabling sync.",
-            flush=True,
-        )
-        import traceback
-
-        traceback.print_exc()
-        return None
-
     # Layout comes from ``forge_cfg`` (filled by the config bridge from
     # ``allocation_mode``).  TP/PP/PS overrides still honor legacy env
     # vars for ad-hoc experiments; they emit deprecation warnings
@@ -364,24 +348,29 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
         ps_mesh_name="ps",
     )
 
-    service = WeightSyncService(
-        backend=backend,
-        trainer_actor=trainer,
-        generator_actor=generator,
-        layout=layout,
-        config={"forge_cfg": forge_cfg},
-    )
+    # Wrap WeightSyncService inside a Monarch actor (准则 3: every
+    # adapter -- and the coordinator they share -- must plug into
+    # Monarch).  The handle returned here quacks like the legacy
+    # ``WeightSyncStrategy`` (``.push(version)`` / ``.shutdown()``), so
+    # the training loop below stays oblivious to the actor wrapping.
     try:
-        await service.initialize()
+        handle = await spawn_weight_sync_actor(
+            backend_name=backend_name,
+            backend_kwargs=backend_kwargs,
+            layout=layout,
+            trainer=trainer,
+            generator=generator,
+            config={"forge_cfg": forge_cfg},
+        )
         print(
             f"[WeightSync] initialized: method=torchstore, backend={backend_name}, "
             f"layout=train={layout.train_world} gen={layout.gen_world} "
-            f"tp={layout.gen_tp}",
+            f"tp={layout.gen_tp} (wrapped in WeightSyncActor)",
             flush=True,
         )
     except Exception as e:
         print(
-            f"[WeightSync] service init failed: {type(e).__name__}: {e}. "
+            f"[WeightSync] actor init failed: {type(e).__name__}: {e}. "
             "Continuing without sync.",
             flush=True,
         )
@@ -389,7 +378,7 @@ async def _create_weight_sync_service(forge_cfg, trainer, generator):
 
         traceback.print_exc()
         return None
-    return service
+    return handle
 
 
 async def _create_legacy_weight_sync(forge_cfg, trainer, generator, method_str):
@@ -654,9 +643,80 @@ async def grpo_main(
         forge_cfg.backend_type = backend_override
         if backend_override == "titan":
             ta = titan_args or {}
+            # Resolve (model_name, model_flavor) with the precedence
+            #     CLI args > HF-config inference > hardcoded fallback
+            # The middle step closes the silent foot-gun documented in
+            # ``forge/engines/titan/_flavor_inference.py``: when the
+            # user passes ``--model /path/to/Qwen3-0.6B`` without
+            # ``--model-flavor``, we used to default to ``"1.7B"``
+            # (hidden=2048), which silently produced 0-key weight syncs
+            # because every titan tensor was 2x the vLLM counterpart.
+            from forge.engines.titan._flavor_inference import (
+                infer_titan_flavor_from_hf_path,
+            )
+
+            cli_name = ta.get("model_name")
+            cli_flavor = ta.get("model_flavor")
+            inferred_name, inferred_flavor = infer_titan_flavor_from_hf_path(
+                forge_cfg.model_path
+            )
+            resolved_name = cli_name or inferred_name or "qwen3"
+            resolved_flavor = cli_flavor or inferred_flavor or "1.7B"
+
+            # Loud diagnostics -- ``print(... flush=True)`` instead of
+            # ``logger.*`` because the root logger has no stdout
+            # handler installed at this boot phase (the rest of the
+            # file follows the same convention; see ``[GRPO] ...``,
+            # ``[WeightSync] ...``).  The mismatch case (CLI says X,
+            # HF config says Y) is the next class of bug we want to
+            # catch -- warn but honor the CLI choice (user override
+            # wins so emergency hot-fixes don't get blocked).
+            if (
+                cli_name is not None
+                and inferred_name is not None
+                and cli_name != inferred_name
+            ):
+                print(
+                    f"[titan] WARNING: model_name CLI={cli_name!r} conflicts "
+                    f"with HF inference={inferred_name!r} (from "
+                    f"{forge_cfg.model_path}). Honoring CLI; weight sync may "
+                    "fail if you actually meant the inferred value.",
+                    flush=True,
+                )
+            if (
+                cli_flavor is not None
+                and inferred_flavor is not None
+                and cli_flavor != inferred_flavor
+            ):
+                print(
+                    f"[titan] WARNING: model_flavor CLI={cli_flavor!r} "
+                    f"conflicts with HF inference={inferred_flavor!r} (from "
+                    f"{forge_cfg.model_path}). Honoring CLI; weight sync may "
+                    "fail if you actually meant the inferred value.",
+                    flush=True,
+                )
+            if cli_flavor is None and inferred_flavor is None:
+                print(
+                    f"[titan] WARNING: could not infer model_flavor from "
+                    f"{forge_cfg.model_path} and no --model-flavor passed; "
+                    f"falling back to hardcoded default {resolved_flavor!r}. "
+                    "Weight sync will produce 0 matched keys if the actual "
+                    "model differs in (hidden_size, num_hidden_layers).",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[titan] resolved model_name={resolved_name!r} "
+                    f"model_flavor={resolved_flavor!r} "
+                    f"(CLI={(cli_name, cli_flavor)}, "
+                    f"HF-inferred={(inferred_name, inferred_flavor)}, "
+                    f"model_path={forge_cfg.model_path})",
+                    flush=True,
+                )
+
             forge_cfg.backend_config = {
-                "model_name": ta.get("model_name", "qwen3"),
-                "model_flavor": ta.get("model_flavor", "1.7B"),
+                "model_name": resolved_name,
+                "model_flavor": resolved_flavor,
                 "hf_model_path": forge_cfg.model_path,
                 "max_steps": forge_cfg.backend_config.get(
                     "max_steps",
@@ -1100,9 +1160,7 @@ def main():
     # A pool-only YAML (no explicit ``bare_metal.workers``) still needs
     # the bare-metal launcher to fire -- detect that by checking whether
     # we found *any* placement hints in the YAML.
-    has_placement_hints = (
-        bool(bare_metal_args) or bool(yaml_pool) or bool(yaml_roles)
-    )
+    has_placement_hints = bool(bare_metal_args) or bool(yaml_pool) or bool(yaml_roles)
 
     if has_placement_hints:
         from forge.types import Launcher, LauncherConfig, ProvisionerConfig

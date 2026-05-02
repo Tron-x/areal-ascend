@@ -1,0 +1,87 @@
+# ms-swift GRPO via Monarch + Forge -- 4+4 split (rollout + trainer)
+#
+# Reproduces the cross-host PoC from `framework-first-principles.mdc`
+# Phase A but driven entirely through Forge actors (no bare torchrun).
+#
+# Topology:
+#   * Rollout pool  -- 1 host, 4 NPUs, vLLM TP=4 server on :8000
+#   * Trainer pool  -- 1 host, 4 NPUs, ms-swift GRPO via SPMDActor
+#   * Weight sync   -- areal.weight_sync collective HCCL,
+#                      cross-mesh TCPStore master at trainer rank 0
+#
+# Launch::
+#
+#     python -m forge.apps.grpo_msswift \
+#         --algo-config examples/grpo/qwen3_06b_msswift_npu.yaml \
+#         --rollout-workers tcp://192.168.0.26:22222 \
+#         --trainer-workers tcp://192.168.0.23:22222
+#
+# Single-host colocate smoke (same URI both flags) works too.
+
+mode: grpo-msswift
+
+msswift:
+  use_modelscope: true
+  rollout_ready_timeout_s: 600.0
+
+  rollout:
+    port: 8000
+    swift_args:
+      # Model + tokenizer
+      model: /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B
+      torch_dtype: bfloat16
+
+      # vLLM topology -- TP=4 (matches NPU pool size); single DP rank.
+      # Sync engine path keeps the spawn-aware patch story simple.
+      vllm_tensor_parallel_size: 4
+      vllm_data_parallel_size: 1
+      vllm_use_async_engine: false
+
+      # vLLM runtime knobs -- conservative for 0.6B + smoke length.
+      max_model_len: 1024
+      vllm_gpu_memory_utilization: 0.85
+      vllm_enforce_eager: true
+
+  trainer:
+    cwd: /root/ms-swift
+    procs_per_host: 4
+    master_port: 0          # let rank 0 pick its own DDP port
+    ws_master_port: 49500   # cross-mesh weight-sync TCPStore master
+
+    swift_args:
+      # GRPO core
+      rlhf_type: grpo
+      model: /root/.cache/modelscope/hub/models/Qwen/Qwen3-0___6B
+      tuner_type: full
+      torch_dtype: bfloat16
+
+      # Local 20-example smoke dataset (created in PoC).  Swap for a
+      # real dataset path -- ms-swift accepts either local jsonl or a
+      # hub id when offline mode is off.
+      dataset: /tmp/swift_areal_smoke/gsm8k_smoke.jsonl
+      load_from_cache_file: true
+
+      # Sequence + sampling caps -- small to keep smoke fast.
+      max_length: 1024
+      max_completion_length: 64
+      temperature: 1.0
+      top_p: 0.85
+
+      # GRPO hyper-params
+      reward_funcs:
+        - accuracy
+        - format
+      num_generations: 4
+
+      # Trainer step budget (CLI --steps overrides this).
+      max_steps: 1
+      per_device_train_batch_size: 1
+      gradient_accumulation_steps: 1
+      learning_rate: 1.0e-6
+      logging_steps: 1
+      output_dir: /tmp/swift_areal_smoke/forge_run/trainer_out
+      num_train_epochs: 1
+      warmup_ratio: 0.0
+      save_strategy: 'no'
+      eval_strategy: 'no'
+      dataloader_num_workers: 0

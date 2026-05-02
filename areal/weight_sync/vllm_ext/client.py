@@ -323,6 +323,110 @@ class WeightSyncClient:
 
         update_fut.result(timeout=self.request_timeout)
 
+    # ------------------------------------------------------------------ lora
+
+    def push_lora_adapter_xccl(
+        self,
+        peft_config: dict,
+        named_lora_params: list[tuple[str, torch.Tensor]],
+        *,
+        lora_name: str,
+        lora_int_id: int,
+        base_model_name: str,
+        pause_resume: bool = True,
+    ) -> None:
+        """Stream a LoRA adapter's ``(A, B)`` matrices to vLLM workers via XCCL.
+
+        This is the LoRA-aware counterpart to :meth:`push_weights_xccl`.
+        Unlike full-base broadcast, only the LoRA delta (typically <2% of
+        full base size) traverses the wire, and vLLM applies it as a
+        live adapter via ``LoRAModel.from_lora_tensors`` rather than a
+        permanent merge into the base weights.
+
+        Required in ``peft_config`` (LoraConfig serialized to dict; see
+        :func:`peft.config.PeftConfigMixin.to_dict` or simply
+        :func:`dataclasses.asdict` on a ``LoraConfig``):
+
+        * ``r`` (int) -- LoRA rank
+        * ``lora_alpha`` (int) -- LoRA scaling factor
+        * ``target_modules`` (list[str] | str) -- which linear layers got
+          adapted (e.g. ``["q_proj", "v_proj"]`` or ``"all-linear"``)
+        * ``bias`` (str) -- one of ``"none"`` / ``"all"`` / ``"lora_only"``
+
+        Args:
+            peft_config: Serialized LoRA config (sets coerced to lists).
+            named_lora_params: Iterable of ``(name, tensor)`` pairs for the
+                LoRA matrices.  Names must follow PEFT convention so the
+                worker-side ``LoRAModel.from_lora_tensors`` can map them
+                back onto target modules
+                (e.g. ``"base_model.model.layers.0.self_attn.q_proj.lora_A.weight"``).
+                Tensors must already live on the local accelerator.
+            lora_name: Logical name of the adapter (must match what
+                vLLM's ``add_lora`` will be / was called with).  ms-swift
+                uses the constant ``"swift_lora"``.
+            lora_int_id: Integer id vLLM uses internally to address the
+                adapter (ms-swift uses ``111``).  Same id is reused on
+                every push so the adapter slot is recycled in place.
+            base_model_name: HF id / path of the base model the adapter
+                was trained against.  Stored on the worker to validate
+                future incremental pushes.
+            pause_resume: When True, brackets the push with
+                ``/areal_pause_generation`` + ``/areal_continue_generation``.
+                Set False if the caller already paused (nested updates).
+
+        Raises:
+            WeightSyncError: If the HTTP handshake or XCCL broadcast
+                handshake fails on either side.
+        """
+        if self._group is None:
+            raise WeightSyncError(
+                "init_communicator must be called before push_lora_adapter_xccl"
+            )
+
+        bucket = list(named_lora_params)
+        if not bucket:
+            logger.warning("push_lora_adapter_xccl: empty LoRA params, skipping")
+            return
+
+        target_modules = peft_config.get("target_modules", [])
+        if isinstance(target_modules, set):
+            target_modules = list(target_modules)
+
+        meta_payload = {
+            "names": [name for name, _ in bucket],
+            "dtypes": [_dtype_to_str(t.dtype) for _, t in bucket],
+            "shapes": [list(t.shape) for _, t in bucket],
+            "group_name": self.group_name,
+            "lora_name": lora_name,
+            "lora_int_id": lora_int_id,
+            "lora_target_modules": target_modules,
+            "lora_rank": int(peft_config.get("r", peft_config.get("lora_rank", 8))),
+            "lora_alpha": int(peft_config.get("lora_alpha", 32)),
+            "lora_bias": str(peft_config.get("bias", "none")),
+            "base_model_name": base_model_name,
+        }
+
+        if pause_resume:
+            self.pause_generation()
+
+        try:
+            self._post("/areal_set_update_weight_meta_lora", meta_payload)
+            update_fut = self._post_async("/areal_update_weights_lora_xccl")
+
+            for _, tensor in bucket:
+                dist.broadcast(tensor, src=0, group=self._group, async_op=False)
+
+            update_fut.result(timeout=self.request_timeout)
+            logger.info(
+                "push_lora_adapter_xccl OK: lora_name=%s int_id=%d params=%d",
+                lora_name,
+                lora_int_id,
+                len(bucket),
+            )
+        finally:
+            if pause_resume:
+                self.continue_generation()
+
     # ------------------------------------------------------------------ disk
 
     def push_weights_from_disk(self, model_path: str) -> None:
@@ -395,8 +499,62 @@ def iter_named_tensors_for_broadcast(
         yield name, tensor
 
 
+def slice_flattened_lora_tensor(
+    flattened: torch.Tensor,
+    metadatas: list[dict],
+) -> list[tuple[str, torch.Tensor]]:
+    """Slice a byte-offset flattened tensor bucket back into per-tensor pairs.
+
+    Generic helper for the "pack many small tensors into one contiguous
+    buffer + metadata sidecar" pattern that originated in SGLang's
+    ``weight_sync/tensor_bucket.py`` and is now reused by several RL
+    frameworks (TRL, ms-swift, etc.) to amortise the per-tensor
+    broadcast overhead on small adapters like LoRA.
+
+    Our XCCL worker broadcasts and applies tensors *individually* (one
+    ``dist.broadcast`` per parameter), so callers who receive a
+    flattened bucket must un-flatten before invoking
+    :meth:`WeightSyncClient.push_lora_adapter_xccl` -- this helper is
+    that un-flatten step.
+
+    Schema contract (each ``metadata`` dict):
+
+    * ``name``     -- target parameter name (string).
+    * ``shape``    -- target tensor shape (sequence of int).
+    * ``dtype``    -- target dtype as string; both
+      ``"bfloat16"`` and ``"torch.bfloat16"`` accepted.
+    * ``start_idx`` / ``end_idx`` -- byte offsets into the **uint8
+      view** of ``flattened``.  Convention: the producer flattens via
+      ``tensor.view(torch.uint8).reshape(-1)`` so both endpoints are
+      byte-addressed, dtype-agnostic.
+
+    No framework-specific imports -- the function only ever sees the
+    primitive dict shape above.  Add a per-framework adapter at the
+    glue layer if your producer uses different keys.
+
+    Returns:
+        List of ``(name, tensor)`` pairs where each tensor is a
+        zero-copy *view* into ``flattened`` (mutating the view mutates
+        the source buffer).  Safe to feed directly to
+        ``dist.broadcast`` because views share device + dtype.
+    """
+    flat_u8 = flattened.view(torch.uint8).reshape(-1)
+    out: list[tuple[str, torch.Tensor]] = []
+    for meta in metadatas:
+        name = meta["name"]
+        shape = tuple(meta["shape"])
+        dtype_str = str(meta["dtype"]).removeprefix("torch.")
+        target_dtype = getattr(torch, dtype_str)
+        start = int(meta["start_idx"])
+        end = int(meta["end_idx"])
+        view = flat_u8[start:end].view(target_dtype).reshape(shape)
+        out.append((name, view))
+    return out
+
+
 __all__ = [
     "WeightSyncClient",
     "WeightSyncError",
     "iter_named_tensors_for_broadcast",
+    "slice_flattened_lora_tensor",
 ]

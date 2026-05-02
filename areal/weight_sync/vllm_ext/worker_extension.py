@@ -57,6 +57,19 @@ class VLLMWorkerExtension:
     Iherited from vllm codebase
     """
 
+    def get_state_keys(self):
+        """Return runtime vLLM model parameter names.
+
+        Adapter frameworks (ms-swift, TRL) call this to map their
+        trainer-side HF parameter names to vLLM's runtime names (which
+        differ for packed QKV / MoE / etc.).  When we install ourselves
+        as ``worker_extension_cls`` we replace whatever ms-swift had
+        registered, so we must re-export this otherwise-generic helper
+        here -- it does not depend on any AReaL weight-sync state, just
+        on the worker's loaded model.
+        """
+        return list(dict(self.model_runner.model.named_parameters()).keys())
+
     def sync(self):
         current_platform.synchronize()
         torch.distributed.barrier()
@@ -224,20 +237,19 @@ class VLLMWorkerExtension:
             if self.model_runner.lora_manager is None:
                 raise RuntimeError("LoRA manager is not initialized")
 
-            # Check if the LoRA adapter exists
+            # Check if the LoRA adapter exists.  First-time push (e.g. step 1
+            # of training) is allowed -- we'll register a fresh adapter from
+            # the broadcast tensors below.  Logging the state here makes
+            # debugging "why is the adapter empty" much easier later.
             adapter_ids = self.model_runner.lora_manager.list_adapters()
-            if lora_int_id not in adapter_ids:
-                raise RuntimeError(
-                    f"LoRA adapter {lora_int_id} not found. Available: {adapter_ids}"
+            adapter_preexists = lora_int_id in adapter_ids
+            if not adapter_preexists:
+                logger.info(
+                    "LoRA adapter %d not yet registered (existing: %s); "
+                    "treating as first-time push and creating from broadcast.",
+                    lora_int_id,
+                    sorted(adapter_ids),
                 )
-
-            # Get the LoRA model
-            lora_model = (
-                self.model_runner.lora_manager._adapter_manager._registered_adapters[
-                    lora_int_id
-                ]
-            )
-            logger.info(f"Found LoRA model with {len(lora_model.loras)} LoRA modules")
 
             # Receive all weights via XCCL broadcast
             logger.info(f"Receiving {len(names)} LoRA parameters via XCCL")
@@ -262,6 +274,9 @@ class VLLMWorkerExtension:
 
             logger.info(f"Received {len(received_weights)} LoRA parameters via XCCL")
 
+            # remove_adapter is a no-op when the adapter doesn't exist;
+            # safe to call unconditionally.  We rebuild from the broadcast
+            # tensors next, so any old version is stale anyway.
             self.model_runner.lora_manager.remove_adapter(lora_int_id)
 
             normalized_weights = {
